@@ -460,79 +460,123 @@ tableOutput("selection_data")
 
 tableOutput("selection_summary")
 
-leafletOutput("edit_map", height = "95vh")
+maplibreOutput("edit_map", height = "95vh")
 
-output$edit_map <- renderLeaflet({
+
+output$edit_map <- renderMaplibre({
   
   req(full_data())
   
+  # Fix: Use full_data() instead of map_data (assuming map_data should be full_data)
+  number_asus <- max(full_data()$asunum)
+  number_categories <- min(c(number_asus, 8))
+  asu_per_category <- number_asus/number_categories
+  brewer_pal <- RColorBrewer::brewer.pal(number_categories, "Accent")
+  
   dynamic_palette <- colorNumeric(palette = "viridis", domain = full_data()$asunum)
   
-  leaflet(full_data()) %>%
-    addProviderTiles(providers$CartoDB.Positron) %>%
-    addPolygons(layerId = ~GEOID, weight = 1, color = "black", fillOpacity = 0.5, group = "tracts",
-                fillColor = ~ifelse(asunum != 0, 
-                                    dynamic_palette(asunum), 
-                                    "#444444"), 
-                label = ~paste0("ASU: ", asunum,
-                                " || GEOID: ", GEOID,
-                                " || Unemployment Rate: ", tract_ASU_urate,
-                                " || Unemployment: ", tract_ASU_unemp,
-                                " || Population: ", tract_pop_cur
-                                ),
-                highlightOptions = highlightOptions(color = "white", weight = 2, bringToFront = TRUE))
-  
+ maplibre(style = carto_style("positron")) |>
+    fit_bounds(full_data(), animate = FALSE) |> 
+    add_fill_layer(
+      id = "basemap",
+      source = full_data(),
+      fill_color = step_expr(
+        column = "asunum",
+        base = "#808080",  # Grey for asunum == 0
+        stops = brewer_pal[1:number_categories],
+        values = c(0.5, seq(1+asu_per_category, number_asus, asu_per_category)),
+        na_color = "#444444"
+      ),
+      fill_opacity = 0.5,
+      fill_outline_color = "black",
+      popup = concat(
+        "<strong>ASU Number: </strong>", get_column("asunum"), "<br>",
+        "<strong>Tract GEOID: </strong>", get_column("GEOID"), "<br>",
+        "<strong>Tract Unemployment Rate: </strong>", number_format(get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2), "%<br>",
+        "<strong>Tract Unemployment: </strong>", number_format(get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0), "<br>"
+      )
+    )
 })
 
-
-
-observeEvent(input$edit_map_shape_click, {
-  click <- input$edit_map_shape_click
+# Corrected click event handler for MapLibre
+observeEvent(input$edit_map_feature_click, {
+  click <- input$edit_map_feature_click
   current_selection <- selected_tracts()
   
+  # Extract the GEOID from the clicked feature properties
+  clicked_geoid <- click$properties$GEOID
+  
   # Add or remove the selected tract
-  if (click$id %in% current_selection) {
-    current_selection <- setdiff(current_selection, click$id)
+  if (clicked_geoid %in% current_selection) {
+    current_selection <- setdiff(current_selection, clicked_geoid)
   } else {
-    current_selection <- c(current_selection, click$id)
+    current_selection <- c(current_selection, clicked_geoid)
   }
   
   selected_tracts(current_selection)
   
-  # Highlight selected tracts
-  leafletProxy("edit_map") %>%
-    clearGroup("selected") %>%
-    addPolylines(data = subset(full_data(), GEOID %in% selected_tracts()),
-                 weight = 3, color = "red", group = "selected")
+  # Update the map highlighting
+  if (length(current_selection) > 0) {
+    selected_data <- subset(full_data(), GEOID %in% selected_tracts())
+    
+    maplibre_proxy("edit_map") %>%
+      clear_layer("selected") %>%
+      add_line_layer(
+        id = "selected",
+        source = selected_data,
+        line_color = "red",
+        line_width = 3,
+        line_opacity = 1
+      )
+  } else {
+    # Clear the selection layer if no tracts are selected
+    maplibre_proxy("edit_map") %>%
+      clear_layer("selected")
+  }
   
+  # Update the selection table
   output$selection_table <- renderTable({
     selected_tracts()
   })
-  
 })
 
-
-# New observeEvent for selecting tracts by ASU number
+# Fix: Single observeEvent for selecting tracts by ASU number
 observeEvent(input$select_asunum, {
   req(full_data())
   
+  # Skip if "None" is selected
+  if (input$select_asunum == "None") {
+    selected_tracts(NULL)
+    maplibre_proxy("edit_map") %>%
+      clear_layer("selected")
+    return()
+  }
+  
   # Get all tracts with the selected ASU number
-  selected_tracts <- full_data() %>%
-    filter(asunum == input$select_asunum) %>%
+  selected_tract_ids <- full_data() %>%
+    filter(asunum == as.numeric(input$select_asunum)) %>%
     pull(GEOID)
   
   # Update the selected_tracts reactive value
-  selected_tracts(selected_tracts)
+  selected_tracts(selected_tract_ids)
   
-  # Highlight the selected tracts on the map
-  leafletProxy("edit_map") %>%
-    clearGroup("selected") %>%
-    addPolylines(data = subset(full_data(), GEOID %in% selected_tracts()),
-                 weight = 3, color = "red", group = "selected")
+  # Get the filtered data for selected tracts
+  selected_data <- subset(full_data(), GEOID %in% selected_tract_ids)
   
+  # Highlight the selected tracts on the map using maplibre proxy
+  maplibre_proxy("edit_map") %>%
+    clear_layer("selected") %>%
+    add_line_layer(
+      id = "selected",
+      source = selected_data,
+      line_color = "red",
+      line_width = 3,
+      line_opacity = 1
+    ) |> 
+    fit_bounds(selected_data, animate = TRUE)
 })
 
-# New observeEvent for manually selecting a GEOID
+# New observeEvent for manually selecting a GEOID using MapLibre
 observeEvent(input$select_geoid, {
   req(full_data())
   
@@ -540,32 +584,26 @@ observeEvent(input$select_geoid, {
   selected_tract <- full_data() %>%
     filter(GEOID == input$manual_geoid)
   
-  # If the tract exists, calculate bounding box and determine zoom level
+  # If the tract exists, highlight it and fit bounds
   if (nrow(selected_tract) > 0) {
-    bbox <- st_bbox(st_geometry(selected_tract))
+    # Highlight the selected tract on the map using maplibre proxy
+    maplibre_proxy("edit_map") %>%
+      clear_layer("selected") %>%
+      add_line_layer(
+        id = "selected",
+        source = selected_tract,
+        line_color = "red",
+        line_width = 3,
+        line_opacity = 1
+      ) %>%
+      fit_bounds(selected_tract, animate = TRUE)
     
-    # Calculate the approximate zoom level based on the size of the bounding box
-    lon_diff <- bbox$xmax - bbox$xmin
-    lat_diff <- bbox$ymax - bbox$ymin
-    
-    # Example zoom level calculation (you may need to adjust this based on your map)
-    zoom_level <- case_when(
-      lon_diff > 1 | lat_diff > 1 ~ 6,
-      lon_diff > 0.5 | lat_diff > 0.5 ~ 8,
-      lon_diff > 0.1 | lat_diff > 0.1 ~ 10,
-      TRUE ~ 12  # Default high zoom level for very small tracts
-    )
-    
-    # Center the map on the tract and apply the calculated zoom level
-    leafletProxy("edit_map") %>%
-      setView(lng = mean(c(bbox$xmin, bbox$xmax)), 
-              lat = mean(c(bbox$ymin, bbox$ymax)), 
-              zoom = zoom_level) %>%
-      clearGroup("selected") %>%
-      addPolylines(data = selected_tract,
-                   weight = 3, color = "red", group = "selected")
+    # Update the selected_tracts reactive value
+    selected_tracts(selected_tract$GEOID)
   }
 })
+
+
 
 # Filter selected tracts by percentile
 observeEvent(input$filter_percentile, {
@@ -584,11 +622,27 @@ observeEvent(input$filter_percentile, {
            tract_ASU_urate > 0) %>%
     pull(GEOID)
   
-  # Update the map to highlight the newly filtered tracts
-  leafletProxy("edit_map") %>%
-    clearGroup("selected") %>%
-    addPolylines(data = subset(full_data(), GEOID %in% filtered_selected),
-                 weight = 3, color = "red", group = "selected")
+  # Update the selected_tracts reactive value with filtered selection
+  selected_tracts(filtered_selected)
+  
+  # Get the filtered data for selected tracts
+  filtered_data <- subset(full_data(), GEOID %in% filtered_selected)
+  
+  # Update the map to highlight the newly filtered tracts using maplibre proxy
+  maplibre_proxy("edit_map") %>%
+    clear_layer("selected") %>%
+    add_line_layer(
+      id = "selected",
+      source = filtered_data,
+      line_color = "red",
+      line_width = 3,
+      line_opacity = 1
+    )
+  
+  # Update the selection table
+  output$selection_table <- renderTable({
+    filtered_selected
+  })
   
 })
 
@@ -596,13 +650,13 @@ observeEvent(input$filter_percentile, {
 
 observeEvent(input$preview, {
   req(selected_tracts())
-  
+
   replacement_data <- full_data() %>%
     st_drop_geometry() %>%
     subset(GEOID %in% selected_tracts())
-  
+
   edit_table(replacement_data)
-  
+
   edit_table() %>%
     ungroup() %>%
     summarize(
@@ -613,54 +667,51 @@ observeEvent(input$preview, {
       ur = round(unemp/lf*100, 5)
     ) %>%
     edit_summary()
-  
+
   # Show Preview of Selected Tracts
-  output$selection_summary <- renderTable({  
+  output$selection_summary <- renderTable({
     edit_summary()
   })
-  
-})
 
+})
 
 
 observeEvent(input$update, {
   req(selected_tracts(), full_data())
   
-  full_data() %>%
+  # Update the full_data reactive value
+  updated_data <- full_data() %>%
     filter(GEOID %in% selected_tracts()) %>%
     mutate(asunum = as.numeric(input$new_asu)) %>%
     rbind(
       full_data() %>%
         filter(!(GEOID %in% selected_tracts()))
-    ) %>%
-    full_data()
+    )
+  
+  # Update the reactive value
+  full_data(updated_data)
   
   # Clear selected tracts
   selected_tracts(NULL)
   
   # Update map to remove highlight on selected tracts
-  leafletProxy("edit_map") %>%
-    clearGroup("selected")
-  
+  maplibre_proxy("edit_map") %>%
+    clear_layer("selected")
 })
-
-
 
 observeEvent(input$reset, {
   req(full_data_reset(), full_data())
   
-  full_data_reset() %>%
-    full_data()
+  # Reset the full_data reactive value
+  full_data(full_data_reset())
   
   # Clear selected tracts
   selected_tracts(NULL)
   
   # Update map to remove highlight on selected tracts
-  leafletProxy("edit_map") %>%
-    clearGroup("selected")
+  maplibre_proxy("edit_map") %>%
+    clear_layer("selected")
 })
-
-
 
 
 
