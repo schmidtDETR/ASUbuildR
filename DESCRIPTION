@@ -1,6 +1,6 @@
 Package: ASUbuildR
 Type: Package
-Title: Shiny interface to help state construct Areas of Substantial Unemployment.
+Title: Shiny interface to help state construct Areas of Substantial Unemployment
 Version: 0.1.0
 Authors@R: c(
     person(
@@ -24,8 +24,10 @@ Imports:
     dplyr,
     readxl,
     flexdashboard,
-    formattable,
-    leaflet,
+    RColorBrewer,
+    mapgl,
+    rmarkdown,
+    stringr,
     sf,
     sfdep,
     shiny,

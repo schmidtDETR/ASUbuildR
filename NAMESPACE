@@ -1,1 +1,27 @@
-exportPattern("^[[:alpha:]]+")
+export(launch_ASUbuildR)
+
+# Core Shiny ecosystem - import everything to avoid issues
+import(shiny)
+import(flexdashboard)
+import(rmarkdown)
+
+# Data manipulation - import key packages entirely for simplicity
+import(dplyr)
+import(sf)
+
+# Specific function imports for other packages
+importFrom(readxl, read_excel)
+importFrom(tigris, tracts)
+importFrom(sfdep, st_contiguity)
+importFrom(RColorBrewer, brewer.pal)
+importFrom(stringr, str_remove)
+
+# mapgl - import the main functions you use
+importFrom(mapgl, maplibre, maplibreOutput, renderMaplibre, maplibre_proxy,
+           carto_style, fit_bounds, add_fill_layer, add_line_layer,
+           clear_layer, add_legend, step_expr, get_column, concat, number_format)
+
+# Utility functions
+importFrom(utils, head, capture.output, write.table, write.csv)
+importFrom(stats, quantile)
+
