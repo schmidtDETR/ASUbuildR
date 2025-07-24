@@ -19,6 +19,7 @@ library(sfdep)
 library(tidyverse)
 library(readxl)
 library(mapview)
+library(shinyFiles)
 
 options(shiny.maxRequestSize = 50 * 1024^2)  # Set to 50MB or your desired limit
 
@@ -523,6 +524,11 @@ observeEvent(input$edit_map_feature_click, {
   # Extract the GEOID from the clicked feature properties
   clicked_geoid <- click$properties$GEOID
   
+  # Check if clicked_geoid is not NULL and not empty
+  if (is.null(clicked_geoid) || length(clicked_geoid) == 0 || is.na(clicked_geoid)) {
+    return()  # Exit early if no valid GEOID
+  }
+  
   # Add or remove the selected tract
   if (clicked_geoid %in% current_selection) {
     current_selection <- setdiff(current_selection, clicked_geoid)
@@ -753,30 +759,108 @@ Save and Load Data
 
 These buttons allow you to save the map in progress so that you can load it again in the future to continue your work.
 
-The save file will land in your working directory, and the path will be noted when you save.
-
-After loading data, you can go directly to the ASU Modification tab to continue making edits.
+First, choose a save directory. The default is your current working directory. After loading data, you can go directly to the ASU Modification tab to continue making edits.
 
 ```{r}
 
+# Directory selection - Simple text input approach
+textInput("save_dir_path", "Save Directory Path:", value = getwd(), width = "100%")
+br()
+actionButton("browse_dir", "Browse for Directory")
+br()
+br()
+textOutput("current_save_dir")
+textOutput("dir_status")
+br()
+
 actionButton("save_data", "Save Data")
 fileInput("load_data", "Load Data", accept = c(".rds"))
+
+# Reactive value to store the selected directory
+save_directory <- reactiveVal(getwd())  # Default to current working directory
+
+# Observer to handle directory path changes
+observeEvent(input$save_dir_path, {
+  if (!is.null(input$save_dir_path) && input$save_dir_path != "") {
+    if (dir.exists(input$save_dir_path)) {
+      save_directory(input$save_dir_path)
+    }
+  }
+})
+
+# Alternative browse button (opens file dialog for directory selection)
+observeEvent(input$browse_dir, {
+  # This will work in RStudio or desktop R
+  if (interactive()) {
+    selected_dir <- tryCatch({
+      choose.dir(default = save_directory(), caption = "Select Save Directory")
+    }, error = function(e) {
+      # For non-Windows systems, use tcltk
+      tryCatch({
+        library(tcltk)
+        tk_choose.dir(default = save_directory(), caption = "Select Save Directory")
+      }, error = function(e2) {
+        NULL
+      })
+    })
+    
+    if (!is.null(selected_dir) && selected_dir != "") {
+      updateTextInput(session, "save_dir_path", value = selected_dir)
+      save_directory(selected_dir)
+    }
+  } else {
+    # In web-deployed apps, show instruction
+    showModal(modalDialog(
+      title = "Directory Selection",
+      "In web-deployed apps, please manually enter the directory path in the text field above.",
+      easyClose = TRUE
+    ))
+  }
+})
+
+# Display current save directory
+output$current_save_dir <- renderText({
+  paste("Current save directory:", save_directory())
+})
+
+# Display directory status
+output$dir_status <- renderText({
+  if (dir.exists(save_directory())) {
+    "✓ Directory exists and is accessible"
+  } else {
+    "⚠ Directory does not exist - it will be created when saving"
+  }
+})
 
 # Observer for saving the data
 observeEvent(input$save_data, {
   req(full_data())
   
-  # Specify the file path in the current working directory
-  save_path <- file.path(getwd(), "saved_data.rds")
+  # Use the selected directory
+  save_path <- file.path(save_directory(), "saved_data.rds")
+  
+  # Check if directory exists, create if it doesn't
+  if (!dir.exists(save_directory())) {
+    dir.create(save_directory(), recursive = TRUE)
+  }
   
   # Save the full_data object to an RDS file
-  saveRDS(full_data(), save_path)
-  
-  # Provide feedback to the user
-  showModal(modalDialog(
-    title = "Data Saved",
-    paste("Your data has been saved to:", save_path)
-  ))
+  tryCatch({
+    saveRDS(full_data(), save_path)
+    
+    # Provide feedback to the user
+    showModal(modalDialog(
+      title = "Data Saved",
+      paste("Your data has been saved to:", save_path),
+      easyClose = TRUE
+    ))
+  }, error = function(e) {
+    showModal(modalDialog(
+      title = "Error Saving Data",
+      paste("Failed to save data:", e$message),
+      easyClose = TRUE
+    ))
+  })
 })
 
 # Observer for loading the data
@@ -818,23 +902,23 @@ observeEvent(input$load_data, {
     easyClose = TRUE
   ))
     
-    # Update the map to reflect the loaded data
+  # Update the map to reflect the loaded data
   dynamic_palette <- colorNumeric(palette = "viridis", domain = full_data()$asunum)
   
-    leafletProxy("edit_map") %>%
-      clearGroup("tracts") %>%
-      addPolygons(data = full_data(), 
-                  layerId = ~GEOID, weight = 1, color = "black", fillOpacity = 0.5, 
-                  fillColor = ~ifelse(asunum != 0, 
-                                      dynamic_palette(asunum), 
-                                      "#444444"), 
-                  label = ~paste0("ASU: ", asunum,
-                                  " || GEOID: ", GEOID,
-                                  " || Unemployment Rate: ", tract_ASU_urate,
-                                  " || Unemployment: ", tract_ASU_unemp,
-                                  " || Population: ", tract_pop_cur),
-                  highlightOptions = highlightOptions(color = "white", weight = 2, bringToFront = TRUE))
-  })
+  leafletProxy("edit_map") %>%
+    clearGroup("tracts") %>%
+    addPolygons(data = full_data(), 
+                layerId = ~GEOID, weight = 1, color = "black", fillOpacity = 0.5, 
+                fillColor = ~ifelse(asunum != 0, 
+                                    dynamic_palette(asunum), 
+                                    "#444444"), 
+                label = ~paste0("ASU: ", asunum,
+                                " || GEOID: ", GEOID,
+                                " || Unemployment Rate: ", tract_ASU_urate,
+                                " || Unemployment: ", tract_ASU_unemp,
+                                " || Population: ", tract_pop_cur),
+                highlightOptions = highlightOptions(color = "white", weight = 2, bringToFront = TRUE))
+})
 
 ```
 
@@ -843,7 +927,6 @@ observeEvent(input$load_data, {
 ```{r}
 
 ```
-
 
 
 ASU Review and Finalization
@@ -866,8 +949,10 @@ numericInput("asu_ur", "ASU Unemployment Rate Threshold:", value = 6.45, min = 0
 numericInput("asu_pop", "ASU Population Threshold:", value = 10000, min = 0)
 
 actionButton("run_asu_summary", "Generate ASU Summary")
+renderUI(HTML("<hr>"))
 
 actionButton("lss_txt", "Generate LSS .txt File")
+renderUI(HTML("<hr>"))
 
 actionButton("review_txt", "Create Summary CSV")
 
@@ -913,7 +998,7 @@ output$asu_review <- renderTable({
 
 observeEvent(input$lss_txt, {
   
-    req(full_data())
+  req(full_data())
 
   # Function to generate text content
   generate_txt <- function() {
@@ -933,47 +1018,129 @@ observeEvent(input$lss_txt, {
     return(txt_content)
   }
 
+  # Get the current save directory from the reactive value
+  current_dir <- save_directory()
+  
+  # Validate directory path
+  if (is.null(current_dir) || current_dir == "") {
+    showModal(modalDialog(
+      title = "No Directory Selected",
+      "Please select a save directory first in the Save and Load Data tab.",
+      easyClose = TRUE
+    ))
+    return()
+  }
+
   # Create the content
   txt_content <- generate_txt()
 
-  filePath <- file.path("lss_batch_file.txt")
+  # Use the selected save directory
+  filePath <- file.path(current_dir, "lss_batch_file.txt")
   
-  # Download the file
-  writeLines(txt_content, filePath)
-  fileUrl <- "lss_batch_file.txt"
-  js <- sprintf("window.location.href='%s';", fileUrl)
-  shinyjs::runjs(js)
-
+  # Ensure directory exists
+  if (!dir.exists(current_dir)) {
+    tryCatch({
+      dir.create(current_dir, recursive = TRUE)
+    }, error = function(e) {
+      showModal(modalDialog(
+        title = "Directory Error",
+        paste("Cannot create directory:", current_dir, "\nError:", e$message),
+        easyClose = TRUE
+      ))
+      return()
+    })
+  }
+  
+  tryCatch({
+    # Write the file
+    writeLines(txt_content, filePath)
+    
+    # Show success message with file location
+    showModal(modalDialog(
+      title = "File Created Successfully",
+      HTML(paste0(
+        "<strong>LSS batch file has been saved to:</strong><br>",
+        "<code>", filePath, "</code>"
+      )),
+      easyClose = TRUE
+    ))
+    
+  }, error = function(e) {
+    showModal(modalDialog(
+      title = "Error Creating File",
+      paste("Failed to create LSS file:", e$message),
+      easyClose = TRUE
+    ))
+  })
 })
-
 
 observeEvent(input$review_txt, {
 
-    req(full_data())
+  req(full_data())
 
-    # Function to generate CSV content
-    generate_csv <- function() {
-        df <- full_data() %>%
-            st_drop_geometry() %>%
-          arrange(asunum, GEOID)
-        
-        return(df)
-    }
-
-    # Create the content
-    df <- generate_csv()
-
-    filePath <- file.path("ASU Review File.csv")
+  # Function to generate CSV content
+  generate_csv <- function() {
+    df <- full_data() %>%
+      st_drop_geometry() %>%
+      arrange(asunum, GEOID)
     
+    return(df)
+  }
+  
+  # Get the current save directory from the reactive value
+  current_dir <- save_directory()
+  
+  # Validate directory path
+  if (is.null(current_dir) || current_dir == "") {
+    showModal(modalDialog(
+      title = "No Directory Selected",
+      "Please select a save directory first in the Save and Load Data tab.",
+      easyClose = TRUE
+    ))
+    return()
+  }
+
+  # Create the content
+  df <- generate_csv()
+
+  # Use the selected save directory
+  filePath <- file.path(current_dir, "ASU_Review_File.csv")
+  
+  # Ensure directory exists
+  if (!dir.exists(current_dir)) {
+    tryCatch({
+      dir.create(current_dir, recursive = TRUE)
+    }, error = function(e) {
+      showModal(modalDialog(
+        title = "Directory Error",
+        paste("Cannot create directory:", current_dir, "\nError:", e$message),
+        easyClose = TRUE
+      ))
+      return()
+    })
+  }
+  
+  tryCatch({
     # Write the CSV file
     write.csv(df, filePath, row.names = FALSE)
     
-    fileUrl <- "ASU Review File.csv"
+    # Show success message with file location
+    showModal(modalDialog(
+      title = "File Created Successfully",
+      HTML(paste0(
+        "<strong>ASU Review CSV has been saved to:</strong><br>",
+        "<code>", filePath, "</code>"
+      )),
+      easyClose = TRUE
+    ))
     
-    # Trigger the download
-    js <- sprintf("window.location.href='%s';", fileUrl)
-    shinyjs::runjs(js)
-
+  }, error = function(e) {
+    showModal(modalDialog(
+      title = "Error Creating File",
+      paste("Failed to create CSV file:", e$message),
+      easyClose = TRUE
+    ))
+  })
 })
 
 
@@ -991,6 +1158,10 @@ observeEvent(input$review_txt, {
 
 
 ```
+
+```
+
+
 
 
 
