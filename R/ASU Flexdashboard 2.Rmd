@@ -402,36 +402,41 @@ To modify the assigned ASU, with tracts selected, use the *Update* button to upd
 To undo your work and return to the initially-designated data, use the *Reset* button.
 
 ```{r}
-
-actionButton("preview", "Show Data for Selected Tracts")
-
-asu_choices <- reactive(full_data() %>% pull(asunum) %>% unique() %>% sort())
-
+# Select an ASU
 asu_selection_ui <- reactive({
   selectInput("select_asunum", "Select ASU Number:",
               choices = c("None", asu_choices()),
               selected = "None")
 })
-
 renderUI(asu_selection_ui())
-
 renderUI(HTML("<hr>"))
 
-numericInput("percentile", "Percentile Threshold:", value = 10, min = 1, max = 100, step = 1)
-actionButton("filter_percentile", "Filter Selected Tracts by UR Percentile")
-
-renderUI(HTML("<hr>"))
-
-textInput("manual_geoid", "Enter a GEOID:", placeholder = "32031990000")
-actionButton("select_geoid", "Select a Single Tract")
-
-renderUI(HTML("<hr>"))
-
+# Change ASU
 numericInput("new_asu", "Change ASU Value:", value = 0, min = 0)
 actionButton("update", "Update Selected Tracts")
-
 renderUI(HTML("<hr>"))
 
+# Clear Selected Tracts
+actionButton("clear", "Clear Selected Tracts")
+renderUI(HTML("<hr>"))
+
+# Show Data for Selection
+actionButton("preview", "Show Data for Selected Tracts")
+asu_choices <- reactive(full_data() %>% pull(asunum) %>% unique() %>% sort())
+
+
+# Show Lowest UR Tracts in Selection
+numericInput("percentile", "Percentile Threshold:", value = 5, min = 1, max = 100, step = 1)
+actionButton("filter_percentile", "Show Tracts with Lowest UR")
+renderUI(HTML("<hr>"))
+
+
+# Single GROID Selection
+textInput("manual_geoid", "Enter a GEOID:", placeholder = "32031990000")
+actionButton("select_geoid", "Select a Single Tract")
+renderUI(HTML("<hr>"))
+
+# Reset to Initial Load
 actionButton("reset", "Reset to Initial Data")
 
 
@@ -455,12 +460,12 @@ actionButton("reset", "Reset to Initial Data")
 #                                      tract_ASU_urate = numeric(),
 #                                      stringsAsFactors = FALSE))
 
+maplibreOutput("edit_map", height = "90vh")
 
 tableOutput("selection_data")
 
 tableOutput("selection_summary")
 
-maplibreOutput("edit_map", height = "95vh")
 
 
 output$edit_map <- renderMaplibre({
@@ -489,7 +494,7 @@ output$edit_map <- renderMaplibre({
       ),
       fill_opacity = 0.5,
       fill_outline_color = "black",
-      popup = concat(
+      tooltip = concat(
         "<strong>ASU Number: </strong>", get_column("asunum"), "<br>",
         "<strong>Tract GEOID: </strong>", get_column("GEOID"), "<br>",
         "<strong>Tract Unemployment Rate: </strong>", number_format(get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2), "%<br>",
@@ -538,6 +543,17 @@ observeEvent(input$edit_map_feature_click, {
   output$selection_table <- renderTable({
     selected_tracts()
   })
+})
+
+# Clear Selected Tracts on Button Click
+observeEvent(input$clear, {
+  
+  selected_tracts(NULL)
+  
+  # Update the map highlighting
+    maplibre_proxy("edit_map") %>%
+      clear_layer("selected")
+    return()
 })
 
 # Fix: Single observeEvent for selecting tracts by ASU number
@@ -870,6 +886,7 @@ observeEvent(input$run_asu_summary, {
     ) %>%
     ungroup() %>%
     mutate(
+      asu_num = round(asunum),
       ur_qualified = if_else(ur >= input$asu_ur, TRUE, FALSE),
       pop_qualified = if_else(population >= input$asu_pop, TRUE, FALSE),
       asu_qualified = ur_qualified & pop_qualified
