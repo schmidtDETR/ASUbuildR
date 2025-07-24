@@ -32,3 +32,6 @@ Imports:
     sfdep,
     shiny,
     tigris
+Suggests: 
+    knitr
+VignetteBuilder: knitr

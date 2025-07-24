@@ -341,7 +341,7 @@ maplibreOutput("initial_map", height = "100vh")
 
 ```
 
-Modify ASU Selections - Tracts
+Modify ASU Selections
 ==========================
 
 ## Controls {data-width=150}
