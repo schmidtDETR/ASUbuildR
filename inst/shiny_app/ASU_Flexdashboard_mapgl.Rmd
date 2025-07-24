@@ -10,15 +10,12 @@ runtime: shiny
 ```{r setup, include=FALSE}
 library(shiny)
 library(flexdashboard)
-library(formattable)
-library(leaflet)
 library(mapgl)
 library(tigris)
 library(sf)
 library(sfdep)
 library(tidyverse)
 library(readxl)
-library(mapview)
 
 options(shiny.maxRequestSize = 50 * 1024^2)  # Set to 50MB or your desired limit
 
@@ -238,7 +235,7 @@ observeEvent(input$process, {
            asunum = as.integer(asunum),
            tract_ASU_clf = as.integer(tract_ASU_clf),
            tract_pop_cur = as.integer(tract_pop_cur),
-           tract_ASU_unemp - as.integer(tract_ASU_unemp)) %>%
+           tract_ASU_unemp = as.integer(tract_ASU_unemp)) %>%
     full_data()
   
   # Reactive full_data_reset gets all tracts, merged with ASU data, saved for resetting modifications.
@@ -250,7 +247,7 @@ observeEvent(input$process, {
            asunum = as.integer(asunum),
            tract_ASU_clf = as.integer(tract_ASU_clf),
            tract_pop_cur = as.integer(tract_pop_cur),
-           tract_ASU_unemp - as.integer(tract_ASU_unemp)) %>%
+           tract_ASU_unemp = as.integer(tract_ASU_unemp)) %>%
     full_data_reset()
   
   # Reactive asu_data contains geometry and continuity data
@@ -281,22 +278,13 @@ observeEvent(input$process, {
   output$asu <- renderTable({
     asu_summary()
   })
-  
-  dynamic_palette <- colorNumeric(palette = "viridis", domain = ASU_assigned$asunum)
-  
+
   
 # Convert to MapLibre
 output$initial_map <- renderMaplibre({
   
   # Prepare the data with colors
   map_data <- full_data()
-  
-  # # Add fill colors to the data
-  # map_data$fill <- ifelse(
-  #   map_data$GEOID %in% ASU_assigned$GEOID,
-  #   dynamic_palette(ASU_assigned$asunum[match(map_data$GEOID, ASU_assigned$GEOID)]),
-  #   "#444444"
-  # )
   
   number_asus <- max(map_data$asunum)
   number_categories <- min(c(number_asus,8))
@@ -337,39 +325,6 @@ output$initial_map <- renderMaplibre({
 })  
 
 
-    
-    # # Add interactivity - tooltip on hover
-    # add_tooltip(
-    #   c("asunum", "GEOID", "tract_ASU_urate"),
-    #   template = "ASU: {{asunum}} || GEOID: {{GEOID}} || Unemployment Rate: {{tract_ASU_urate}}"
-    # ) #%>%
-    # 
-    # # Add hover effects using paint properties
-    # add_fill_layer(
-    #   source = map_data,
-    #   fill_color = list(
-    #     "case",
-    #     list("boolean", list("feature-state", "hover"), false),
-    #     "white",  # hover color
-    #     list("get", "fill_color")  # default color
-    #   ),
-    #   fill_opacity = 0.5,
-    #   line_color = list(
-    #     "case", 
-    #     list("boolean", list("feature-state", "hover"), false),
-    #     "white",  # hover border color
-    #     "black"   # default border color
-    #   ),
-    #   line_width = list(
-    #     "case",
-    #     list("boolean", list("feature-state", "hover"), false),
-    #     2,  # hover border width
-    #     1   # default border width
-    #   )
-    # )
-
-  
-  
 })
 
 
@@ -386,7 +341,7 @@ maplibreOutput("initial_map", height = "100vh")
 
 ```
 
-Modify ASU Selections - Tracts
+Modify ASU Selections
 ==========================
 
 ## Controls {data-width=150}
@@ -489,9 +444,7 @@ output$edit_map <- renderMaplibre({
     full_brewer_pal <- RColorBrewer::brewer.pal(actual_categories, "Accent")
     brewer_pal <- full_brewer_pal[1:number_categories]  # Take only what we need
   }
-  
-  dynamic_palette <- colorNumeric(palette = "viridis", domain = full_data()$asunum)
-  
+
   maplibre(style = carto_style("positron")) |>
     fit_bounds(full_data(), animate = FALSE) |> 
     add_fill_layer(
@@ -573,7 +526,7 @@ observeEvent(input$clear, {
     return()
 })
 
-# Fix: Single observeEvent for selecting tracts by ASU number
+# Select tracts in an ASU from dropdown
 observeEvent(input$select_asunum, {
   req(full_data())
   
@@ -609,7 +562,7 @@ observeEvent(input$select_asunum, {
     fit_bounds(selected_data, animate = TRUE)
 })
 
-# New observeEvent for manually selecting a GEOID using MapLibre
+# Select a single tract given a GEOID
 observeEvent(input$select_geoid, {
   req(full_data())
   
@@ -680,7 +633,7 @@ observeEvent(input$filter_percentile, {
 })
 
 
-
+# Calculate and display a table of data for selected tracts
 observeEvent(input$preview, {
   req(selected_tracts())
 
@@ -708,7 +661,7 @@ observeEvent(input$preview, {
 
 })
 
-
+# Update selected tracts to new ASU number.
 observeEvent(input$update, {
   req(selected_tracts(), full_data())
   
@@ -732,6 +685,8 @@ observeEvent(input$update, {
     clear_layer("selected")
 })
 
+
+# Reset data to initial data load from Excel input
 observeEvent(input$reset, {
   req(full_data_reset(), full_data())
   
