@@ -472,24 +472,36 @@ output$edit_map <- renderMaplibre({
   
   req(full_data())
   
-  # Fix: Use full_data() instead of map_data (assuming map_data should be full_data)
   number_asus <- max(full_data()$asunum)
   number_categories <- min(c(number_asus, 8))
   asu_per_category <- number_asus/number_categories
-  brewer_pal <- RColorBrewer::brewer.pal(number_categories, "Accent")
+  
+  # Create breaks for ASU categories, excluding 0
+  if (number_categories == 1) {
+    # Single ASU: just need one break at 1
+    asu_breaks <- 1
+    actual_categories <- 1
+    brewer_pal <- "#7FC97F"  # Single color
+  } else {
+    # Multiple ASUs: create breaks from 1 to max, evenly spaced
+    asu_breaks <- seq(from = 1, to = number_asus, length.out = number_categories)
+    actual_categories <- max(3, number_categories)  # Ensure minimum of 3 for brewer.pal
+    full_brewer_pal <- RColorBrewer::brewer.pal(actual_categories, "Accent")
+    brewer_pal <- full_brewer_pal[1:number_categories]  # Take only what we need
+  }
   
   dynamic_palette <- colorNumeric(palette = "viridis", domain = full_data()$asunum)
   
- maplibre(style = carto_style("positron")) |>
+  maplibre(style = carto_style("positron")) |>
     fit_bounds(full_data(), animate = FALSE) |> 
     add_fill_layer(
       id = "basemap",
       source = full_data(),
       fill_color = step_expr(
         column = "asunum",
-        base = "#808080",  # Grey for asunum == 0
-        stops = brewer_pal[1:number_categories],
-        values = c(0.5, seq(1+asu_per_category, number_asus, asu_per_category)),
+        base = "#808080",  # Grey for asunum == 0 (and anything < first break)
+        stops = brewer_pal,
+        values = asu_breaks,
         na_color = "#444444"
       ),
       fill_opacity = 0.5,
