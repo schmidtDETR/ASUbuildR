@@ -820,7 +820,7 @@ observeEvent(input$browse_dir, {
 
 # Display current save directory
 output$current_save_dir <- renderText({
-  paste("Current save directory:", save_directory())
+  paste("Current save directory: ", save_directory())
 })
 
 # Display directory status
@@ -901,23 +901,49 @@ observeEvent(input$load_data, {
     "Your data has been successfully loaded.",
     easyClose = TRUE
   ))
-    
-  # Update the map to reflect the loaded data
-  dynamic_palette <- colorNumeric(palette = "viridis", domain = full_data()$asunum)
   
-  leafletProxy("edit_map") %>%
-    clearGroup("tracts") %>%
-    addPolygons(data = full_data(), 
-                layerId = ~GEOID, weight = 1, color = "black", fillOpacity = 0.5, 
-                fillColor = ~ifelse(asunum != 0, 
-                                    dynamic_palette(asunum), 
-                                    "#444444"), 
-                label = ~paste0("ASU: ", asunum,
-                                " || GEOID: ", GEOID,
-                                " || Unemployment Rate: ", tract_ASU_urate,
-                                " || Unemployment: ", tract_ASU_unemp,
-                                " || Population: ", tract_pop_cur),
-                highlightOptions = highlightOptions(color = "white", weight = 2, bringToFront = TRUE))
+  # Recreate the color scheme logic (same as in renderMaplibre)
+  number_asus <- max(full_data()$asunum)
+  number_categories <- min(c(number_asus, 8))
+  asu_per_category <- number_asus/number_categories
+  
+  # Create breaks for ASU categories, excluding 0
+  if (number_categories == 1) {
+    # Single ASU: just need one break at 1
+    asu_breaks <- 1
+    actual_categories <- 1
+    brewer_pal <- "#7FC97F"  # Single color
+  } else {
+    # Multiple ASUs: create breaks from 1 to max, evenly spaced
+    asu_breaks <- seq(from = 1, to = number_asus, length.out = number_categories)
+    actual_categories <- max(3, number_categories)  # Ensure minimum of 3 for brewer.pal
+    full_brewer_pal <- RColorBrewer::brewer.pal(actual_categories, "Accent")
+    brewer_pal <- full_brewer_pal[1:number_categories]  # Take only what we need
+  }
+  
+  # Update the map using maplibre_proxy
+  maplibre_proxy("edit_map") |>
+    clear_layer("basemap") |>
+    add_fill_layer(
+      id = "basemap",
+      source = full_data(),
+      fill_color = step_expr(
+        column = "asunum",
+        base = "#808080",  # Grey for asunum == 0 (and anything < first break)
+        stops = brewer_pal,
+        values = asu_breaks,
+        na_color = "#444444"
+      ),
+      fill_opacity = 0.5,
+      fill_outline_color = "black",
+      tooltip = concat(
+        "<strong>ASU Number: </strong>", get_column("asunum"), "<br>",
+        "<strong>Tract GEOID: </strong>", get_column("GEOID"), "<br>",
+        "<strong>Tract Unemployment Rate: </strong>", number_format(get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2), "%<br>",
+        "<strong>Tract Unemployment: </strong>", number_format(get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0), "<br>"
+      )
+    ) |>
+    fit_bounds(full_data(), animate = TRUE)
 })
 
 ```
@@ -949,6 +975,9 @@ numericInput("asu_ur", "ASU Unemployment Rate Threshold:", value = 6.45, min = 0
 numericInput("asu_pop", "ASU Population Threshold:", value = 10000, min = 0)
 
 actionButton("run_asu_summary", "Generate ASU Summary")
+renderUI(HTML("<hr>"))
+
+textOutput("current_save_dir")
 renderUI(HTML("<hr>"))
 
 actionButton("lss_txt", "Generate LSS .txt File")
