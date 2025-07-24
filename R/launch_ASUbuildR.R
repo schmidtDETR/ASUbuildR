@@ -29,7 +29,7 @@ library(shiny)
 #' @seealso \code{\link[rmarkdown]{run}} for more details on running Shiny documents
 #'
 #' @export
-launch_ASUbuildR <- function(rmd_file = "R/ASU Flexdashboard.Rmd") {
+launch_ASUbuildR <- function(rmd_file = "R/ASU Flexdashboard - mapgl.Rmd") {
 
   # Check if the RMD file exists
   if (!file.exists(rmd_file)) {
