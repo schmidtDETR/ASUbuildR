@@ -20,8 +20,7 @@ library(readxl)
 
 source("../../R/run_asu_original.R",  local = TRUE)
 source("../../R/run_tract_hunter.R",  local = TRUE)
-# source("S:/ra/RADUMP/aisolorio/Code Projects/ASUbuildR/R/run_asu_original.r", local = TRUE)
-# source("S:/ra/RADUMP/aisolorio/Code Projects/ASUbuildR/R/run_tract_hunter.r", local = TRUE)
+
 # cache every tigris download automatically
 options(
   tigris_use_cache = TRUE,                 # turn caching on
