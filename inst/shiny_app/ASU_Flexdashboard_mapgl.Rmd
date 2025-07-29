@@ -312,6 +312,7 @@ output$initial_map <- renderMaplibre({
       popup = concat(
         "<strong>ASU Number: </strong>",get_column("asunum"), "<br>",
         "<strong>Tract GEOID: </strong>",get_column("GEOID"),"<br>",
+        "<strong>Tract Population: </strong>",number_format(get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0),"<br>",
         "<strong>Tract Unemployment Rate: </strong>",number_format(get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2),"%<br>",
         "<strong>Tract Unemployment: </strong>",number_format(get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0),"<br>")
     ) |>
@@ -460,11 +461,11 @@ output$edit_map <- renderMaplibre({
       fill_opacity = 0.5,
       fill_outline_color = "black",
       tooltip = concat(
-        "<strong>ASU Number: </strong>", get_column("asunum"), "<br>",
-        "<strong>Tract GEOID: </strong>", get_column("GEOID"), "<br>",
-        "<strong>Tract Unemployment Rate: </strong>", number_format(get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2), "%<br>",
-        "<strong>Tract Unemployment: </strong>", number_format(get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0), "<br>"
-      )
+        "<strong>ASU Number: </strong>",get_column("asunum"), "<br>",
+        "<strong>Tract GEOID: </strong>",get_column("GEOID"),"<br>",
+        "<strong>Tract Population: </strong>",number_format(get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0),"<br>",
+        "<strong>Tract Unemployment Rate: </strong>",number_format(get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2),"%<br>",
+        "<strong>Tract Unemployment: </strong>",number_format(get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0),"<br>")
     )
 })
 
