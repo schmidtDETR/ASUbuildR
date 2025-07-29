@@ -17,8 +17,18 @@ library(sfdep)
 library(tidyverse)
 library(readxl)
 
-source("REPLACE with file location for original_tract_builder", local = TRUE)
-source("Replace with file location for tract hunter", local = TRUE)
+
+source("../../R/run_asu_original.R",  local = TRUE)
+source("../../R/run_tract_hunter.R",  local = TRUE)
+# source("S:/ra/RADUMP/aisolorio/Code Projects/ASUbuildR/R/run_asu_original.r", local = TRUE)
+# source("S:/ra/RADUMP/aisolorio/Code Projects/ASUbuildR/R/run_tract_hunter.r", local = TRUE)
+# cache every tigris download automatically
+options(
+  tigris_use_cache = TRUE,                 # turn caching on
+  tigris_class     = "sf"                  # always return sf objects
+)
+
+>>>>>>> afbd2e3 (Added progress bar, Created relative paths for algorithms. Updated descriptions of algorithms)
 options(shiny.maxRequestSize = 50 * 1024^2)  # Set to 50MB or your desired limit
 
 # Initialize reactive values
@@ -151,13 +161,6 @@ Load Initial ASU
 
 ## Controls {data-width=200}
 
-This button will launch two processes, which will take up to 5 minutes to complete. For smaller states, it may take under 15 seconds.
-
-First, the application will download census shapefiles by tract for the appropriate state and year. Next, after combining the BLS file with these shapefiles, it will iteratively search for contiguous geographic regions until the combined unemployment rate in each region is as close to 6.45% as possible.
-
-When this process is complete, a map will appear to the right, and a summary of the created ASU regions will appear below.  It is important to note, these will still include areas that do not qualify as an independent ASU (there is no check for population), but it gives the analyst a starting place for analysis.
-
-Once this step is done, you may proceed to the next step.
 
 ```{r}
 radioButtons(
@@ -169,48 +172,115 @@ radioButtons(
   inline = TRUE
 )
 actionButton("process", "Load Tracts and Initialize ASU")
+# ---- dynamic algorithm description ------------------------------------
+output$algo_blurb <- renderUI({
+
+  if (is.null(input$asu_algo) || input$asu_algo == "orig") {
+
+    # --- ORIGINAL TEXT: leave exactly as you had it --------------------
+    HTML(
+      "<p>
+        This button will launch two processes, which will take up to 5&nbsp;minutes
+        to complete. For smaller states, it may take under 15&nbsp;seconds.
+      </p>
+      <p>
+        First, the application will download census shapefiles by tract for the
+        appropriate state and year. Next, after combining the BLS file with these
+        shapefiles, it will iteratively search for contiguous geographic regions
+        until the combined unemployment rate in each region is as close to
+        6.45 % as possible.
+      </p>
+      <p>
+        When this process is complete, a map will appear to the right, and a
+        summary of the created ASU regions will appear below. It is important to
+        note these will still include areas that do not qualify as an independent
+        ASU (there is no check for population), but it gives the analyst a
+        starting place for analysis.
+      </p>
+      <p>
+        Once this step is done, you may proceed to the next step.
+      </p>"
+    )
+
+  } else {  # ---- TRACT HUNTER TEXT ------------------------------------
+
+    HTML(
+  "<p>
+     <strong>Tract&nbsp;Hunter algorithm:</strong>
+     begins with the single tract that has the highest unemployment rate,
+     then <em>expands</em> by attaching <u>directly adjacent</u> tracts while
+     the combined rate stays&nbsp;&ge;&nbsp;6.45&nbsp;%.  If adding a
+     neighbour pulls the rate below the threshold, the routine performs a
+     <em>trade&nbsp;pass</em>&nbsp;&mdash;dropping low-unemployment tracts and
+     adding higher-unemployment neighbours&nbsp;&mdash;until the target is met
+     or no legal trade remains.
+   </p>
+   <ul>
+     <li>Every tract added or traded keeps the region contiguous.</li>
+     <li>Population may grow, but only regions &ge; 10 000 people are kept.</li>
+     <li>After the first pass, neighbouring ASUs that share a boundary are
+         merged, and a second pass sweeps up any remaining eligible tracts.</li>
+     <li>The progress bar’s detail line (<code>Targeting … Remaining …</code>)
+         comes straight from the optimisation loop.</li>
+   </ul>
+   <p>
+     Because this algorithm is more complex, it takes longer than the original
+     method, but it is more likely to produce valid ASU clusters and to capture
+     a higher total number of unemployed individuals within those clusters.
+   </p>"
+)
+
+
+  }
+})
+
+uiOutput("algo_blurb")
+
 tableOutput("asu")
 
 observeEvent(input$process, {
-  ## 1. Build the base tract+BLS data --------------------------
-  tract_list <- tracts(state = state(), year = tract_year()) |>
-    mutate(
-      row_num = row_number(),
-      continuous = st_contiguity(geometry)
-    )
+  
+  ## 0 · Basic checks ----------------------------------------------------
+  req(uploaded_data(), state(), tract_year())
 
-  data_merge <- tract_list |>
-    left_join(uploaded_data(), by = "GEOID") #|>
-    #arrange(desc(tract_ASU_urate), desc(tract_ASU_unemp))
+  ## 1 · Wrap the whole long job in withProgress -------------------------
+  withProgress(message = "Running ASU initialisation…", value = 0, {
 
-  ## 2. Run the chosen ASU algorithm -----------------------------
-  algo_choice <- isolate(input$asu_algo %||% "orig")
-  
-  if (algo_choice == "orig") {
-  res <- run_asu_original(tract_list, uploaded_data())
-} else {
-  res <- run_tract_hunter(tract_list, uploaded_data())   # ← new call
-}
-  
-  # 🔧 Ensure geometries are MULTIPOLYGON for maplibregl
-  if (!inherits(res$full_data, "sf")) {
-    stop("res$full_data is not an sf object")
-  }
-  
-  res$full_data <- sf::st_cast(res$full_data, "MULTIPOLYGON", warn = FALSE)
-  
-  ## 3. Push results into the reactiveVals already used elsewhere
-  full_data(res$full_data)
-  full_data_reset(res$full_data_reset)
-  asu_data(res$asu_data)
-  asu_tracts(res$asu_tracts)
-  asu_summary(res$asu_summary)
-  map_data_dbg(res$full_data)  
+    ## 1a · Build tracts + neighbours (can take ~10–60 s the first time)
+    incProgress(0.10, detail = "Downloading Census shapefiles…")
+    tract_list <- tracts(state = state(), year = tract_year()) |>
+      mutate(
+        row_num    = row_number(),
+        continuous = st_contiguity(geometry)
+      )
 
-  ## 4. Render the summary table shown just under the button -----
-  output$asu <- renderTable({
-    asu_summary()
-  })
+    ## 1b · Merge the BLS data
+    incProgress(0.05, detail = "Merging BLS unemployment data…")
+    data_merge <- tract_list |>
+      left_join(uploaded_data(), by = "GEOID")
+
+    # 2 · Run the chosen ASU algorithm ---------------------------------
+    algo_choice <- isolate(input$asu_algo %||% "orig")
+    
+    incProgress(0.05, detail = "Finding initial ASU seeds…")
+    res <- if (algo_choice == "orig") {
+      run_asu_original(tract_list, uploaded_data())      # <- no verbose here
+    } else {
+      run_tract_hunter(tract_list, uploaded_data(),       # <- keep verbose
+                       verbose = TRUE)
+    }
+
+
+    ## 3 · Finish the bar
+    incProgress(1, detail = "Finishing up…")
+  })  # ---- withProgress ends here  -------------------------------------
+
+  ## 4 · Store results & draw map  --------------------------------------
+  full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
+  asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
+  asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
+
+  output$asu <- renderTable( asu_summary() )
   
   ## 5. (Re‑)draw the first map ----------------------------------
   output$initial_map <- renderMaplibre({
@@ -1163,15 +1233,8 @@ observeEvent(input$review_txt, {
 
 ```
 
-
-
 Debugging
 =======================================
 ```{r}
 verbatimTextOutput("map_data_preview")
 ```
-
-
-
-
-

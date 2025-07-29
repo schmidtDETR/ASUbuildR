@@ -11,6 +11,16 @@ run_tract_hunter <- function(tract_list,
     library(sf); library(dplyr); library(glue); library(igraph); library(crayon)
   })
 
+  # --- progress helper ---------------------------------------------------
+  update_status <- function(msg) {
+    # If we're running inside a Shiny session *and* inside a withProgress block
+    if (requireNamespace("shiny", quietly = TRUE) && shiny::isRunning()) {
+      shiny::incProgress(amount = 0, detail = msg)   # 0 ⇒ just change the text
+    } else if (isTRUE(verbose)) {
+      cat("\r", msg); flush.console()
+    }
+  }
+
 
   # ---- 0 · PREP --------------------------------------------------------
   data_merge <- tract_list %>%
@@ -569,10 +579,9 @@ run_tract_hunter <- function(tract_list,
         unemp_tot        <- sum(unemp_vec[tracts_in_asu])
 
         if (verbose) {
-          cat(
-            glue("\rTargeting: {target_index} | Remaining: {nrow(tracts_not_in_asu) - i} | Unemployed: {unemp_tot}     ")
+          update_status(
+            glue("Targeting: {target_index} | Remaining: {nrow(tracts_not_in_asu) - i} | Unemployed: {unemp_tot}")
           )
-          flush.console()
         }
 
         if (isTRUE(ok)) {        # update succeeded
