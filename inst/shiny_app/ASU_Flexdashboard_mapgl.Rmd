@@ -27,7 +27,7 @@ options(
   tigris_class     = "sf"                  # always return sf objects
 )
 
->>>>>>> afbd2e3 (Added progress bar, Created relative paths for algorithms. Updated descriptions of algorithms)
+
 options(shiny.maxRequestSize = 50 * 1024^2)  # Set to 50MB or your desired limit
 
 # Initialize reactive values
