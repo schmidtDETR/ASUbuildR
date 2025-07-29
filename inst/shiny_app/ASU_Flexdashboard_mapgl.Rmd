@@ -1,10 +1,13 @@
 ---
-title: "ASU Designation Program"
+title: "ASUbuildR"
 output: 
   flexdashboard::flex_dashboard:
     orientation: columns
     vertical_layout: scroll
 runtime: shiny
+editor_options: 
+  markdown: 
+    wrap: 72
 ---
 
 ```{r setup, include=FALSE}
@@ -33,6 +36,7 @@ selected_tracts <- reactiveVal(NULL)
 edit_table <- reactiveVal(NULL)
 edit_summary <- reactiveVal(NULL)
 current_selection <- reactiveVal(NULL)
+highlighted_tracts <- reactiveVal(character(0))
 
 
 
@@ -70,16 +74,22 @@ excel_names <- c("record",
 
 ```
 
-Data Initialization
-=============================
+# Data Initialization
 
-## Controls {data-width=150}
+## Controls {data-width="150"}
 
-This screen allows you to import the BLS-provided ASU file, generally named like *NV_asu23.xlsx* which will be the only external data import step necessary.  The script will read the file, extract the state and corresponding year, and standardize the column names to avoid annual updates to the script.
+This screen allows you to import the BLS-provided ASU file, generally
+named like *NV_asu23.xlsx* which will be the only external data import
+step necessary. The script will read the file, extract the state and
+corresponding year, and standardize the column names to avoid annual
+updates to the script.
 
-If the necessary data is not in columns A through AB within the Excel file, this process will not work correctly.
+If the necessary data is not in columns A through AB within the Excel
+file, this process will not work correctly.
 
-Once the file is loaded, a preview of the data will appear on the right, the state and year will display below, and the analyst may proceed to the next tab (Load Initial ASU).
+Once the file is loaded, a preview of the data will appear on the right,
+the state and year will display below, and the analyst may proceed to
+the next tab (Load Initial ASU).
 
 ```{r}
 fileInput("file", "Choose Excel File", accept = c(".xls", ".xlsx"))
@@ -91,7 +101,7 @@ textOutput("selected_year")
 
 ```
 
-## Output {data-width=850}
+## Output {data-width="850"}
 
 ```{r}
 
@@ -143,16 +153,24 @@ observeEvent(input$file, {
 
 ```
 
-Load Initial ASU
-============================
+# Load Initial ASU
 
-## Controls {data-width=200}
+## Controls {data-width="200"}
 
-This button will launch two processes, which will take up to 5 minutes to complete. For smaller states, it may take under 15 seconds.
+This button will launch two processes, which will take up to 5 minutes
+to complete. For smaller states, it may take under 15 seconds.
 
-First, the application will download census shapefiles by tract for the appropriate state and year. Next, after combining the BLS file with these shapefiles, it will iteratively search for contiguous geographic regions until the combined unemployment rate in each region is as close to 6.45% as possible.
+First, the application will download census shapefiles by tract for the
+appropriate state and year. Next, after combining the BLS file with
+these shapefiles, it will iteratively search for contiguous geographic
+regions until the combined unemployment rate in each region is as close
+to 6.45% as possible.
 
-When this process is complete, a map will appear to the right, and a summary of the created ASU regions will appear below.  It is important to note, these will still include areas that do not qualify as an independent ASU (there is no check for population), but it gives the analyst a starting place for analysis.
+When this process is complete, a map will appear to the right, and a
+summary of the created ASU regions will appear below. It is important to
+note, these will still include areas that do not qualify as an
+independent ASU (there is no check for population), but it gives the
+analyst a starting place for analysis.
 
 Once this step is done, you may proceed to the next step.
 
@@ -334,7 +352,7 @@ output$initial_map <- renderMaplibre({
 
 ```
 
-## Output {data-width=800}
+## Output {data-width="800"}
 
 ```{r}
 
@@ -342,20 +360,11 @@ maplibreOutput("initial_map", height = "100vh")
 
 ```
 
-Modify ASU Selections
-==========================
+# Modify ASU Selections
 
-## Controls {data-width=150}
+## Controls {data-width="150" style="height: 100vh; overflow-y: auto; padding-right: 10px;"}
 
-Selecting tracts on the map to the right will allow you to modify the designated ASU from the inital selection methodology. Several tools are provided to manage this process.
-
-You may select tracts by clicking on the map, or by selecting a numbered ASU from the dropdown below to select all tracts in that ASU.  The *Preview* button will calculate metrics for all selected tracts.
-
-You may also choose to *Filter* selected tracts to find the lowest unemployment rates in an area.  This can be useful to omit low-unemployment tracts after adding tracts to connect isolated regions.
-
-To modify the assigned ASU, with tracts selected, use the *Update* button to update the ASU of selected tracts. To remove a tract from any ASUs, assign it to ASU zero.
-
-To undo your work and return to the initially-designated data, use the *Reset* button.
+These tools allow you to select, inspect, and change ASU designations for individual Census tracts.  *Selected* Census tracts will be outlined in red, and are the tracts updated when you change the ASU number.  You may also click on the map to select or unselect individual tracts. An ASU value of 0 means the tract is not included in any ASU.
 
 ```{r}
 # Select an ASU
@@ -380,12 +389,19 @@ renderUI(HTML("<hr>"))
 actionButton("preview", "Show Data for Selected Tracts")
 asu_choices <- reactive(full_data() %>% pull(asunum) %>% unique() %>% sort())
 
-
-# Show Lowest UR Tracts in Selection
-numericInput("percentile", "Percentile Threshold:", value = 5, min = 1, max = 100, step = 1)
-actionButton("filter_percentile", "Show Tracts with Lowest UR")
 renderUI(HTML("<hr>"))
 
+
+# Show Lowest UR Tracts in Selection
+selectInput("unemployment_filter", 
+             "Highlight selected tracts with:",
+             choices = list("Low unemployment" = "low", 
+                           "High unemployment" = "high"),
+             selected = "low")
+numericInput("percentile", "Percentile Threshold:", value = 5, min = 1, max = 100, step = 1)
+actionButton("filter_percentile", "Highlight Tracts")
+actionButton("clear_percentile", "Clear Highlights")
+renderUI(HTML("<hr>"))
 
 # Single GROID Selection
 textInput("manual_geoid", "Enter a GEOID:", placeholder = "32031990000")
@@ -404,7 +420,7 @@ actionButton("reset", "Reset to Initial Data")
 
 ```
 
-## Output {data-width=850}
+## Output {data-width="850"}
 
 ```{r}
 
@@ -469,7 +485,7 @@ output$edit_map <- renderMaplibre({
     )
 })
 
-# Corrected click event handler for MapLibre
+# Select or Unselect tracts on click
 observeEvent(input$edit_map_feature_click, {
   click <- input$edit_map_feature_click
   current_selection <- selected_tracts()
@@ -592,44 +608,70 @@ observeEvent(input$select_geoid, {
 
 
 
-# Filter selected tracts by percentile
-observeEvent(input$filter_percentile, {
+# Create a reactive expression that handles the filtering logic
+filtered_tracts <- reactive({
+  req(input$percentile, input$unemployment_filter, full_data(), selected_tracts())
   
-  req(input$percentile, full_data(), selected_tracts())
+  # selected_data <- full_data() %>%
+  #   filter(GEOID %in% selected_tracts())
   
-  # Calculate the threshold for the percentile based on selected tracts
-  selected_data <- full_data() %>%
-    filter(GEOID %in% selected_tracts())
+  potential_lighlights <- full_data() %>%
+    filter(GEOID %in% selected_tracts(),
+           tract_pop_cur > 0)
   
-  threshold <- quantile(selected_data$tract_ASU_urate, input$percentile/100)
+  #threshold <- quantile(potential_lighlights$tract_ASU_urate, input$percentile/100)
   
-  # Filter currently selected tracts by the new percentile threshold
-  filtered_selected <- selected_data %>%
-    filter(tract_ASU_urate <= threshold,
-           tract_ASU_urate > 0) %>%
-    pull(GEOID)
+  if (input$unemployment_filter == "low") {
+    
+    threshold <- quantile(potential_lighlights$tract_ASU_urate, input$percentile/100)
+    
+    filtered_selected <- potential_lighlights %>%
+      filter(tract_ASU_urate <= threshold,
+             tract_ASU_urate > 0) %>%
+      pull(GEOID)
+  } else {
+    
+    threshold <- quantile(potential_lighlights$tract_ASU_urate, 1-(input$percentile/100))
+    
+    filtered_selected <- potential_lighlights %>%
+      filter(tract_ASU_urate >= threshold,
+             tract_ASU_urate > 0) %>%
+      pull(GEOID)
+  }
   
-  # Update the selected_tracts reactive value with filtered selection
-  selected_tracts(filtered_selected)
+  return(filtered_selected)
+})
+
+# Single observer that responds to changes in either input
+observeEvent(list(input$filter_percentile, input$unemployment_filter), {
   
-  # Get the filtered data for selected tracts
+  filtered_selected <- filtered_tracts()
+  highlighted_tracts(filtered_selected)
+  
   filtered_data <- subset(full_data(), GEOID %in% filtered_selected)
   
-  # Update the map to highlight the newly filtered tracts using maplibre proxy
   maplibre_proxy("edit_map") %>%
-    clear_layer("selected") %>%
-    add_line_layer(
-      id = "selected",
+    clear_layer("highlighted") %>%
+    add_fill_layer(
+      id = "highlighted",
       source = filtered_data,
-      line_color = "red",
-      line_width = 3,
-      line_opacity = 1
+      fill_color = "black",
+      fill_opacity = 0.8
     )
   
-  # Update the selection table
-  output$selection_table <- renderTable({
-    filtered_selected
-  })
+  # output$selection_table <- renderTable({
+  #   filtered_selected
+  # })
+  
+})
+
+
+# Clear highlights with button click or when changing ASU selection
+
+observeEvent(list(input$clear_percentile, input$select_asunum), {
+  
+  maplibre_proxy("edit_map") %>%
+    clear_layer("highlighted")
   
 })
 
@@ -707,14 +749,16 @@ observeEvent(input$reset, {
 
 ```
 
-Save and Load Data
-==========================
+# Save and Load Data
 
-## Controls  {data-width=150}
+## Controls {data-width="150"}
 
-These buttons allow you to save the map in progress so that you can load it again in the future to continue your work.
+These buttons allow you to save the map in progress so that you can load
+it again in the future to continue your work.
 
-First, choose a save directory. The default is your current working directory. After loading data, you can go directly to the ASU Modification tab to continue making edits.
+First, choose a save directory. The default is your current working
+directory. After loading data, you can go directly to the ASU
+Modification tab to continue making edits.
 
 ```{r}
 
@@ -903,25 +947,30 @@ observeEvent(input$load_data, {
 
 ```
 
-## Output {data-width=850}
+## Output {data-width="850"}
 
 ```{r}
 
 ```
 
+# ASU Review and Finalization
 
-ASU Review and Finalization
-==========================
+## Controls {data-width="150"}
 
-## Controls {data-width=150}
+This screen will allow you to review your selected ASUs. It uses a
+threshold of 6.45% unemployment and a population of 10,000, but these
+numbers can be modified in case they change in the future.
 
-This screen will allow you to review your selected ASUs.  It uses a threshold of 6.45% unemployment and a population of 10,000, but these numbers can be modified in case they change in the future.
+*Generate ASU Summary* will show a table of all ASUs, and whether they
+pass or fail the ASU definitions for unemployment and population. Please
+pay attention to these measures - an unemployment rate of 6.449% will
+display as 6.45%, but will fail the validation.
 
-*Generate ASU Summary* will show a table of all ASUs, and whether they pass or fail the ASU definitions for unemployment and population. Please pay attention to these measures - an unemployment rate of 6.449% will display as 6.45%, but will fail the validation.
+Note, you *may* go back and forth between the selection and review
+screens.
 
-Note, you *may* go back and forth between the selection and review screens.
-
-When ready to create an output file, the *Generate LSS .txt File* button will create a formatted batch file for upload to LSS.
+When ready to create an output file, the *Generate LSS .txt File* button
+will create a formatted batch file for upload to LSS.
 
 ```{r}
 
@@ -942,7 +991,7 @@ actionButton("review_txt", "Create Summary CSV")
 
 ```
 
-## Output {data-width=850}
+## Output {data-width="850"}
 
 ```{r}
 
@@ -1142,10 +1191,203 @@ observeEvent(input$review_txt, {
 
 ```
 
-```
+# How to Use ASUbuildR
 
+**About ASUloadR**
 
+ASUloadR is an application built in R using Shiny and Flexdashboard to
+create a point-and-click environment to build Areas of Substantial
+Unemployment (ASU). While this package does not replace the work of an
+analyst in a state from working on the ASU process, it provides tools to
+make that process more straightforward.
 
+It should be noted, the U.S. Bureau of Labor Statistics has several
+options for designating ASUs. **ASUloadR** only uses the addition
+method, building regions at the Census Tract level. Analysts may
+discover that other alternatives work better for their state in a given
+year.
 
+The ASU creation logic in this program was created by a collaboration
+between the states of Ohio and Nevada, with the Shiny app and Graphical
+User Interface designed by Nevada’s Research & Analysis Bureau.
 
+The Github repository for this package can be found at
+<https://github.com/schmidtDETR/ASUbuildR>
 
+**About the ASU Process**
+
+The ASU process typically begins when the U.S. Bureau of Labor
+Statistics distributes to each state a file providing the calculated
+inputs for regions within the state from which ASUs must be designated.
+This is provided as an Excel sheet with a filename like `ST_asuYY.xlsx`
+where ST is the state abbreviation and YY is the year for which the ASU
+is being designated. **ASUloadR** is currently designed to pull
+information directly from this file, including identifying the state and
+year for which data should be retrieved.
+
+Because this file is built using public information but using
+preliminary LAUS data for June of the current year, archives of these
+files are not publicly available but also do not contain confidential
+information. Future versions of ASUloadR may build these input files
+directly, but currently the state-specific input file is required.
+
+ASUs are required to meet three elements to be considered. First, the
+region must be geographically contiguous (including corner-to-corner
+intersections). Second, the region must have a population of at least
+10,000. Third, the unemployment rate in the region must be at least
+6.5%. The methodology in **BLSloadR** looks at each census tract with an
+unemployment rate of at least 6.45%, then adds the adjacent tract with
+the next-highest unemployment rate (or a labor force of 0), and
+continues until the unemployment rate in the combined region is \<6.45%.
+It then removes the last-added tract, designates the region as an ASU,
+and continues with the next-highest remaining unused tract in the state.
+It continues building regions until there are no remaining tracts with a
+rate of at least 6.45%, then stops.
+
+**Using ASUloadR**
+
+The basic functionality of **ASUloadR** is simple. First, install the
+package. Second, call the `launch_ASUloadR()` function. If you prefer,
+you don’t even have to load the package into your library, just call it
+directly with `ASUloadR::launch_ASUloadR()`. By default, this will
+launch the **ASUloadR** Shiny app in your default browser window.
+
+**Basic Navigation**
+
+Within the app window, there are a series of tabs across the top. These
+control the basic navigation within the app. The functionality of each
+tab will be described in detail below.
+
+-   Data Initialization: this is where you load the Excel file from BLS.
+
+-   Load Initial ASU: here you use the data from BLS to generate an
+    initial list of potential ASUs.
+
+-   Modify ASU Selections: this is the primary window you will interact
+    with. It allows for the manipulation and refinement of the data.
+
+-   Save and Load Data: this allows you to save the current state of the
+    modified data and maps to be loaded later. If you have already saved
+    data, you can come straight here to load that map.
+
+-   ASU Review and Finalization: this tab contains tools to review the
+    summarized ASUs, to generate an output CSV file to review individual
+    tracts, and to generate a batch TXT file that can be uploaded to
+    BLS.
+
+**Data Initialization**
+
+To begin the ASU building process, click the `Browse` button on the left
+side of the page. Once a file has been selected, an overview of the file
+will appear on the right to confirm the file has successfully loaded.
+You may review the contents of the columns to ensure that data appears
+to be loaded correctly. This script assumes the columns are maintained
+in a consistent order by BLS - changes to the structure of the file will
+require updates to the structure of this code.
+
+When review is complete, continue to the next tab - Load Initial ASU.
+
+**Load Initial ASU**
+
+To begin the ASU designation process, click the
+`Load Tracts and Initialize ASU` button. This will execute the
+tract-by-tract ASU building process. Small states may see this process
+run in under 20 seconds. The largest states may take up to 5 minutes.
+When the process is complete, the app will render a map to on the right
+side of the page. The number of colors on this map is limited to 8, so
+if more than 8 potential ASUs are identified, more than one ASU will use
+the same color.
+
+In addition, note that a table of the potential ASUs will appear below
+the button. This will give the analyst a sense of how many tracts may be
+worth merging into larger ASUs. In general, regions with 3 or fewer
+tracts are unlikely to meet the population threshold to qualify as an
+ASU.
+
+To begin manipulating the data, proceed to the next tab, Modify ASU
+Selections. Or, if the number of modifications is large or the state
+takes a long time to run, skip ahead to perform an initial save of the
+data on Save and Load Data.
+
+**Modify ASU Selections**
+
+This tab is where all edits to the ASU selections are made. A number of
+tools are provided to aid in the optimization of the ASUs. In general,
+*selected* tracts will be outlined in red on the map.
+
+-   Hover over the map. Hovering the mouse over the map will display
+    information about that tract useful to the selection process.
+
+-   Click on the map. Clicking on the map will select, or unselect, a
+    particular tract.
+
+-   Select ASU Number: This dropdown allows you to select all the tracts
+    in a particular ASU. If you select None, this will effectively clear
+    all selected tracts.
+
+-   Change ASU Value / Update Selected Tracts: This is how you change
+    the pre-assigned ASU number. Enter the numeric value in the box
+    under *Change ASU Value:* and then click the *Update Selected
+    Tracts* to change the value. The numeric value remains in the box,
+    providing a convenient way to keep changing tracts or groups of
+    tracts to the same ASU. Further, changing the ASU number to 0 is how
+    selected tracts are removed from any ASUs.
+
+-   Show Data for Selected Tracts: This will generate a table below the
+    map which has the aggregated ASU data for all selected tracts. This
+    may help with determining whether it is efficient to add a tract or
+    group of tracts to an existing ASU.
+
+-   Percentile Threshold / Show Tracts with Lowest UR: This allows you
+    to enter a numeric value (0-100) which will highlight the tracts
+    within the current selection that have the lowest unemployment
+    rates. As the analyst changes ASUs, this helps identify tracts which
+    might be good candidates to remove from an ASU to add others in.
+    While the algorithm will add tracts until the combined rate is as
+    low as possible, it does not know whether a tract with low
+    unemployment would be useful to “bridge” to a further high
+    unemployment tract that could not otherwise qualify as an ASU.
+    *Note: this functionality currently **removes highlighting from
+    still-selected tracts**. To make changes, please Clear Selected
+    Tracts, then select the tract you wish to modify.*
+
+-   Enter a GEOID / Select a Single Tract: This functionality is most
+    useful when using the CSV output that this app generates on the
+    **ASU Review and Finalization** tab. Given the 11-character GEOID,
+    you can input that to highlight a single tract to examine where it
+    fits. This can be helpful for fine-tuning - reviewing the
+    highest-unemployment tracts not included in an ASU to ensure they
+    cannot be connected in to improve the ASU.
+
+-   Reset to Initial Data: This button will reset all changes you have
+    made to the state of the map after the **Load Initial ASU** process.
+    For when you’ve just broken everything and want to start over. Use
+    with caution!
+
+**Save and Load Data**
+
+This tab contains some simple options to help save and load the current
+state of the map. While Nevada had only 6 initial ASUs to review other
+states may have over 100! This will save the background data of the app
+as an RDS file, or load data from an RDS file.
+
+To specify a directory other than your working directory, paste that
+directory into the `Save Directory Path` box.
+
+**ASU Review and Finalization**
+
+This will typically be the last screen in the process. Here, you may
+test the ASUs you have created against the required numeric thresholds
+using `Generate ASU Summary` - this is most useful for validating edge
+cases, when the calculated aggregate ASU rate is less than but rounds up
+to 6.45. Because the criteria for an ASU is an unemployment rate of
+6.5%, a rate of 6.449% will not qualify. The TRUE/FALSE outputs in the
+table provide the most reliable test for whether the ASU will qualify.
+
+Generate LSS .txt File and Create Summary CSV will both create files in
+the directory specified in the **Save and Load Data** tab (or your
+working directory). The LSS TXT file should be formatted to be able to
+upload to LSS directly once the ASUs are completed. The Summary CSV file
+provides a handy output of all selected tracts and a useful tool to
+review the selections for high-unemployment tracts that were not
+included.
