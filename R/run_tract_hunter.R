@@ -611,23 +611,11 @@ run_tract_hunter <- function(tract_list,
   # optionally merge touching ASUs  -------------------------------
   if (isTRUE(join_touching)) {
     data_merge <- combine_asu_groups(data_merge, nb)
+
+    # 2nd pass
+    asu_pass(verbose = TRUE)
   }
 
-
-  # final report
-  cat(
-    "\nFinal unemployment total: ",
-    sum(unemp_vec[data_merge$row_num[!is.na(data_merge$asunum)]], na.rm = TRUE),
-    "\n"
-  )
-  # optionally merge touching ASUs  -------------------------------
-  if (isTRUE(join_touching)) {
-    data_merge <- combine_asu_groups(data_merge, nb)
-  }
-
-
-  # 2nd pass
-  asu_pass(verbose = TRUE)
 
   # final report
   cat(
