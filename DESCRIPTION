@@ -31,7 +31,10 @@ Imports:
     sf,
     sfdep,
     shiny,
-    tigris
+    tigris,
+    glue,
+    igraph,
+    crayon
 Suggests: 
     knitr
 VignetteBuilder: knitr
