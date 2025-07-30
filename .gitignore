@@ -3,3 +3,6 @@
 .RData
 .Ruserdata
 inst/doc
+.Rproj
+inst/shinny_app/_tigris_cache/
+ASUbuildR.Rproj
