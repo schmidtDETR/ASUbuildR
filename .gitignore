@@ -3,10 +3,9 @@
 .RData
 .Ruserdata
 inst/doc
-<<<<<<< HEAD
 .Rproj
 inst/shinny_app/_tigris_cache/
 ASUbuildR.Rproj
-=======
 inst/Tract Hunter V3.Rmd
->>>>>>> origin/tract_hunter
+
+
