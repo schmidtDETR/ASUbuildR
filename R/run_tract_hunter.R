@@ -8,9 +8,7 @@ run_tract_hunter <- function(tract_list,
                              join_touching  = TRUE,   # <- NEW
                              verbose    = TRUE) {
 
-  suppressPackageStartupMessages({
-    library(sf); library(dplyr); library(glue); library(igraph); library(crayon)
-  })
+
 
   # --- progress helper ---------------------------------------------------
   update_status <- function(msg) {
@@ -32,7 +30,7 @@ run_tract_hunter <- function(tract_list,
     )
 
   nb <- data_merge$continuous
-  g  <- graph_from_adj_list(nb)
+  g  <- igraph::graph_from_adj_list(nb)
 
   emp_vec        <- data_merge$tract_ASU_emp
   unemp_vec      <- data_merge$tract_ASU_unemp
@@ -202,7 +200,7 @@ run_tract_hunter <- function(tract_list,
       asu_pop    <- best_pop
       asu_ur     <- best_ur
 
-      cat(glue("UR: {round(asu_ur, 4)} | Unemp: {round(asu_unemp)} | Emp: {round(asu_emp)} | Pop: {round(asu_pop)}   \r"))
+      cat(glue::glue("UR: {round(asu_ur, 4)} | Unemp: {round(asu_unemp)} | Emp: {round(asu_emp)} | Pop: {round(asu_pop)}   \r"))
       flush.console()  # Especially important in RGui or RStudio
 
 
@@ -298,7 +296,7 @@ run_tract_hunter <- function(tract_list,
     all_paths <- list()  # container for candidate paths
     for (nbr in found_neighbors) {
       # Using a cutoff (here 5) to limit path length. Adjust the cutoff as needed.
-      paths_temp <- k_shortest_paths(g, from = nbr, to = target_index, mode = "out", k = 50)
+      paths_temp <- igraph::k_shortest_paths(g, from = nbr, to = target_index, mode = "out", k = 50)
       all_paths <- c(all_paths, paths_temp$vpath)
     }
 
@@ -354,10 +352,10 @@ run_tract_hunter <- function(tract_list,
 
     # 5. Create the union and induced subgraph (compute once)
     union_indexes <- sort(c(asu_indexes, new_indexes))
-    sub_g <- induced_subgraph(g, vids = union_indexes)
+    sub_g <- igraph::induced_subgraph(g, vids = union_indexes)
 
     # 6. Get cut vertices from subgraph and compute invalid drop ids
-    cp <- articulation_points(sub_g)
+    cp <- igraph::articulation_points(sub_g)
     cut_verts <- if (length(cp) > 0) union_indexes[cp] else integer(0)
     invalid_drop_ids <- c(cut_verts, new_indexes)
 
@@ -434,8 +432,8 @@ run_tract_hunter <- function(tract_list,
 
       # Update drop candidates: recompute subgraph and invalid drop ids
       union_indexes <- sort(c(remaining_indexes, new_indexes))
-      sub_g <- induced_subgraph(g, vids = union_indexes)
-      cp <- articulation_points(sub_g)
+      sub_g <- igraph::induced_subgraph(g, vids = union_indexes)
+      cp <- igraph::articulation_points(sub_g)
       cut_verts <- if(length(cp) > 0) union_indexes[cp] else integer(0)
       invalid_drop_ids <- c(cut_verts, new_indexes)
       drop_candidates <- setdiff(remaining_indexes, invalid_drop_ids)
@@ -514,13 +512,13 @@ run_tract_hunter <- function(tract_list,
       # Create the vertex data frame with a "name" column
       vertices_df <- data.frame(name = asunums, stringsAsFactors = FALSE)
 
-      asu_graph <- graph_from_data_frame(
+      asu_graph <- igraph::graph_from_data_frame(
         d = as.data.frame(edges_unique, stringsAsFactors = FALSE),
         vertices = vertices_df,
         directed = FALSE
       )
 
-      comps <- components(asu_graph)
+      comps <- igraph::components(asu_graph)
 
       # Create a lookup table mapping the original asunum to the new combined asunum.
       lookup <- data.frame(
@@ -544,7 +542,7 @@ run_tract_hunter <- function(tract_list,
                                lookup$new_asu[match(as.character(asunum), lookup$original_asu)],
                                asunum))
 
-      message(yellow("Combined ASU groups based on touching tracts."))
+      message(crayon::yellow("Combined ASU groups based on touching tracts."))
       return(tract_data)
     }
   }
@@ -581,7 +579,7 @@ run_tract_hunter <- function(tract_list,
 
         if (verbose) {
           update_status(
-            glue("Targeting: {target_index} | Remaining: {nrow(tracts_not_in_asu) - i} | Unemployed: {unemp_tot}")
+            glue::glue("Targeting: {target_index} | Remaining: {nrow(tracts_not_in_asu) - i} | Unemployed: {unemp_tot}")
           )
         }
 
