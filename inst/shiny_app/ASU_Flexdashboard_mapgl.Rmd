@@ -17,8 +17,22 @@ library(sfdep)
 library(tidyverse)
 library(readxl)
 
-source("S:/ra/RADUMP/aisolorio/Code Projects/ASUbuildR/R/run_asu_original.r", local = TRUE)
-source("S:/ra/RADUMP/aisolorio/Code Projects/ASUbuildR/R/run_tract_hunter.r", local = TRUE)
+# ---- tigris cache -------------------------------------------------
+# put cached ZIPs in  inst/shiny_app/_tigris_cache  (any writable path works)
+tigris::tigris_cache_dir( here::here("inst", "shiny_app", "_tigris_cache") )
+
+# tell tigris to look there first before re‑downloading
+options(tigris_use_cache = TRUE)
+
+# ---- resolve paths from the project root ----------------------------
+# 'here()' always points at the directory that contains ASUbuildR.Rproj
+# no matter where this .Rmd lives.
+if (!requireNamespace("here", quietly = TRUE))
+  install.packages("here")
+
+library(here)          # <‑‑ add once
+source(here::here("R", "run_asu_original.r"))   # local = FALSE by default
+source(here::here("R", "run_tract_hunter.R"))
 options(shiny.maxRequestSize = 50 * 1024^2)  # Set to 50MB or your desired limit
 
 # Initialize reactive values
@@ -168,172 +182,153 @@ radioButtons(
   ),
   inline = TRUE
 )
+
+checkboxInput(
+  inputId = "join_touching",
+  label   = "Include touching tracts when building ASUs",
+  value   = TRUE          # default keeps current behaviour
+)
+
+
 actionButton("process", "Load Tracts and Initialize ASU")
 tableOutput("asu")
 
 observeEvent(input$process, {
-  ## 1. Build the base tract+BLS data --------------------------
+
+  ## 1 ─ Build the base tract + BLS data ------------------------------
   tract_list <- tracts(state = state(), year = tract_year()) |>
     mutate(
-      row_num = row_number(),
+      row_num    = row_number(),
       continuous = st_contiguity(geometry)
     )
 
   data_merge <- tract_list |>
-    left_join(uploaded_data(), by = "GEOID") #|>
-    #arrange(desc(tract_ASU_urate), desc(tract_ASU_unemp))
+    left_join(uploaded_data(), by = "GEOID")
+    # arrange(desc(tract_ASU_urate), desc(tract_ASU_unemp))  # not needed here
 
-  ## 2. Run the chosen ASU algorithm -----------------------------
+  ## 2 ─ Run the chosen ASU algorithm ---------------------------------
   algo_choice <- isolate(input$asu_algo %||% "orig")
-  
-  if (algo_choice == "orig") {
-  res <- run_asu_original(tract_list, uploaded_data())
-} else {
-  res <- run_tract_hunter(tract_list, uploaded_data())   # ← new call
-}
-  
-  # 🔧 Ensure geometries are MULTIPOLYGON for maplibregl
-  if (!inherits(res$full_data, "sf")) {
-    stop("res$full_data is not an sf object")
-  }
-  
-  res$full_data <- sf::st_cast(res$full_data, "MULTIPOLYGON", warn = FALSE)
-  
-  ## 3. Push results into the reactiveVals already used elsewhere
-  full_data(res$full_data)
-  full_data_reset(res$full_data_reset)
-  asu_data(res$asu_data)
-  asu_tracts(res$asu_tracts)
-  asu_summary(res$asu_summary)
-  map_data_dbg(res$full_data)  
+  join_flag   <- isTRUE(input$join_touching)         # << the new toggle
 
-  ## 4. Render the summary table shown just under the button -----
-  output$asu <- renderTable({
-    asu_summary()
-  })
-  
-  ## 5. (Re‑)draw the first map ----------------------------------
+  res <- if (algo_choice == "orig") {
+           run_asu_original(tract_list, uploaded_data())
+         } else {
+           run_tract_hunter(tract_list, uploaded_data(),
+                            join_touching = join_flag)
+         }
+
+  ## 3 ─ Ensure MULTIPOLYGON for maplibregl ---------------------------
+  if (!inherits(res$full_data, "sf"))
+    stop("res$full_data is not an sf object")
+
+  res$full_data <- sf::st_cast(res$full_data, "MULTIPOLYGON", warn = FALSE)
+
+  ## 4 ─ Push results into reactiveVals already used elsewhere --------
+  full_data(      res$full_data)
+  full_data_reset(res$full_data_reset)
+  asu_data(       res$asu_data)
+  asu_tracts(     res$asu_tracts)
+  asu_summary(    res$asu_summary)
+  map_data_dbg(   res$full_data)
+
+  ## 5 ─ Render the summary table just under the button ---------------
+  output$asu <- renderTable({ asu_summary() })
+
+  ## 6 ─ (Re)draw the first map ---------------------------------------
   output$initial_map <- renderMaplibre({
 
-  req(full_data())
-  map_data <- full_data()
+    req(full_data())
+    map_data <- full_data()
 
-  ## ---- 1. geometry housekeeping ---------------------------------
-  map_data <- map_data |>
-    sf::st_make_valid() |>                 # repair
-    sf::st_zm(what = "ZM", drop = TRUE) |> # drop Z/M
-    dplyr::filter(!sf::st_is_empty(geometry)) |>     # no empties
-    dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
-    dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
-    #sf::st_cast("MULTIPOLYGON", warn = FALSE) |>
-    dplyr::select(-geom_type)
+    # ---- 6·1 geometry housekeeping ----------------------------------
+    map_data <- map_data |>
+      sf::st_make_valid() |>
+      sf::st_zm(what = "ZM", drop = TRUE) |>
+      dplyr::filter(!sf::st_is_empty(geometry)) |>
+      dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
+      dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
+      dplyr::select(-geom_type)
 
-  if (nrow(map_data) == 0) {
-    return(
-      maplibre(style = carto_style("positron")) |>
-      add_control("No valid polygon geometry to display.", "top-left")
-    )
-  }
+    if (nrow(map_data) == 0) {
+      return(
+        maplibre(style = carto_style("positron")) |>
+        add_control("No valid polygon geometry to display.", "top-left")
+      )
+    }
 
-  ## ---- 2. palette / breaks (unchanged) --------------------------
-  map_data <- map_data |>
-    dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
+    # ---- 6·2 palette / breaks ---------------------------------------
+    map_data <- map_data |>
+      dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
 
-  n_asu <- max(map_data$asunum, na.rm = TRUE)
-  n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
+    n_asu <- max(map_data$asunum, na.rm = TRUE)
+    n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
 
-  n_cat <- dplyr::case_when(
-    n_asu == 0 ~ 1L,
-    n_asu <  3 ~ n_asu,
-    TRUE        ~ min(n_asu, 8L)
-  )
+    palette_logic <- function(n_asu) {
+      if (n_asu == 0) {
+        list(fill = "#808080", legend_vals = "(none)", legend_cols = "#808080")
+      } else if (n_asu == 1) {
+        list(
+          fill = step_expr(
+            column   = "asunum",
+            base     = "#808080",
+            stops    = "#7FC97F",
+            values   = 1,
+            na_color = "#444444"
+          ),
+          legend_vals = 1,
+          legend_cols = "#7FC97F"
+        )
+      } else {
+        n_cat  <- min(max(n_asu, 3L), 8L)
+        pal    <- RColorBrewer::brewer.pal(n_cat, "Accent")
+        breaks <- seq(1 + n_asu / n_cat, n_asu, length.out = n_cat - 1)
+        list(
+          fill = step_expr(
+            column   = "asunum",
+            base     = pal[1],
+            stops    = pal[-1],
+            values   = breaks,
+            na_color = "#444444"
+          ),
+          legend_vals = seq_len(n_asu),
+          legend_cols = pal
+        )
+      }
+    }
 
-  palette <- if (n_asu == 0)            "#808080"
-             else if (n_cat == 1)       "#7FC97F"
-             else                       RColorBrewer::brewer.pal(n_cat, "Accent")
+    pal <- palette_logic(n_asu)
 
-  breaks  <- if (n_asu <= 1) numeric(0)
-             else seq(1 + n_asu / n_cat, n_asu, length.out = n_cat - 1)
+    # ---- 6·3 build map ----------------------------------------------
+    maplibre(style = carto_style("positron")) |>
+      fit_bounds(map_data, animate = FALSE) |>
+      add_fill_layer(
+        id                 = "basemap",
+        source             = map_data,
+        fill_color         = pal$fill,
+        fill_opacity       = 0.5,
+        fill_outline_color = "black",
+        popup = concat(
+          "<strong>ASU Number: </strong>", get_column("asunum"), "<br>",
+          "<strong>Tract GEOID: </strong>", get_column("GEOID"),  "<br>",
+          "<strong>UR: </strong>",
+          number_format(get_column("tract_ASU_urate"),
+                        style = "decimal", maximum_fraction_digits = 2),
+          "%<br>",
+          "<strong>Unemp: </strong>",
+          number_format(get_column("tract_ASU_unemp"),
+                        style = "decimal", maximum_fraction_digits = 0), "<br>"
+        )
+      ) |>
+      add_legend(
+        "ASU Number",
+        values = pal$legend_vals,
+        colors = pal$legend_cols,
+        type   = "categorical"
+      )
+  })
 
-  stops   <- if (length(palette) > 1) palette[-1] else character(0)
+})  # ---- end observeEvent -------------------------------------------------
 
-# Line below used for debugging geometry types
-#print(table(sf::st_geometry_type(map_data)))
-
-## ---- 3 · build map ----------------------------------------------------
-map <- maplibre(style = carto_style("positron")) |>
-       fit_bounds(map_data, animate = FALSE)
-
-# ── palette logic -------------------------------------------------------
-map_data <- map_data |>
-  dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
-
-n_asu <- max(map_data$asunum, na.rm = TRUE)
-n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
-
-if (n_asu == 0) {                               # ── 1 · no ASUs yet
-  fill_colour <- "#808080"
-  legend_vals <- "(none)"
-  legend_cols <- "#808080"
-
-} else if (n_asu == 1) {                        # ── 2 · exactly one ASU
-  fill_colour <- step_expr(
-    column   = "asunum",
-    base     = "#808080",                       # grey for NA / 0
-    stops    = "#7FC97F",                       # green for ASU 1
-    values   = 1,
-    na_color = "#444444"
-  )
-  legend_vals <- 1
-  legend_cols <- "#7FC97F"
-
-} else {                                        # ── 3 · two‑plus ASUs
-  n_cat   <- min(max(n_asu, 3L), 8L)            # 3–8 categories
-  pal     <- RColorBrewer::brewer.pal(n_cat, "Accent")
-  breaks  <- seq(1 + n_asu / n_cat, n_asu, length.out = n_cat - 1)
-
-  fill_colour <- step_expr(
-    column   = "asunum",
-    base     = pal[1],
-    stops    = pal[-1],
-    values   = breaks,
-    na_color = "#444444"
-  )
-  legend_vals <- seq_len(n_asu)
-  legend_cols <- pal
-}
-
-# ── draw ----------------------------------------------------------------
-map |>
-  add_fill_layer(
-    id                 = "basemap",
-    source             = map_data,
-    fill_color         = fill_colour,           # <- **now always defined**
-    fill_opacity       = 0.5,
-    fill_outline_color = "black",
-    popup = concat(
-      "<strong>ASU Number: </strong>", get_column("asunum"), "<br>",
-      "<strong>Tract GEOID: </strong>", get_column("GEOID"),  "<br>",
-      "<strong>UR: </strong>",
-      number_format(get_column("tract_ASU_urate"),
-                    style = "decimal", maximum_fraction_digits = 2),
-      "%<br>",
-      "<strong>Unemp: </strong>",
-      number_format(get_column("tract_ASU_unemp"),
-                    style = "decimal", maximum_fraction_digits = 0), "<br>"
-    )
-  ) |>
-  add_legend(
-    "ASU Number",
-    values = legend_vals,
-    colors = legend_cols,
-    type   = "categorical"
-  )
-
-})
-
-
-})
 
 # ─────────────── DEBUG PANEL ───────────────
 output$map_data_preview <- renderPrint({

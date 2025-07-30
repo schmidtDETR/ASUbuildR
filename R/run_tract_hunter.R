@@ -5,6 +5,7 @@ run_tract_hunter <- function(tract_list,
                              bls_df,
                              ur_thresh  = 0.0645,
                              pop_thresh = 10000,
+                             join_touching  = TRUE,   # <- NEW
                              verbose    = TRUE) {
 
   suppressPackageStartupMessages({
@@ -588,6 +589,9 @@ run_tract_hunter <- function(tract_list,
       }
     }
   }
+
+  ##### ---- 2 · INITIALIZE ASU NUMBERS -----------------------------------
+
   # 0. make sure asunum is character
   data_merge <- data_merge %>%
     mutate(asunum = as.character(asunum))
@@ -595,14 +599,23 @@ run_tract_hunter <- function(tract_list,
   # 1st pass
   asu_pass(verbose = TRUE)
 
+  # optionally merge touching ASUs  -------------------------------
+  if (isTRUE(join_touching)) {
+    data_merge <- combine_asu_groups(data_merge, nb)
+  }
+
+
   # final report
   cat(
     "\nFinal unemployment total: ",
     sum(unemp_vec[data_merge$row_num[!is.na(data_merge$asunum)]], na.rm = TRUE),
     "\n"
   )
-  # combine neighbouring ASUs
-  data_merge <- combine_asu_groups(data_merge, nb)
+  # optionally merge touching ASUs  -------------------------------
+  if (isTRUE(join_touching)) {
+    data_merge <- combine_asu_groups(data_merge, nb)
+  }
+
 
   # 2nd pass
   asu_pass(verbose = TRUE)
