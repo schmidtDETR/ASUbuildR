@@ -19,6 +19,11 @@ library(sf)
 library(sfdep)
 library(tidyverse)
 library(readxl)
+library(Rcpp)
+
+sourceCpp("../../src/choose_best_neighbor.cpp")
+sourceCpp("../../src/build_edges.cpp")
+sourceCpp("../../src/choose_best_drop.cpp")
 
 ## ---- tigris cache ----------------------------------------------------
 ## put cached TIGER/Line ZIPs in a per-user cache folder that is always
