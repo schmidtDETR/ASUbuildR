@@ -86,16 +86,16 @@ run_tract_hunter <- function(tract_list,
 
   # ---- 1 · SEED‑AND‑EXPAND -------------------------------------------
   repeat {
-    # 1) Identify all **unused** tracts with UR >= 0.0645
+    # 1) Identify all **unused** tracts with UR above threshold
     all_unused <- setdiff(seq_along(ur_vec), used_indexes)
-    valid_unused <- all_unused[ ur_vec[all_unused] >= .0645]
+    valid_unused <- all_unused[ ur_vec[all_unused] >= ur_thresh]
 
     # Exclude any that we already tried as a starting point
     possible_starts <- setdiff(valid_unused, tried_starting_indexes)
 
     # If none remain, we're done
     if (length(possible_starts) == 0) {
-      # message("No more possible starting tracts meeting UR >= 0.0645 that haven't been tried.")
+      # message("No more possible starting tracts meeting UR threshold that haven't been tried.")
       break
     }
 
@@ -123,72 +123,23 @@ run_tract_hunter <- function(tract_list,
         break
       }
 
-      # 2) Find all possible "candidate" tracts out to X hops (2 or 3),
-      #    but do *not* skip bridging tracts along the way.
-      #    We'll BFS from each boundary tract to possible "far" tracts
-      #    collecting all contiguous paths that stay out of used_indexes & asu_list.
+      # 2) Evaluate boundary tracts using Rcpp helper to avoid BFS overhead
+      res <- choose_best_neighbor(boundary_tracts,
+                                  emp_vec, unemp_vec, population_vec,
+                                  asu_emp, asu_unemp, asu_pop,
+                                  ur_thresh)
 
-      best_improvement <- -Inf  # track the best improvement or best final unemp, etc.
-      best_path <- NULL         # store the path (bridge + final neighbor)
-      best_ur   <- NA
-      best_emp  <- NA
-      best_unemp <- NA
-      best_pop   <- NA
+      best_index <- res$best_index
 
-      for (b in boundary_tracts) {
-
-        # BFS or DFS up to 2 or 3 hops from b, ignoring asu_list & used_indexes
-        candidate_paths <- bfs_paths_up_to_k_hops(start = b, nb = nb,
-                                                  max_hops = 0,
-                                                  blocked = c(asu_list, used_indexes))
-
-        # candidate_paths is a *list of paths*, each a vector of tract indices
-        # The last node in each path is the "far" neighbor.
-
-        for (path_vec in candidate_paths) {
-
-          # The set of new tracts if we add path_vec to the ASU
-          # (We also include bridging tracts if they're in path_vec)
-          new_tracts <- setdiff(path_vec, asu_list)  # any that aren't already in the ASU
-
-          # Calculate new totals if we add all of them
-          total_emp   <- asu_emp   + sum(emp_vec[new_tracts])
-          total_unemp <- asu_unemp + sum(unemp_vec[new_tracts])
-          total_pop   <- asu_pop   + sum(population_vec[new_tracts])
-          total_ur    <- total_unemp / (total_emp + total_unemp)
-
-          # Check if this keeps UR above threshold
-          if (total_ur >= 0.0645) {
-            # If your main goal is to *maximize total_unemp*:
-            #   improvement <- total_unemp
-            # Or to maximize final UR:
-            #   improvement <- total_ur
-            # Or any other logic.
-            improvement <- ((total_unemp)^.9) * total_ur
-
-            if(is.na(improvement)){
-              improvement <-0
-            }
-
-            if (improvement > best_improvement) {
-              best_improvement <- improvement
-              best_path        <- path_vec
-              best_ur          <- total_ur
-              best_emp         <- total_emp
-              best_unemp       <- total_unemp
-              best_pop         <- total_pop
-            }
-          }
-
-
-        } # end loop over candidate_paths
-      } # end loop over boundary tracts
-
-      # If we never found a path that yields UR >= 0.0645, we stop
-      if (is.null(best_path)) {
-        #message("No contiguous path found that maintains UR >= 0.0645.")
+      if (is.na(best_index)) {
         break
       }
+
+      best_path  <- best_index
+      best_ur    <- res$best_ur
+      best_emp   <- res$best_emp
+      best_unemp <- res$best_unemp
+      best_pop   <- res$best_pop
 
       # Otherwise, add all bridging tracts in best_path to the ASU
       new_tracts <- setdiff(best_path, asu_list)
@@ -208,9 +159,9 @@ run_tract_hunter <- function(tract_list,
     }
 
     # ---------------------------------------------------------------------
-    # 4) Check final criteria for this ASU (pop >= 10000, UR >= 0.0645)
+    # 4) Check final criteria for this ASU (pop >= 10000, UR >= threshold)
     # ---------------------------------------------------------------------
-    if (asu_pop >= 10000 && asu_ur >= 0.0645) {
+    if (asu_pop >= pop_thresh && asu_ur >= ur_thresh) {
       # It's a valid ASU; save it and mark these tracts used
       asu_groups[[length(asu_groups) + 1]] <- asu_list
       used_indexes <- c(used_indexes, asu_list)
@@ -373,7 +324,7 @@ run_tract_hunter <- function(tract_list,
       (remaining_unemp + total_new_unemp + remaining_emp + total_new_emp)
 
     # 9. Early exit: if the new rate is already acceptable, update and return TRUE.
-    if (new_ur >= 0.0645) {
+    if (new_ur >= ur_thresh) {
       flush.console()
       # cat(green(glue::glue("\n Adding in {toString(new_indexes)}, no trade needed.\n Added {sum(unemp_vec[new_indexes])} unemp \n")))
       # flush.console()
@@ -387,7 +338,7 @@ run_tract_hunter <- function(tract_list,
     unemp_buffer <- total_new_unemp  # Total unemp being added
 
     # Iterate until the updated unemployment rate meets the threshold
-    while(new_ur < 0.0645) {
+    while(new_ur < ur_thresh) {
       # Filter candidates based on whether their unemp is less than the unemp buffer
       drop_candidates <- drop_candidates[ unemp_vec[drop_candidates] < unemp_buffer ]
       if (length(drop_candidates) == 0) return(FALSE)
@@ -423,7 +374,7 @@ run_tract_hunter <- function(tract_list,
       # cat(green(status_msg), "\n")
       # flush.console()
 
-      if(new_ur >= 0.0645) {
+      if(new_ur >= ur_thresh) {
         # cat("Hooray!\n")
         # flush.console()
         trade_complete <- TRUE

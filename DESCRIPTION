@@ -29,7 +29,11 @@ Imports:
     tigris,
     glue,
     igraph,
-    crayon
+    crayon,
+    Rcpp
+LinkingTo:
+    Rcpp
+SystemRequirements: C++11
 Suggests:
     knitr
 VignetteBuilder: knitr
