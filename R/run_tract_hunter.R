@@ -247,7 +247,7 @@ run_tract_hunter <- function(tract_list,
     all_paths <- list()  # container for candidate paths
     for (nbr in found_neighbors) {
       # Using a cutoff (here 5) to limit path length. Adjust the cutoff as needed.
-      paths_temp <- igraph::k_shortest_paths(g, from = nbr, to = target_index, mode = "out", k = 50)
+      paths_temp <- igraph::k_shortest_paths(g, from = nbr, to = target_index, mode = "out", k = 25)
       all_paths <- c(all_paths, paths_temp$vpath)
     }
 
