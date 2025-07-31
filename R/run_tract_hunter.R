@@ -267,7 +267,6 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
     unemp_buffer    <- total_new_unemp
 
     while (new_ur < ur_thresh) {
-      drop_candidates <- drop_candidates[ unemp_vec[drop_candidates] < unemp_buffer ]
       if (length(drop_candidates) == 0) return(FALSE)
 
       drop_res <- choose_best_drop_candidate(drop_candidates,
@@ -299,7 +298,6 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
       cut_verts <- if (length(cp) > 0) union_indexes[cp] else integer(0)
       invalid_drop_ids <- c(cut_verts, new_indexes)
       drop_candidates <- setdiff(remaining_indexes, invalid_drop_ids)
-      drop_candidates <- drop_candidates[ unemp_vec[drop_candidates] < unemp_buffer ]
       if (length(drop_candidates) == 0) return(FALSE)
     }
 
@@ -343,7 +341,6 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
 
       if (isTRUE(ok)) {
         successful_update <- TRUE
-        break
       }
     }
 
