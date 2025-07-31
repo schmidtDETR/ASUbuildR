@@ -117,18 +117,13 @@ excel_names <- c("record",
 
 ## Controls {data-width="150"}
 
-This screen allows you to import the BLS-provided ASU file, generally
-named like *NV_asu23.xlsx* which will be the only external data import
-step necessary. The script will read the file, extract the state and
-corresponding year, and standardize the column names to avoid annual
-updates to the script.
+This screen allows you to import the BLS-provided ASU file, generally named like *NV_asu23.xlsx* which will be the only external data import step necessary. The script will read the file, extract the state and corresponding year, and standardize the column names to avoid annual updates to the script.
 
-If the necessary data is not in columns A through AB within the Excel
-file, this process will not work correctly.
+If the necessary data is not in columns **A through AB** within the Excel file, this process will not work correctly.
 
-Once the file is loaded, a preview of the data will appear on the right,
-the state and year will display below, and the analyst may proceed to
-the next tab (Load Initial ASU).
+Once the file is loaded, a preview of the data will appear on the right, the state and year will display below, and the analyst may proceed to the next tab (Load Initial ASU).
+
+Note: at this time, ASUbuildR assumes a state is using county-based census tracts.  If a state uses another geography such as NECTAs as the basis for its ASU tract file, this process will require some modification.
 
 ```{r}
 fileInput("file", "Choose Excel File", accept = c(".xls", ".xlsx"))
@@ -405,7 +400,7 @@ observeEvent(input$process, {
         fill_color         = pal$fill,
         fill_opacity       = 0.5,
         fill_outline_color = "black",
-        popup = concat(
+        tooltip = concat(
           "<strong>ASU Number: </strong>", get_column("asunum"), "<br>",
           "<strong>Tract GEOID: </strong>", get_column("GEOID"),  "<br>",
           "<strong>UR: </strong>",
@@ -576,6 +571,7 @@ output$edit_map <- renderMaplibre({
         "<strong>ASU Number: </strong>",get_column("asunum"), "<br>",
         "<strong>Tract GEOID: </strong>",get_column("GEOID"),"<br>",
         "<strong>Tract Population: </strong>",number_format(get_column("tract_pop_cur"), style = "decimal", maximum_fraction_digits = 0),"<br>",
+                "<strong>Tract Labor Force: </strong>",number_format(get_column("tract_ASU_clf"), style = "decimal", maximum_fraction_digits = 0),"<br>",
         "<strong>Tract Unemployment Rate: </strong>",number_format(get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2),"%<br>",
         "<strong>Tract Unemployment: </strong>",number_format(get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0),"<br>")
     )
@@ -1292,211 +1288,99 @@ observeEvent(input$review_txt, {
 
 ```
 
+How to Use ASUbuildR
+=======================================
+
+**About ASUbuildR**
+
+ASUbuildR is an application built in R using Shiny and Flexdashboard to create a point-and-click environment to build Areas of Substantial Unemployment (ASU). While this package does not replace the work of an analyst in a state from working on the ASU process, it provides tools to make that process more straightforward.
+
+It should be noted, the U.S. Bureau of Labor Statistics has several options for designating ASUs. **ASUbuildR** only uses the addition method, building regions at the Census Tract level. Analysts may discover that other alternatives work better for their state in a given year.
+
+The ASU creation logic in this program was created by a collaboration between the states of Ohio and Nevada, with the Shiny app and Graphical User Interface designed by Nevada’s Research & Analysis Bureau.
+
+The Github repository for this package can be found at <https://github.com/schmidtDETR/ASUbuildR>
+
+**About the ASU Process**
+
+The ASU process typically begins when the U.S. Bureau of Labor Statistics distributes to each state a file providing the calculated inputs for regions within the state from which ASUs must be designated. This is provided as an Excel sheet with a filename like `ST_asuYY.xlsx` where ST is the state abbreviation and YY is the year for which the ASU
+is being designated. **ASUbuildR** is currently designed to pull information directly from this file, including identifying the state and year for which data should be retrieved.
+
+Because this file is built using public information but using preliminary LAUS data for June of the current year, archives of these files are not publicly available but also do not contain confidential information. Future versions of ASUbuildR may build these input files directly, but currently the state-specific input file is required.
+
+ASUs are required to meet three elements to be considered. First, the region must be geographically contiguous (including corner-to-corner intersections). Second, the region must have a population of at least 10,000. Third, the unemployment rate in the region must be at least 6.5%. The methodology in **BLSloadR** looks at each census tract with an unemployment rate of at least 6.45%, then adds the adjacent tract with the next-highest unemployment rate (or a labor force of 0), and continues until the unemployment rate in the combined region is less than 6.45%. It then removes the last-added tract, designates the region as an ASU, and continues with the next-highest remaining unused tract in the state. It continues building regions until there are no remaining tracts with a rate of at least 6.45%, then stops.
+
+**Using ASUbuildR**
+
+The basic functionality of **ASUbuildR** is simple. First, install the package. Second, call the `launch_ASUbuildR()` function. If you prefer, you don’t even have to load the package into your library, just call it directly with `ASUbuildR::launch_ASUbuildR()`. By default, this will launch the **ASUbuildR** Shiny app in your default browser window.
+
+**Basic Navigation**
+
+Within the app window, there are a series of tabs across the top. These control the basic navigation within the app. The functionality of each tab will be described in detail below.
+
+-   Data Initialization: this is where you load the Excel file from BLS.
+
+-   Load Initial ASU: here you use the data from BLS to generate an initial list of potential ASUs.
+
+-   Modify ASU Selections: this is the primary window you will interact with. It allows for the manipulation and refinement of the data.
+
+-   Save and Load Data: this allows you to save the current state of the modified data and maps to be loaded later. If you have already saved data, you can come straight here to load that map.
+
+-   ASU Review and Finalization: this tab contains tools to review the summarized ASUs, to generate an output CSV file to review individual tracts, and to generate a batch TXT file that can be uploaded to BLS.
+
+**Data Initialization**
+
+To begin the ASU building process, click the `Browse` button on the left side of the page. Once a file has been selected, an overview of the file will appear on the right to confirm the file has successfully loaded. You may review the contents of the columns to ensure that data appears to be loaded correctly. This script assumes the columns are maintained
+in a consistent order by BLS - changes to the structure of the file will require updates to the structure of this code. 
+
+When review is complete, continue to the next tab - Load Initial ASU.
+
+**Load Initial ASU**
+
+There are currently two options on this screen.  The *original* process is the fastest option, and will take up to 5 minutes in the largest states and under 30 seconds in smaller states.  The *Tract Hunter* method is a more advanced algorithm, and while it starts in a smilar way, it incorporates more iterative logic to merge ASUs, checks for population thresholds, and trades lower-value tracts for higher value tracts to try to maximize total unemployment in ASUs.  It takes longer, but the latest version takes under half an hour to run the data for Texas, so is still a rather efficient starting place.
+
+To begin the ASU designation process, choose a methodology and click the `Load Tracts and Initialize ASU` button. This will execute the tract-by-tract ASU building process. When the process is complete, the app will render a map to on the right side of the page. The number of colors on this map is limited to 8, so if more than 8 potential ASUs are identified, more than one ASU will use the same color.
+
+In addition, note that a table of the potential ASUs will appear below the button. This will give the analyst a sense of how many tracts may be worth merging into larger ASUs. In general, regions with 3 or fewer tracts are unlikely to meet the population threshold to qualify as an ASU.
+
+To begin manipulating the data, proceed to the next tab, Modify ASU Selections. Or, if the number of modifications is large or the state takes a long time to run, skip ahead to perform an initial save of the data on Save and Load Data.
+
+**Modify ASU Selections**
+
+This tab is where all edits to the ASU selections are made. A number of tools are provided to aid in the optimization of the ASUs. In general, *selected* tracts will be outlined in red on the map.
+
+-   Hover over the map. Hovering the mouse over the map will display information about that tract useful to the selection process.
+
+-   Click on the map. Clicking on the map will select, or unselect, a particular tract.
+
+-   Select ASU Number: This dropdown allows you to select all the tracts in a particular ASU. If you select None, this will effectively clear all selected tracts.
+
+-   Change ASU Value / Update Selected Tracts: This is how you change the pre-assigned ASU number. Enter the numeric value in the box under *Change ASU Value:* and then click the *Update Selected Tracts* to change the value. The numeric value remains in the box, providing a convenient way to keep changing tracts or groups of tracts to the same ASU. Further, changing the ASU number to 0 is how selected tracts are removed from any ASUs.
+
+-   Show Data for Selected Tracts: This will generate a table below the map which has the aggregated ASU data for all selected tracts. This may help with determining whether it is efficient to add a tract or group of tracts to an existing ASU.
+
+-   Percentile Threshold / Show Tracts with Lowest UR: This allows you to enter a numeric value (0-100) which will highlight the tracts within the current selection that have the lowest unemployment rates. As the analyst changes ASUs, this helps identify tracts which
+    might be good candidates to remove from an ASU to add others in. While the algorithm will add tracts until the combined rate is as low as possible, it does not know whether a tract with low unemployment would be useful to “bridge” to a further high unemployment tract that could not otherwise qualify as an ASU. To make changes, please Clear Selected Tracts, then select the tract you wish to modify.
+
+-   Enter a GEOID / Select a Single Tract: This functionality is most useful when using the CSV output that this app generates on the **ASU Review and Finalization** tab. Given the 11-character GEOID, you can input that to highlight a single tract to examine where it
+    fits. This can be helpful for fine-tuning - reviewing the highest-unemployment tracts not included in an ASU to ensure they cannot be connected in to improve the ASU.
+
+-   Reset to Initial Data: This button will reset all changes you have made to the state of the map after the **Load Initial ASU** process. For when you’ve just broken everything and want to start over. Use with caution!
+
+**Save and Load Data**
+
+This tab contains some simple options to help save and load the current state of the map. While Nevada had only 6 initial ASUs to review other states may have over 100! This will save the background data of the app as an RDS file, or load data from an RDS file.
+
+To specify a directory other than your working directory, paste that directory into the `Save Directory Path` box.
+
+**ASU Review and Finalization**
+
+This will typically be the last screen in the process. Here, you may test the ASUs you have created against the required numeric thresholds using `Generate ASU Summary` - this is most useful for validating edge cases, when the calculated aggregate ASU rate is less than but rounds up to 6.45. Because the criteria for an ASU is an unemployment rate of 6.5%, a rate of 6.449% will not qualify. The TRUE/FALSE outputs in the table provide the most reliable test for whether the ASU will qualify.
+
+Generate LSS .txt File and Create Summary CSV will both create files in the directory specified in the **Save and Load Data** tab (or your working directory). The LSS TXT file should be formatted to be able to upload to LSS directly once the ASUs are completed. The Summary CSV file provides a handy output of all selected tracts and a useful tool to review the selections for high-unemployment tracts that were not included.
 
 Debugging
 =======================================
 ```{r}
 verbatimTextOutput("map_data_preview")
 ```
-=======
-# How to Use ASUbuildR
-
-**About ASUloadR**
-
-ASUloadR is an application built in R using Shiny and Flexdashboard to
-create a point-and-click environment to build Areas of Substantial
-Unemployment (ASU). While this package does not replace the work of an
-analyst in a state from working on the ASU process, it provides tools to
-make that process more straightforward.
-
-It should be noted, the U.S. Bureau of Labor Statistics has several
-options for designating ASUs. **ASUloadR** only uses the addition
-method, building regions at the Census Tract level. Analysts may
-discover that other alternatives work better for their state in a given
-year.
-
-The ASU creation logic in this program was created by a collaboration
-between the states of Ohio and Nevada, with the Shiny app and Graphical
-User Interface designed by Nevada’s Research & Analysis Bureau.
-
-The Github repository for this package can be found at
-<https://github.com/schmidtDETR/ASUbuildR>
-
-**About the ASU Process**
-
-The ASU process typically begins when the U.S. Bureau of Labor
-Statistics distributes to each state a file providing the calculated
-inputs for regions within the state from which ASUs must be designated.
-This is provided as an Excel sheet with a filename like `ST_asuYY.xlsx`
-where ST is the state abbreviation and YY is the year for which the ASU
-is being designated. **ASUloadR** is currently designed to pull
-information directly from this file, including identifying the state and
-year for which data should be retrieved.
-
-Because this file is built using public information but using
-preliminary LAUS data for June of the current year, archives of these
-files are not publicly available but also do not contain confidential
-information. Future versions of ASUloadR may build these input files
-directly, but currently the state-specific input file is required.
-
-ASUs are required to meet three elements to be considered. First, the
-region must be geographically contiguous (including corner-to-corner
-intersections). Second, the region must have a population of at least
-10,000. Third, the unemployment rate in the region must be at least
-6.5%. The methodology in **BLSloadR** looks at each census tract with an
-unemployment rate of at least 6.45%, then adds the adjacent tract with
-the next-highest unemployment rate (or a labor force of 0), and
-continues until the unemployment rate in the combined region is \<6.45%.
-It then removes the last-added tract, designates the region as an ASU,
-and continues with the next-highest remaining unused tract in the state.
-It continues building regions until there are no remaining tracts with a
-rate of at least 6.45%, then stops.
-
-**Using ASUloadR**
-
-The basic functionality of **ASUloadR** is simple. First, install the
-package. Second, call the `launch_ASUloadR()` function. If you prefer,
-you don’t even have to load the package into your library, just call it
-directly with `ASUloadR::launch_ASUloadR()`. By default, this will
-launch the **ASUloadR** Shiny app in your default browser window.
-
-**Basic Navigation**
-
-Within the app window, there are a series of tabs across the top. These
-control the basic navigation within the app. The functionality of each
-tab will be described in detail below.
-
--   Data Initialization: this is where you load the Excel file from BLS.
-
--   Load Initial ASU: here you use the data from BLS to generate an
-    initial list of potential ASUs.
-
--   Modify ASU Selections: this is the primary window you will interact
-    with. It allows for the manipulation and refinement of the data.
-
--   Save and Load Data: this allows you to save the current state of the
-    modified data and maps to be loaded later. If you have already saved
-    data, you can come straight here to load that map.
-
--   ASU Review and Finalization: this tab contains tools to review the
-    summarized ASUs, to generate an output CSV file to review individual
-    tracts, and to generate a batch TXT file that can be uploaded to
-    BLS.
-
-**Data Initialization**
-
-To begin the ASU building process, click the `Browse` button on the left
-side of the page. Once a file has been selected, an overview of the file
-will appear on the right to confirm the file has successfully loaded.
-You may review the contents of the columns to ensure that data appears
-to be loaded correctly. This script assumes the columns are maintained
-in a consistent order by BLS - changes to the structure of the file will
-require updates to the structure of this code.
-
-When review is complete, continue to the next tab - Load Initial ASU.
-
-**Load Initial ASU**
-
-To begin the ASU designation process, click the
-`Load Tracts and Initialize ASU` button. This will execute the
-tract-by-tract ASU building process. Small states may see this process
-run in under 20 seconds. The largest states may take up to 5 minutes.
-When the process is complete, the app will render a map to on the right
-side of the page. The number of colors on this map is limited to 8, so
-if more than 8 potential ASUs are identified, more than one ASU will use
-the same color.
-
-In addition, note that a table of the potential ASUs will appear below
-the button. This will give the analyst a sense of how many tracts may be
-worth merging into larger ASUs. In general, regions with 3 or fewer
-tracts are unlikely to meet the population threshold to qualify as an
-ASU.
-
-To begin manipulating the data, proceed to the next tab, Modify ASU
-Selections. Or, if the number of modifications is large or the state
-takes a long time to run, skip ahead to perform an initial save of the
-data on Save and Load Data.
-
-**Modify ASU Selections**
-
-This tab is where all edits to the ASU selections are made. A number of
-tools are provided to aid in the optimization of the ASUs. In general,
-*selected* tracts will be outlined in red on the map.
-
--   Hover over the map. Hovering the mouse over the map will display
-    information about that tract useful to the selection process.
-
--   Click on the map. Clicking on the map will select, or unselect, a
-    particular tract.
-
--   Select ASU Number: This dropdown allows you to select all the tracts
-    in a particular ASU. If you select None, this will effectively clear
-    all selected tracts.
-
--   Change ASU Value / Update Selected Tracts: This is how you change
-    the pre-assigned ASU number. Enter the numeric value in the box
-    under *Change ASU Value:* and then click the *Update Selected
-    Tracts* to change the value. The numeric value remains in the box,
-    providing a convenient way to keep changing tracts or groups of
-    tracts to the same ASU. Further, changing the ASU number to 0 is how
-    selected tracts are removed from any ASUs.
-
--   Show Data for Selected Tracts: This will generate a table below the
-    map which has the aggregated ASU data for all selected tracts. This
-    may help with determining whether it is efficient to add a tract or
-    group of tracts to an existing ASU.
-
--   Percentile Threshold / Show Tracts with Lowest UR: This allows you
-    to enter a numeric value (0-100) which will highlight the tracts
-    within the current selection that have the lowest unemployment
-    rates. As the analyst changes ASUs, this helps identify tracts which
-    might be good candidates to remove from an ASU to add others in.
-    While the algorithm will add tracts until the combined rate is as
-    low as possible, it does not know whether a tract with low
-    unemployment would be useful to “bridge” to a further high
-    unemployment tract that could not otherwise qualify as an ASU.
-    *Note: this functionality currently **removes highlighting from
-    still-selected tracts**. To make changes, please Clear Selected
-    Tracts, then select the tract you wish to modify.*
-
--   Enter a GEOID / Select a Single Tract: This functionality is most
-    useful when using the CSV output that this app generates on the
-    **ASU Review and Finalization** tab. Given the 11-character GEOID,
-    you can input that to highlight a single tract to examine where it
-    fits. This can be helpful for fine-tuning - reviewing the
-    highest-unemployment tracts not included in an ASU to ensure they
-    cannot be connected in to improve the ASU.
-
--   Reset to Initial Data: This button will reset all changes you have
-    made to the state of the map after the **Load Initial ASU** process.
-    For when you’ve just broken everything and want to start over. Use
-    with caution!
-
-**Save and Load Data**
-
-This tab contains some simple options to help save and load the current
-state of the map. While Nevada had only 6 initial ASUs to review other
-states may have over 100! This will save the background data of the app
-as an RDS file, or load data from an RDS file.
-
-To specify a directory other than your working directory, paste that
-directory into the `Save Directory Path` box.
-
-**ASU Review and Finalization**
-
-This will typically be the last screen in the process. Here, you may
-test the ASUs you have created against the required numeric thresholds
-using `Generate ASU Summary` - this is most useful for validating edge
-cases, when the calculated aggregate ASU rate is less than but rounds up
-to 6.45. Because the criteria for an ASU is an unemployment rate of
-6.5%, a rate of 6.449% will not qualify. The TRUE/FALSE outputs in the
-table provide the most reliable test for whether the ASU will qualify.
-
-Generate LSS .txt File and Create Summary CSV will both create files in
-the directory specified in the **Save and Load Data** tab (or your
-working directory). The LSS TXT file should be formatted to be able to
-upload to LSS directly once the ASUs are completed. The Summary CSV file
-provides a handy output of all selected tracts and a useful tool to
-review the selections for high-unemployment tracts that were not
-included.
-
