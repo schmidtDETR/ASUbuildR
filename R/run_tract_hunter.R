@@ -464,7 +464,7 @@ run_tract_hunter <- function(tract_list,
         unemp_tot        <- sum(unemp_vec[tracts_in_asu])
 
         ## show progress only every 100th iteration (and on the very last one)
-        if (verbose && (i %% 100L == 1L || i == n_can)) {
+        if (verbose && (i %% 500L == 1L || i == n_can)) {
           update_status(
             glue::glue("Targeting: {target_index} | Remaining: {n_can - i} | Unemployed: {unemp_tot}")
           )
