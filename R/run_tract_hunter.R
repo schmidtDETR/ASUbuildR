@@ -41,49 +41,6 @@ run_tract_hunter <- function(tract_list,
   tried_starting_indexes <- integer(0)
   asu_groups             <- list()
 
-  # ---- helper: BFS paths (unchanged) ----------------------------------
-  # BFS to get *all* paths up to k hops
-  bfs_paths_up_to_k_hops <- function(start, nb, max_hops = 3, blocked = integer(0)) {
-
-    # Each queue element is a list: (path_vec, depth)
-    queue <- list(list(path = c(start), depth = 0))
-    all_paths <- list()
-
-    while (length(queue) > 0) {
-      current <- queue[[1]]
-      queue <- queue[-1]
-
-      path_vec <- current$path
-      depth    <- current$depth
-
-      # If we've reached the max depth, store the path
-      if (depth == max_hops) {
-        all_paths[[ length(all_paths) + 1 ]] <- path_vec
-        next
-      }
-
-      # Otherwise, expand neighbors of the last node in the path
-      last_node <- tail(path_vec, 1)
-      these_neighbors <- nb[[last_node]]
-
-      # Exclude blocked or already in path
-      these_neighbors <- setdiff(these_neighbors, c(path_vec, blocked))
-
-      if (length(these_neighbors) == 0) {
-        # No further expansion from here
-        all_paths[[ length(all_paths) + 1 ]] <- path_vec
-      } else {
-        # Enqueue expansions
-        for (nxt in these_neighbors) {
-          new_path <- c(path_vec, nxt)
-          queue[[ length(queue) + 1 ]] <- list(path = new_path, depth = depth + 1)
-        }
-      }
-    }
-
-    return(all_paths)
-  }
-
   # ---- 1 · SEED‑AND‑EXPAND -------------------------------------------
   repeat {
     # 1) Identify all **unused** tracts with UR above threshold
@@ -247,7 +204,7 @@ run_tract_hunter <- function(tract_list,
     all_paths <- list()  # container for candidate paths
     for (nbr in found_neighbors) {
       # Using a cutoff (here 5) to limit path length. Adjust the cutoff as needed.
-      paths_temp <- igraph::k_shortest_paths(g, from = nbr, to = target_index, mode = "out", k = 25)
+      paths_temp <- igraph::k_shortest_paths(g, from = nbr, to = target_index, mode = "out", k = 5)
       all_paths <- c(all_paths, paths_temp$vpath)
     }
 
