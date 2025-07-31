@@ -381,11 +381,11 @@ tract_hunter_finalize <- function(state) {
     st_drop_geometry() %>%
     group_by(asunum) %>%
     summarise(
-      tracts     = n(),
-      population = sum(tract_pop_cur,   na.rm = TRUE),
-      unemp      = sum(tract_ASU_unemp, na.rm = TRUE),
-      emp        = sum(tract_ASU_emp,   na.rm = TRUE),
-      ur         = round(unemp/(unemp+emp)*100, 5),
+      Tracts     = n(),
+      Population          = sum(tract_pop_cur,   na.rm = TRUE),
+      Unemployment        = sum(tract_ASU_unemp, na.rm = TRUE),
+      Employed            = sum(tract_ASU_emp,   na.rm = TRUE),
+      `Unemployment Rate` = round(Unemployment/(Unemployment+Employed)*100, 5),
       .groups = "drop"
     )
 
