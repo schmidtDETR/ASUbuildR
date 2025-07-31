@@ -127,18 +127,13 @@ excel_names <- c("record",
 
 ## Controls {data-width="150"}
 
-This screen allows you to import the BLS-provided ASU file, generally
-named like *NV_asu23.xlsx* which will be the only external data import
-step necessary. The script will read the file, extract the state and
-corresponding year, and standardize the column names to avoid annual
-updates to the script.
+This screen allows you to import the BLS-provided ASU file, generally named like *NV_asu23.xlsx* which will be the only external data import step necessary. The script will read the file, extract the state and corresponding year, and standardize the column names to avoid annual updates to the script.
 
-If the necessary data is not in columns A through AB within the Excel
-file, this process will not work correctly.
+If the necessary data is not in columns **A through AB** within the Excel file, this process will not work correctly.
 
-Once the file is loaded, a preview of the data will appear on the right,
-the state and year will display below, and the analyst may proceed to
-the next tab (Load Initial ASU).
+Once the file is loaded, a preview of the data will appear on the right, the state and year will display below, and the analyst may proceed to the next tab (Load Initial ASU).
+
+Note: at this time, ASUbuildR assumes a state is using county-based census tracts.  If a state uses another geography such as NECTAs as the basis for its ASU tract file, this process will require some modification.
 
 ```{r}
 fileInput("file", "Choose Excel File", accept = c(".xls", ".xlsx"))
@@ -438,7 +433,7 @@ observeEvent(input$process, {
         fill_color         = pal$fill,
         fill_opacity       = 0.5,
         fill_outline_color = "black",
-        popup = concat(
+        tooltip = concat(
           "<strong>ASU Number: </strong>", get_column("asunum"), "<br>",
           "<strong>Tract GEOID: </strong>", get_column("GEOID"),  "<br>",
           "<strong>UR: </strong>",
@@ -778,6 +773,7 @@ output$edit_map <- renderMaplibre({
         "<strong>ASU Number: </strong>",get_column("asunum"), "<br>",
         "<strong>Tract GEOID: </strong>",get_column("GEOID"),"<br>",
         "<strong>Tract Population: </strong>",number_format(get_column("tract_pop_cur"), style = "decimal", maximum_fraction_digits = 0),"<br>",
+                "<strong>Tract Labor Force: </strong>",number_format(get_column("tract_ASU_clf"), style = "decimal", maximum_fraction_digits = 0),"<br>",
         "<strong>Tract Unemployment Rate: </strong>",number_format(get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2),"%<br>",
         "<strong>Tract Unemployment: </strong>",number_format(get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0),"<br>")
     )
@@ -1694,4 +1690,3 @@ upload to LSS directly once the ASUs are completed. The Summary CSV file
 provides a handy output of all selected tracts and a useful tool to
 review the selections for high-unemployment tracts that were not
 included.
-
