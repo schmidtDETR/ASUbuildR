@@ -41,61 +41,18 @@ run_tract_hunter <- function(tract_list,
   tried_starting_indexes <- integer(0)
   asu_groups             <- list()
 
-  # ---- helper: BFS paths (unchanged) ----------------------------------
-  # BFS to get *all* paths up to k hops
-  bfs_paths_up_to_k_hops <- function(start, nb, max_hops = 3, blocked = integer(0)) {
-
-    # Each queue element is a list: (path_vec, depth)
-    queue <- list(list(path = c(start), depth = 0))
-    all_paths <- list()
-
-    while (length(queue) > 0) {
-      current <- queue[[1]]
-      queue <- queue[-1]
-
-      path_vec <- current$path
-      depth    <- current$depth
-
-      # If we've reached the max depth, store the path
-      if (depth == max_hops) {
-        all_paths[[ length(all_paths) + 1 ]] <- path_vec
-        next
-      }
-
-      # Otherwise, expand neighbors of the last node in the path
-      last_node <- tail(path_vec, 1)
-      these_neighbors <- nb[[last_node]]
-
-      # Exclude blocked or already in path
-      these_neighbors <- setdiff(these_neighbors, c(path_vec, blocked))
-
-      if (length(these_neighbors) == 0) {
-        # No further expansion from here
-        all_paths[[ length(all_paths) + 1 ]] <- path_vec
-      } else {
-        # Enqueue expansions
-        for (nxt in these_neighbors) {
-          new_path <- c(path_vec, nxt)
-          queue[[ length(queue) + 1 ]] <- list(path = new_path, depth = depth + 1)
-        }
-      }
-    }
-
-    return(all_paths)
-  }
-
   # ---- 1 · SEED‑AND‑EXPAND -------------------------------------------
   repeat {
-    # 1) Identify all **unused** tracts with UR >= 0.0645
+    # 1) Identify all **unused** tracts with UR above threshold
     all_unused <- setdiff(seq_along(ur_vec), used_indexes)
-    valid_unused <- all_unused[ ur_vec[all_unused] >= .0645]
+    valid_unused <- all_unused[ ur_vec[all_unused] >= ur_thresh]
 
     # Exclude any that we already tried as a starting point
     possible_starts <- setdiff(valid_unused, tried_starting_indexes)
 
     # If none remain, we're done
     if (length(possible_starts) == 0) {
-      # message("No more possible starting tracts meeting UR >= 0.0645 that haven't been tried.")
+      # message("No more possible starting tracts meeting UR threshold that haven't been tried.")
       break
     }
 
@@ -123,72 +80,23 @@ run_tract_hunter <- function(tract_list,
         break
       }
 
-      # 2) Find all possible "candidate" tracts out to X hops (2 or 3),
-      #    but do *not* skip bridging tracts along the way.
-      #    We'll BFS from each boundary tract to possible "far" tracts
-      #    collecting all contiguous paths that stay out of used_indexes & asu_list.
+      # 2) Evaluate boundary tracts using Rcpp helper to avoid BFS overhead
+      res <- choose_best_neighbor(boundary_tracts,
+                                  emp_vec, unemp_vec, population_vec,
+                                  asu_emp, asu_unemp, asu_pop,
+                                  ur_thresh)
 
-      best_improvement <- -Inf  # track the best improvement or best final unemp, etc.
-      best_path <- NULL         # store the path (bridge + final neighbor)
-      best_ur   <- NA
-      best_emp  <- NA
-      best_unemp <- NA
-      best_pop   <- NA
+      best_index <- res$best_index
 
-      for (b in boundary_tracts) {
-
-        # BFS or DFS up to 2 or 3 hops from b, ignoring asu_list & used_indexes
-        candidate_paths <- bfs_paths_up_to_k_hops(start = b, nb = nb,
-                                                  max_hops = 0,
-                                                  blocked = c(asu_list, used_indexes))
-
-        # candidate_paths is a *list of paths*, each a vector of tract indices
-        # The last node in each path is the "far" neighbor.
-
-        for (path_vec in candidate_paths) {
-
-          # The set of new tracts if we add path_vec to the ASU
-          # (We also include bridging tracts if they're in path_vec)
-          new_tracts <- setdiff(path_vec, asu_list)  # any that aren't already in the ASU
-
-          # Calculate new totals if we add all of them
-          total_emp   <- asu_emp   + sum(emp_vec[new_tracts])
-          total_unemp <- asu_unemp + sum(unemp_vec[new_tracts])
-          total_pop   <- asu_pop   + sum(population_vec[new_tracts])
-          total_ur    <- total_unemp / (total_emp + total_unemp)
-
-          # Check if this keeps UR above threshold
-          if (total_ur >= 0.0645) {
-            # If your main goal is to *maximize total_unemp*:
-            #   improvement <- total_unemp
-            # Or to maximize final UR:
-            #   improvement <- total_ur
-            # Or any other logic.
-            improvement <- ((total_unemp)^.9) * total_ur
-
-            if(is.na(improvement)){
-              improvement <-0
-            }
-
-            if (improvement > best_improvement) {
-              best_improvement <- improvement
-              best_path        <- path_vec
-              best_ur          <- total_ur
-              best_emp         <- total_emp
-              best_unemp       <- total_unemp
-              best_pop         <- total_pop
-            }
-          }
-
-
-        } # end loop over candidate_paths
-      } # end loop over boundary tracts
-
-      # If we never found a path that yields UR >= 0.0645, we stop
-      if (is.null(best_path)) {
-        #message("No contiguous path found that maintains UR >= 0.0645.")
+      if (is.na(best_index)) {
         break
       }
+
+      best_path  <- best_index
+      best_ur    <- res$best_ur
+      best_emp   <- res$best_emp
+      best_unemp <- res$best_unemp
+      best_pop   <- res$best_pop
 
       # Otherwise, add all bridging tracts in best_path to the ASU
       new_tracts <- setdiff(best_path, asu_list)
@@ -208,9 +116,9 @@ run_tract_hunter <- function(tract_list,
     }
 
     # ---------------------------------------------------------------------
-    # 4) Check final criteria for this ASU (pop >= 10000, UR >= 0.0645)
+    # 4) Check final criteria for this ASU (pop >= 10000, UR >= threshold)
     # ---------------------------------------------------------------------
-    if (asu_pop >= 10000 && asu_ur >= 0.0645) {
+    if (asu_pop >= pop_thresh && asu_ur >= ur_thresh) {
       # It's a valid ASU; save it and mark these tracts used
       asu_groups[[length(asu_groups) + 1]] <- asu_list
       used_indexes <- c(used_indexes, asu_list)
@@ -296,7 +204,7 @@ run_tract_hunter <- function(tract_list,
     all_paths <- list()  # container for candidate paths
     for (nbr in found_neighbors) {
       # Using a cutoff (here 5) to limit path length. Adjust the cutoff as needed.
-      paths_temp <- igraph::k_shortest_paths(g, from = nbr, to = target_index, mode = "out", k = 50)
+      paths_temp <- igraph::k_shortest_paths(g, from = nbr, to = target_index, mode = "out", k = 5)
       all_paths <- c(all_paths, paths_temp$vpath)
     }
 
@@ -373,7 +281,7 @@ run_tract_hunter <- function(tract_list,
       (remaining_unemp + total_new_unemp + remaining_emp + total_new_emp)
 
     # 9. Early exit: if the new rate is already acceptable, update and return TRUE.
-    if (new_ur >= 0.0645) {
+    if (new_ur >= ur_thresh) {
       flush.console()
       # cat(green(glue::glue("\n Adding in {toString(new_indexes)}, no trade needed.\n Added {sum(unemp_vec[new_indexes])} unemp \n")))
       # flush.console()
@@ -387,18 +295,20 @@ run_tract_hunter <- function(tract_list,
     unemp_buffer <- total_new_unemp  # Total unemp being added
 
     # Iterate until the updated unemployment rate meets the threshold
-    while(new_ur < 0.0645) {
+    while(new_ur < ur_thresh) {
       # Filter candidates based on whether their unemp is less than the unemp buffer
       drop_candidates <- drop_candidates[ unemp_vec[drop_candidates] < unemp_buffer ]
       if (length(drop_candidates) == 0) return(FALSE)
 
-      # Vectorized evaluation: calculate candidate new sums if each candidate were dropped
-      candidate_new_unemp <- remaining_unemp - unemp_vec[drop_candidates] + total_new_unemp
-      candidate_new_emp   <- remaining_emp   - emp_vec[drop_candidates]   + total_new_emp
-      candidate_new_ur    <- candidate_new_unemp / (candidate_new_unemp + candidate_new_emp)
+      # Choose the drop candidate that maximizes UR via Rcpp
+      drop_res <- choose_best_drop_candidate(drop_candidates,
+                                             unemp_vec, emp_vec,
+                                             remaining_unemp, remaining_emp,
+                                             total_new_unemp, total_new_emp,
+                                             unemp_buffer)
+      new_drop_index <- drop_res$best_index
 
-      # Choose candidate with maximum resulting unemployment rate
-      new_drop_index <- drop_candidates[ which.max(candidate_new_ur) ]
+      if (is.na(new_drop_index)) return(FALSE)
 
       # Update: add candidate to dropped_indexes and remove it from remaining_indexes
       dropped_indexes <- c(dropped_indexes, new_drop_index)
@@ -423,7 +333,7 @@ run_tract_hunter <- function(tract_list,
       # cat(green(status_msg), "\n")
       # flush.console()
 
-      if(new_ur >= 0.0645) {
+      if(new_ur >= ur_thresh) {
         # cat("Hooray!\n")
         # flush.console()
         trade_complete <- TRUE
@@ -470,40 +380,14 @@ run_tract_hunter <- function(tract_list,
 
     # Filter to tracts that are assigned to an ASU
     assigned <- tract_data %>% filter(!is.na(asunum))
-    edge_list <- list()
+    asu_vec <- as.integer(tract_data$asunum)
+    edges_mat <- build_asu_edges(nb, asu_vec)
 
-    # For each assigned tract, look at its neighbors.
-    for (i in seq_len(nrow(assigned))) {
-      # IMPORTANT: if your 'row_num' column is not the row number, you might need a mapping.
-      tract_id <- assigned$row_num[i]
-      asu_current <- assigned$asunum[i]
-
-      # Get the neighbor tract indexes from nb.
-      # Ensure that "tract_id" here correctly matches the row indexing of nb.
-      neighbs <- nb[[tract_id]]
-      if (length(neighbs) == 0) next
-
-      for (n in neighbs) {
-        # Get neighbor's asunum (if any)
-        asu_neighbor <- tract_data$asunum[tract_data$row_num == n]
-        # Only record edges if neighbor is assigned and from a different ASU.
-        if (!is.na(asu_neighbor) && asu_neighbor != asu_current) {
-          # Record the pair (order doesn't matter)
-          edge_list[[length(edge_list) + 1]] <- c(as.character(asu_current), as.character(asu_neighbor))
-        }
-      }
-    }
-
-    # If no edges found, nothing needs to be merged.
-    if (length(edge_list) == 0) {
+    if (nrow(edges_mat) == 0) {
       message("No ASU groups are touching; no merging required.")
       return(tract_data)
     } else {
-      # Convert the list of edges to a two-column matrix and remove duplicate edges.
-      edges_mat <- do.call(rbind, edge_list)
-      # Sort each edge so that A-B and B-A become identical.
-      edges_sorted <- t(apply(edges_mat, 1, sort))
-      edges_unique <- unique(edges_sorted)
+      edges_unique <- unique(t(apply(edges_mat, 1, sort)))
 
       # ------------------------------------------------
       # STEP 2: Build the ASU graph and compute connected components.
@@ -565,21 +449,24 @@ run_tract_hunter <- function(tract_list,
       successful_update <- FALSE
 
       ## ---- 2. loop over candidates ------------------------------
-      for (i in seq_len(nrow(tracts_not_in_asu))) {
+      n_can <- nrow(tracts_not_in_asu)          # cache once
+
+      for (i in seq_len(n_can)) {
 
         target_index <- tracts_not_in_asu$row_num[i]
 
-        # run the user‑supplied updater (works by side‑effect on global data_merge)
+        ## run the user-supplied updater  (works by side-effect on global data_merge)
         ok <- update_tract_data(target_index)
 
-        # refresh state **after** possible change
+        ## refresh state **after** possible change
         data_merge_local <- data_merge
         tracts_in_asu    <- data_merge_local$row_num[!is.na(data_merge_local$asunum)]
         unemp_tot        <- sum(unemp_vec[tracts_in_asu])
 
-        if (verbose) {
+        ## show progress only every 100th iteration (and on the very last one)
+        if (verbose && (i %% 500L == 1L || i == n_can)) {
           update_status(
-            glue::glue("Targeting: {target_index} | Remaining: {nrow(tracts_not_in_asu) - i} | Unemployed: {unemp_tot}")
+            glue::glue("Targeting: {target_index} | Remaining: {n_can - i} | Unemployed: {unemp_tot}")
           )
         }
 
