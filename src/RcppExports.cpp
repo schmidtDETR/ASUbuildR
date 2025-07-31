@@ -10,6 +10,36 @@ Rcpp::Rostream<true>&  Rcpp::Rcout = Rcpp::Rcpp_cout_get();
 Rcpp::Rostream<false>& Rcpp::Rcerr = Rcpp::Rcpp_cerr_get();
 #endif
 
+// build_asu_edges
+IntegerMatrix build_asu_edges(List nb, IntegerVector asu_vec);
+RcppExport SEXP _ASUbuildR_build_asu_edges(SEXP nbSEXP, SEXP asu_vecSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< List >::type nb(nbSEXP);
+    Rcpp::traits::input_parameter< IntegerVector >::type asu_vec(asu_vecSEXP);
+    rcpp_result_gen = Rcpp::wrap(build_asu_edges(nb, asu_vec));
+    return rcpp_result_gen;
+END_RCPP
+}
+// choose_best_drop_candidate
+List choose_best_drop_candidate(IntegerVector drop_candidates, NumericVector unemp_vec, NumericVector emp_vec, double remaining_unemp, double remaining_emp, double total_new_unemp, double total_new_emp, double unemp_buffer);
+RcppExport SEXP _ASUbuildR_choose_best_drop_candidate(SEXP drop_candidatesSEXP, SEXP unemp_vecSEXP, SEXP emp_vecSEXP, SEXP remaining_unempSEXP, SEXP remaining_empSEXP, SEXP total_new_unempSEXP, SEXP total_new_empSEXP, SEXP unemp_bufferSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< IntegerVector >::type drop_candidates(drop_candidatesSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type unemp_vec(unemp_vecSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type emp_vec(emp_vecSEXP);
+    Rcpp::traits::input_parameter< double >::type remaining_unemp(remaining_unempSEXP);
+    Rcpp::traits::input_parameter< double >::type remaining_emp(remaining_empSEXP);
+    Rcpp::traits::input_parameter< double >::type total_new_unemp(total_new_unempSEXP);
+    Rcpp::traits::input_parameter< double >::type total_new_emp(total_new_empSEXP);
+    Rcpp::traits::input_parameter< double >::type unemp_buffer(unemp_bufferSEXP);
+    rcpp_result_gen = Rcpp::wrap(choose_best_drop_candidate(drop_candidates, unemp_vec, emp_vec, remaining_unemp, remaining_emp, total_new_unemp, total_new_emp, unemp_buffer));
+    return rcpp_result_gen;
+END_RCPP
+}
 // choose_best_neighbor
 List choose_best_neighbor(IntegerVector boundary_tracts, NumericVector emp_vec, NumericVector unemp_vec, NumericVector pop_vec, double asu_emp, double asu_unemp, double asu_pop, double ur_thresh);
 RcppExport SEXP _ASUbuildR_choose_best_neighbor(SEXP boundary_tractsSEXP, SEXP emp_vecSEXP, SEXP unemp_vecSEXP, SEXP pop_vecSEXP, SEXP asu_empSEXP, SEXP asu_unempSEXP, SEXP asu_popSEXP, SEXP ur_threshSEXP) {
@@ -30,6 +60,8 @@ END_RCPP
 }
 
 static const R_CallMethodDef CallEntries[] = {
+    {"_ASUbuildR_build_asu_edges", (DL_FUNC) &_ASUbuildR_build_asu_edges, 2},
+    {"_ASUbuildR_choose_best_drop_candidate", (DL_FUNC) &_ASUbuildR_choose_best_drop_candidate, 8},
     {"_ASUbuildR_choose_best_neighbor", (DL_FUNC) &_ASUbuildR_choose_best_neighbor, 8},
     {NULL, NULL, 0}
 };

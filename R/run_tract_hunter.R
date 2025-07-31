@@ -343,13 +343,15 @@ run_tract_hunter <- function(tract_list,
       drop_candidates <- drop_candidates[ unemp_vec[drop_candidates] < unemp_buffer ]
       if (length(drop_candidates) == 0) return(FALSE)
 
-      # Vectorized evaluation: calculate candidate new sums if each candidate were dropped
-      candidate_new_unemp <- remaining_unemp - unemp_vec[drop_candidates] + total_new_unemp
-      candidate_new_emp   <- remaining_emp   - emp_vec[drop_candidates]   + total_new_emp
-      candidate_new_ur    <- candidate_new_unemp / (candidate_new_unemp + candidate_new_emp)
+      # Choose the drop candidate that maximizes UR via Rcpp
+      drop_res <- choose_best_drop_candidate(drop_candidates,
+                                             unemp_vec, emp_vec,
+                                             remaining_unemp, remaining_emp,
+                                             total_new_unemp, total_new_emp,
+                                             unemp_buffer)
+      new_drop_index <- drop_res$best_index
 
-      # Choose candidate with maximum resulting unemployment rate
-      new_drop_index <- drop_candidates[ which.max(candidate_new_ur) ]
+      if (is.na(new_drop_index)) return(FALSE)
 
       # Update: add candidate to dropped_indexes and remove it from remaining_indexes
       dropped_indexes <- c(dropped_indexes, new_drop_index)
@@ -421,40 +423,14 @@ run_tract_hunter <- function(tract_list,
 
     # Filter to tracts that are assigned to an ASU
     assigned <- tract_data %>% filter(!is.na(asunum))
-    edge_list <- list()
+    asu_vec <- as.integer(tract_data$asunum)
+    edges_mat <- build_asu_edges(nb, asu_vec)
 
-    # For each assigned tract, look at its neighbors.
-    for (i in seq_len(nrow(assigned))) {
-      # IMPORTANT: if your 'row_num' column is not the row number, you might need a mapping.
-      tract_id <- assigned$row_num[i]
-      asu_current <- assigned$asunum[i]
-
-      # Get the neighbor tract indexes from nb.
-      # Ensure that "tract_id" here correctly matches the row indexing of nb.
-      neighbs <- nb[[tract_id]]
-      if (length(neighbs) == 0) next
-
-      for (n in neighbs) {
-        # Get neighbor's asunum (if any)
-        asu_neighbor <- tract_data$asunum[tract_data$row_num == n]
-        # Only record edges if neighbor is assigned and from a different ASU.
-        if (!is.na(asu_neighbor) && asu_neighbor != asu_current) {
-          # Record the pair (order doesn't matter)
-          edge_list[[length(edge_list) + 1]] <- c(as.character(asu_current), as.character(asu_neighbor))
-        }
-      }
-    }
-
-    # If no edges found, nothing needs to be merged.
-    if (length(edge_list) == 0) {
+    if (nrow(edges_mat) == 0) {
       message("No ASU groups are touching; no merging required.")
       return(tract_data)
     } else {
-      # Convert the list of edges to a two-column matrix and remove duplicate edges.
-      edges_mat <- do.call(rbind, edge_list)
-      # Sort each edge so that A-B and B-A become identical.
-      edges_sorted <- t(apply(edges_mat, 1, sort))
-      edges_unique <- unique(edges_sorted)
+      edges_unique <- unique(t(apply(edges_mat, 1, sort)))
 
       # ------------------------------------------------
       # STEP 2: Build the ASU graph and compute connected components.
