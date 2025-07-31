@@ -449,21 +449,24 @@ run_tract_hunter <- function(tract_list,
       successful_update <- FALSE
 
       ## ---- 2. loop over candidates ------------------------------
-      for (i in seq_len(nrow(tracts_not_in_asu))) {
+      n_can <- nrow(tracts_not_in_asu)          # cache once
+
+      for (i in seq_len(n_can)) {
 
         target_index <- tracts_not_in_asu$row_num[i]
 
-        # run the user‑supplied updater (works by side‑effect on global data_merge)
+        ## run the user-supplied updater  (works by side-effect on global data_merge)
         ok <- update_tract_data(target_index)
 
-        # refresh state **after** possible change
+        ## refresh state **after** possible change
         data_merge_local <- data_merge
         tracts_in_asu    <- data_merge_local$row_num[!is.na(data_merge_local$asunum)]
         unemp_tot        <- sum(unemp_vec[tracts_in_asu])
 
-        if (verbose) {
+        ## show progress only every 100th iteration (and on the very last one)
+        if (verbose && (i %% 100L == 1L || i == n_can)) {
           update_status(
-            glue::glue("Targeting: {target_index} | Remaining: {nrow(tracts_not_in_asu) - i} | Unemployed: {unemp_tot}")
+            glue::glue("Targeting: {target_index} | Remaining: {n_can - i} | Unemployed: {unemp_tot}")
           )
         }
 
