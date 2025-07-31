@@ -33,5 +33,4 @@ Imports:
 Suggests:
     knitr
 VignetteBuilder: knitr
-Remotes:
-    mitchelloharawild/mapgl
+
