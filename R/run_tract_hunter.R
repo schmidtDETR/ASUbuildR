@@ -1,5 +1,5 @@
 # -----------------------------------------------------------------------
-# run_tract_hunter.R  –  “as‑is” port of your original script
+# run_tract_hunter.R  –  "as‑is" port of your original script
 # -----------------------------------------------------------------------
 
 # The functions below break the Tract Hunter algorithm into
@@ -17,17 +17,17 @@ tract_hunter_seed <- function(tract_list,
     if (requireNamespace("shiny", quietly = TRUE) && shiny::isRunning()) {
       shiny::incProgress(amount = 0, detail = msg)
     } else if (isTRUE(verbose)) {
-      cat("\r", msg); flush.console()
+      cat("\r", msg); utils::flush.console()
     }
   }
 
   # ---- 0 · PREP ----------------------------------------------------
-  data_merge <- tract_list %>%
-    left_join(bls_df, by = "GEOID") %>%
-    mutate(
+  data_merge <- tract_list |>
+    dplyr::left_join(bls_df, by = "GEOID") |>
+    dplyr::mutate(
       ur      = ifelse(tract_ASU_unemp + tract_ASU_emp == 0,
-                        0, tract_ASU_unemp/(tract_ASU_unemp + tract_ASU_emp)),
-      row_num = if_else(!is.na(row_num), row_num, row_number())
+                       0, tract_ASU_unemp/(tract_ASU_unemp + tract_ASU_emp)),
+      row_num = dplyr::if_else(!is.na(row_num), row_num, dplyr::row_number())
     )
 
   data_merge$continuous <- lapply(data_merge$continuous, function(x) {
@@ -35,10 +35,6 @@ tract_hunter_seed <- function(tract_list,
     if (length(x) == 1 && x == 0) return(integer(0))
     as.integer(x)
   })
-
-
-
-
 
   nb <- data_merge$continuous
   g  <- igraph::graph_from_adj_list(nb)
@@ -90,7 +86,7 @@ tract_hunter_seed <- function(tract_list,
     asu_unemp <- unemp_vec[starting_index]
     asu_pop   <- population_vec[starting_index]
     asu_ur    <- ifelse(asu_emp + asu_unemp == 0,
-                         0, asu_unemp / (asu_emp + asu_unemp))
+                        0, asu_unemp / (asu_emp + asu_unemp))
 
     asu_list <- c(starting_index)
 
@@ -122,7 +118,7 @@ tract_hunter_seed <- function(tract_list,
       asu_ur     <- best_ur
 
       cat(glue::glue("UR: {round(asu_ur, 4)} | Unemp: {round(asu_unemp)} | Emp: {round(asu_emp)} | Pop: {round(asu_pop)}   \r"))
-      flush.console()
+      utils::flush.console()
     }
 
     if (asu_pop >= pop_thresh && asu_ur >= ur_thresh) {
@@ -153,7 +149,7 @@ tract_hunter_seed <- function(tract_list,
 }
 
 combine_asu_groups_internal <- function(tract_data, nb) {
-  assigned <- tract_data %>% filter(!is.na(asunum))
+  assigned <- tract_data |> dplyr::filter(!is.na(asunum))
   asu_vec  <- as.integer(tract_data$asunum)
   edges_mat <- build_asu_edges(nb, asu_vec)
 
@@ -180,17 +176,17 @@ combine_asu_groups_internal <- function(tract_data, nb) {
       stringsAsFactors = FALSE
     )
 
-    new_ids <- lookup %>%
-      group_by(comp) %>%
-      summarize(new_asu = min(original_asu)) %>%
-      ungroup()
+    new_ids <- lookup |>
+      dplyr::group_by(comp) |>
+      dplyr::summarize(new_asu = min(original_asu)) |>
+      dplyr::ungroup()
 
-    lookup <- lookup %>% left_join(new_ids, by = "comp")
+    lookup <- lookup |> dplyr::left_join(new_ids, by = "comp")
 
-    tract_data <- tract_data %>%
-      mutate(asunum = ifelse(!is.na(asunum),
-                             lookup$new_asu[match(as.character(asunum), lookup$original_asu)],
-                             asunum))
+    tract_data <- tract_data |>
+      dplyr::mutate(asunum = ifelse(!is.na(asunum),
+                                    lookup$new_asu[match(as.character(asunum), lookup$original_asu)],
+                                    asunum))
 
     message(crayon::yellow("Combined ASU groups based on touching tracts."))
     return(tract_data)
@@ -210,7 +206,7 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
     if (requireNamespace("shiny", quietly = TRUE) && shiny::isRunning()) {
       shiny::incProgress(amount = 0, detail = msg)
     } else if (isTRUE(verbose)) {
-      cat("\r", msg); flush.console()
+      cat("\r", msg); utils::flush.console()
     }
   }
 
@@ -275,7 +271,6 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
     )
   }
 
-
   update_tract_data <- function(target_index) {
     all_asu_indexes <- which(!is.na(data_merge$asunum))
 
@@ -312,7 +307,7 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
     new_ur <- (remaining_unemp + total_new_unemp) / denom
 
     if (new_ur >= ur_thresh) {
-      flush.console()
+      utils::flush.console()
       data_merge[new_indexes, "asunum"] <<- asu_being_processed
       return(TRUE)
     }
@@ -372,9 +367,9 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
 
   repeat {
     data_merge_local <- data_merge
-    tracts_not_in_asu <- data_merge_local %>%
-      filter(is.na(asunum)) %>%
-      arrange(-ur)
+    tracts_not_in_asu <- data_merge_local |>
+      dplyr::filter(is.na(asunum)) |>
+      dplyr::arrange(-ur)
 
     if (nrow(tracts_not_in_asu) == 0L) {
       if (verbose) cat("\nNo more tracts to process.\n")
@@ -426,20 +421,20 @@ tract_hunter_finalize <- function(state) {
 
   data_merge$asunum[is.na(data_merge$asunum)] <- 0
 
-  full_data <- data_merge %>%
-    select(-continuous) %>%
-    st_as_sf() %>%
-    st_cast("MULTIPOLYGON", warn = FALSE) %>%
-    mutate(ur = ur * 100,
-           asunum = as.integer(asunum))
+  full_data <- data_merge |>
+    dplyr::select(-continuous) |>
+    sf::st_as_sf() |>
+    sf::st_cast("MULTIPOLYGON", warn = FALSE) |>
+    dplyr::mutate(ur = ur * 100,
+                  asunum = as.integer(asunum))
 
-  asu_tracts <- full_data %>% filter(asunum > 0)
+  asu_tracts <- full_data |> dplyr::filter(asunum > 0)
 
-  asu_summary <- asu_tracts %>%
-    st_drop_geometry() %>%
-    group_by(asunum) %>%
-    summarise(
-      Tracts     = n(),
+  asu_summary <- asu_tracts |>
+    sf::st_drop_geometry() |>
+    dplyr::group_by(asunum) |>
+    dplyr::summarise(
+      Tracts     = dplyr::n(),
       Population          = sum(tract_pop_cur,   na.rm = TRUE),
       Unemployment        = sum(tract_ASU_unemp, na.rm = TRUE),
       Employed            = sum(tract_ASU_emp,   na.rm = TRUE),
