@@ -343,6 +343,7 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
 
       if (isTRUE(ok)) {
         successful_update <- TRUE
+        break
       }
     }
 
