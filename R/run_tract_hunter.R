@@ -206,6 +206,8 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
 
     all_paths <- list()
     for (nbr in found_neighbors) {
+      # Using a cutoff (here 5) to limit path length. Adjust the cutoff as needed.
+
       paths_temp <- igraph::k_shortest_paths(g, from = nbr, to = target_index, mode = "out", k = 5)
       all_paths <- c(all_paths, paths_temp$vpath)
     }
