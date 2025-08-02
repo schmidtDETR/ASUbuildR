@@ -161,6 +161,7 @@ tract_hunter_seed <- function(tract_list,
     ur_thresh       = ur_thresh,
     pop_thresh      = pop_thresh
   )
+}
 #' Combine touching ASU groups
 #'
 #' Internal helper that merges adjacent ASU groups into one.
