@@ -1606,14 +1606,16 @@ When review is complete, continue to the next tab - Load Initial ASU.
 
 **Load Initial ASU**
 
-To begin the ASU designation process, click the
-`Load Tracts and Initialize ASU` button. This will execute the
-tract-by-tract ASU building process. Small states may see this process
-run in under 20 seconds. The largest states may take up to 5 minutes.
-When the process is complete, the app will render a map to on the right
-side of the page. The number of colors on this map is limited to 8, so
-if more than 8 potential ASUs are identified, more than one ASU will use
-the same color.
+There are two options available to the user at this stage.  The **Tract Hunter** is a process that will iteratively build ASU regions by seeding an initial map, then comparing potential targeted tracts to add or remove, with the goal of achieving the maximum level of unemployment within ASUs. Tract Hunter includes logic to only allow ASUs that meet the minimum 10,000 population threshold.
+
+The original **Simple Snake** methodology starts from tracts with an unemployment rate of at least 6.45%, then sequentially adding the adjacent tract with the highest unemployment rate until the combined region is less than 6.45%. Because this starts from single tracts, it does not consider whether the combined population qualifies as an ASU.
+
+If the state being loaded is a New England state, you will see an additional option to select the year to download.  Because the Census Bureau only maintains NECTA-based census tracts for 2021 and earlier, using the default settings may cause the app to crash if your Excel file uses these older GEOIDs.
+
+To begin the ASU designation process, choose a methodology.  Then, click the
+`Load Tracts and Initialize ASU` button. This will download the appropriate shapefiles from the Census and execute the tract-by-tract ASU building process. Small states may see this process run in under 20 seconds. The largest states may take up to 5 minutes. When the process is complete, the app will render a map to on the right side of the page. The number of colors on this map is limited to 8, so if more than 8 potential ASUs are identified, more than one ASU will use the same color.
+
+If using the Tract Hunter, use the **Run Hunter** and **Combine Groups** buttons to allow the algorithm to attempt to improve the existing ASUs.
 
 In addition, note that a table of the potential ASUs will appear below
 the button. This will give the analyst a sense of how many tracts may be
@@ -1621,7 +1623,7 @@ worth merging into larger ASUs. In general, regions with 3 or fewer
 tracts are unlikely to meet the population threshold to qualify as an
 ASU.
 
-To begin manipulating the data, proceed to the next tab, Modify ASU
+To begin manually manipulating the data, proceed to the next tab, Modify ASU
 Selections. Or, if the number of modifications is large or the state
 takes a long time to run, skip ahead to perform an initial save of the
 data on Save and Load Data.
@@ -1655,18 +1657,7 @@ tools are provided to aid in the optimization of the ASUs. In general,
     may help with determining whether it is efficient to add a tract or
     group of tracts to an existing ASU.
 
--   Percentile Threshold / Show Tracts with Lowest UR: This allows you
-    to enter a numeric value (0-100) which will highlight the tracts
-    within the current selection that have the lowest unemployment
-    rates. As the analyst changes ASUs, this helps identify tracts which
-    might be good candidates to remove from an ASU to add others in.
-    While the algorithm will add tracts until the combined rate is as
-    low as possible, it does not know whether a tract with low
-    unemployment would be useful to “bridge” to a further high
-    unemployment tract that could not otherwise qualify as an ASU.
-    *Note: this functionality currently **removes highlighting from
-    still-selected tracts**. To make changes, please Clear Selected
-    Tracts, then select the tract you wish to modify.*
+-   Percentile Threshold: This allows you to examine the tracts in your current selection with either high or low unemployment rates.  This is useful for identifying tracts outside of current ASUs that you may wish to include in an ASU or identifying tracts inside of current ASUs that you may with to drop.  Please choose whether you want to highlight Low or High unemployment tracts and enter a number in the Percentile Threshold box to highlight the top or bottom X% of tracts (X is the number you enter).  For example, if you have 200 tracts selected and choose 5 as your threshold and High unemployment, clicking the **Highlight Tracts** button will turn the color of the 10 tracts with the highest unemployment rates black.  Selecting **Clear Highlights** will clear all current highlighting.
 
 -   Enter a GEOID / Select a Single Tract: This functionality is most
     useful when using the CSV output that this app generates on the
