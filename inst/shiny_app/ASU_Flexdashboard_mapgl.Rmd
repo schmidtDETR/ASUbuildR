@@ -186,7 +186,13 @@ shiny::observeEvent(input$file, {
            tract_ASU_clf,
            tract_ASU_emp,
            tract_ASU_unemp,
-           tract_ASU_urate)
+           tract_ASU_urate) |> 
+    dplyr::mutate(
+      tract_pop_cur = as.integer(tract_pop_cur),
+      tract_ASU_clf = as.integer(tract_ASU_clf),
+      tract_ASU_emp = as.integer(tract_ASU_emp),
+      tract_ASU_unemp = as.integer(tract_ASU_unemp)
+    )
   
   uploaded_data(df)
   
@@ -310,25 +316,23 @@ output$algo_blurb <- shiny::renderUI({
   } else {
     ## ───────── TRACT-HUNTER METHOD ─────────
     shiny::HTML(
-      "<p><strong>Tract Hunter pipeline</strong></p>
+      "<p><strong>Tract Hunter workflow</strong></p>
        <p>Because Tract Hunter works in stages, the interface exposes those
           stages as separate buttons:</p>
        <ul>
          <li><em>Load tracts & initialise</em><br>
              ▸ downloads shapefiles, merges the BLS file, then runs the
-             <strong>Seed + Expand</strong> step automatically.</li>
-         <li><em>Run ASU Pass</em><br>
+             <strong>Seed + Expand</strong> step automatically. This should only be run once.</li>
+         <li><em>Run Hunter</em><br>
              ▸ performs the optimisation/trade pass that adds
              high-unemployment neighbours and drops low-unemployment ones until
              every ASU is as close as possible to the
-             <code>6.45&nbsp;%</code> threshold.</li>
+             <code>6.45%</code> threshold.</li>
          <li><em>Combine Groups</em><br>
-             ▸ merges adjacent ASUs that share a boundary, then performs a
-             <em>second</em> optimisation pass so no eligible tract is left
-             behind.</li>
+             ▸ merges adjacent ASUs that share a boundary. Connected ASUs allow for more tracts to be added, so whenever ASUs are merged it is advisable to run another pass with the Tract Hunter.</li>
        </ul>
        <p>You can stop after any step to inspect the map, or run the buttons
-          in sequence for the full, automatic workflow.  Each step updates the
+          in sequence for the full, automatic workflow. We suggest iteratively running the Run Hunter and Combine Groups steps until Total Unemployment in ASUs no longer increases.  Each step updates the
           colour map and the unemployment totals shown on the right.</p>"
     )
   }
@@ -345,7 +349,6 @@ shiny::observeEvent(input$process, {
   ## 0 · Basic checks ----------------------------------------------------
   shiny::req(uploaded_data(), state(), tract_year())
 
-  # ADD THIS NEW CODE HERE:
   # Determine which year to use
   selected_year <- tract_year()  # default to detected year
   
