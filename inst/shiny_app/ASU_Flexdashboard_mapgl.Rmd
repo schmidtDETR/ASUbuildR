@@ -219,12 +219,36 @@ shiny::observeEvent(input$file, {
 ## Controls {data-width="200"}
 
 ```{r}
+# ---- New England year override controls ------------------------------
+shiny::conditionalPanel(
+  condition = "output.is_new_england === true",
+  shiny::tagList(
+    shiny::hr(style = "margin: 0.8rem 0;"),
+    shiny::h5("New England Year Selection"),
+    shiny::radioButtons(
+      inputId = "ne_year_choice",
+      label   = "Choose tract year:",
+      choices = list(
+        "Use detected year (default)" = "detected",
+        "Use 2021 (last NECTA year)"  = "2021"
+      ),
+      selected = "detected",
+      inline = FALSE
+    ),
+    shiny::p(
+      style = "font-size: 0.9em; color: #666;",
+      "Note: 2021 is the last year NECTA-based tracts were available for New England states."
+    )
+  )
+)
+
 # ---- algorithm picker -------------------------------------------------
 shiny::radioButtons(
   inputId = "asu_algo",
   label   = "Choose algorithm",
-  choices = c("Original"      = "orig",
-              "Tract Hunter"  = "mine"),
+  choices = c(
+    "Tract Hunter"  = "mine",
+    "Simple Snake"  = "orig"),
   inline  = TRUE
 )
 
@@ -253,28 +277,6 @@ shiny::conditionalPanel(
   )
 )
 
-# ---- New England year override controls ------------------------------
-shiny::conditionalPanel(
-  condition = "output.is_new_england === true",
-  shiny::tagList(
-    shiny::hr(style = "margin: 0.8rem 0;"),
-    shiny::h5("New England Year Selection"),
-    shiny::radioButtons(
-      inputId = "ne_year_choice",
-      label   = "Choose tract year:",
-      choices = list(
-        "Use detected year (default)" = "detected",
-        "Use 2021 (last NECTA year)"  = "2021"
-      ),
-      selected = "detected",
-      inline = FALSE
-    ),
-    shiny::p(
-      style = "font-size: 0.9em; color: #666;",
-      "Note: 2021 is the last year NECTA-based tracts were available for New England states."
-    )
-  )
-)
 
 # ---- dynamic algorithm description -----------------------------------
 output$algo_blurb <- shiny::renderUI({
@@ -335,6 +337,7 @@ output$algo_blurb <- shiny::renderUI({
 shiny::uiOutput("algo_blurb")
 
 shiny::htmlOutput("total_unemp")
+
 shiny::tableOutput("asu")
 
 shiny::observeEvent(input$process, {
@@ -440,17 +443,17 @@ shiny::observeEvent(input$process, {
 
     palette_logic <- function(n_asu) {
   if (n_asu == 0) {
-    list(fill = "#808080",
+    list(fill = "#E0E0E0",
          legend_vals = "(none)",
-         legend_cols = "#808080")
+         legend_cols = "#E0E0E0")
 
   } else if (n_asu == 1) {
     list(
       fill  = mapgl::step_expr(column="asunum",
-                        base="#808080",
+                        base="#E0E0E0",
                         stops="#7FC97F",
                         values=1,
-                        na_color="#444444"),
+                        na_color="#E0E0E0"),
       legend_vals = 1,
       legend_cols = "#7FC97F"
     )
@@ -469,7 +472,7 @@ shiny::observeEvent(input$process, {
                        base     = pal[1],
                        stops    = pal[-1],
                        values   = breaks,
-                       na_color = "#444444"),
+                       na_color = "#E0E0E0"),
       legend_vals = seq_len(n_asu),
       legend_cols = legend_cols
     )
@@ -485,7 +488,7 @@ shiny::observeEvent(input$process, {
         id                 = "basemap",
         source             = map_data,
         fill_color         = pal$fill,
-        fill_opacity       = 0.5,
+        fill_opacity       = 0.6,
         fill_outline_color = "black",
         tooltip = mapgl::concat(
           "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
@@ -546,17 +549,17 @@ shiny::observeEvent(input$th_pass, {
     
     palette_logic <- function(n_asu) {
   if (n_asu == 0) {
-    list(fill = "#808080",
+    list(fill = "#E0E0E0",
          legend_vals = "(none)",
-         legend_cols = "#808080")
+         legend_cols = "#E0E0E0")
 
   } else if (n_asu == 1) {
     list(
       fill  = mapgl::step_expr(column="asunum",
-                        base="#808080",
+                        base="#E0E0E0",
                         stops="#7FC97F",
                         values=1,
-                        na_color="#444444"),
+                        na_color="#E0E0E0"),
       legend_vals = 1,
       legend_cols = "#7FC97F"
     )
@@ -575,7 +578,7 @@ shiny::observeEvent(input$th_pass, {
                        base     = pal[1],
                        stops    = pal[-1],
                        values   = breaks,
-                       na_color = "#444444"),
+                       na_color = "#E0E0E0"),
       legend_vals = seq_len(n_asu),
       legend_cols = legend_cols
     )
@@ -630,17 +633,17 @@ shiny::observeEvent(input$th_combine, {
     
     palette_logic <- function(n_asu) {
   if (n_asu == 0) {
-    list(fill = "#808080",
+    list(fill = "#E0E0E0",
          legend_vals = "(none)",
-         legend_cols = "#808080")
+         legend_cols = "#E0E0E0")
 
   } else if (n_asu == 1) {
     list(
       fill  = mapgl::step_expr(column="asunum",
-                        base="#808080",
+                        base="#E0E0E0",
                         stops="#7FC97F",
                         values=1,
-                        na_color="#444444"),
+                        na_color="#E0E0E0"),
       legend_vals = 1,
       legend_cols = "#7FC97F"
     )
@@ -659,7 +662,7 @@ shiny::observeEvent(input$th_combine, {
                        base     = pal[1],
                        stops    = pal[-1],
                        values   = breaks,
-                       na_color = "#444444"),
+                       na_color = "#E0E0E0"),
       legend_vals = seq_len(n_asu),
       legend_cols = legend_cols
     )
@@ -694,6 +697,13 @@ output$total_unemp <- shiny::renderUI({
            scales::comma(total_unemp()))
   )
 })
+
+output$total_unemp2 <- shiny::renderUI({
+  shiny::HTML(
+    paste0("<strong>Total Unemployment in ASUs:</strong> ",
+           scales::comma(total_unemp()))
+  )
+})
 ```
 
 ## Output {data-width="800"}
@@ -709,6 +719,10 @@ mapgl::maplibreOutput("initial_map", height = "100vh")
 These tools allow you to select, inspect, and change ASU designations for individual Census tracts.  *Selected* Census tracts will be outlined in red, and are the tracts updated when you change the ASU number.  You may also click on the map to select or unselect individual tracts. An ASU value of 0 means the tract is not included in any ASU.
 
 ```{r}
+#-------Total Unemployment Box --------------------------------
+shiny::htmlOutput("total_unemp2")
+shiny::renderUI(shiny::HTML("<hr>"))
+
 # Select an ASU
 asu_selection_ui <- shiny::reactive({
   shiny::selectInput("select_asunum", "Select ASU Number:",
@@ -794,10 +808,10 @@ output$edit_map <- mapgl::renderMaplibre({
       source = full_data(),
       fill_color = mapgl::step_expr(
         column = "asunum",
-        base = "#808080",  # Grey for asunum == 0 (and anything < first break)
+        base = "#E0E0E0",  # Grey for asunum == 0 (and anything < first break)
         stops = brewer_pal,
         values = asu_breaks,
-        na_color = "#444444"
+        na_color = "#E0E0E0"
       ),
       fill_opacity = 0.5,
       fill_outline_color = "black",
@@ -1075,10 +1089,7 @@ Modification tab to continue making edits.
 ```{r}
 # Directory selection - Simple text input approach
 shiny::textInput("save_dir_path", "Save Directory Path:", value = getwd(), width = "100%")
-shiny::br()
-shiny::actionButton("browse_dir", "Browse for Directory")
-shiny::br()
-shiny::br()
+#shiny::actionButton("browse_dir", "Browse for Directory") # non-functional
 shiny::textOutput("current_save_dir")
 shiny::textOutput("dir_status")
 shiny::br()
@@ -1098,34 +1109,34 @@ shiny::observeEvent(input$save_dir_path, {
   }
 })
 
-# Alternative browse button (opens file dialog for directory selection)
-shiny::observeEvent(input$browse_dir, {
-  # This will work in RStudio or desktop R
-  if (interactive()) {
-    selected_dir <- tryCatch({
-      utils::choose.dir(default = save_directory(), caption = "Select Save Directory")
-    }, error = function(e) {
-      # For non-Windows systems, use tcltk
-      tryCatch({
-        tcltk::tk_choose.dir(default = save_directory(), caption = "Select Save Directory")
-      }, error = function(e2) {
-        NULL
-      })
-    })
-    
-    if (!is.null(selected_dir) && selected_dir != "") {
-      shiny::updateTextInput(session, "save_dir_path", value = selected_dir)
-      save_directory(selected_dir)
-    }
-  } else {
-    # In web-deployed apps, show instruction
-    shiny::showModal(shiny::modalDialog(
-      title = "Directory Selection",
-      "In web-deployed apps, please manually enter the directory path in the text field above.",
-      easyClose = TRUE
-    ))
-  }
-})
+# # Alternative browse button (opens file dialog for directory selection)
+# shiny::observeEvent(input$browse_dir, {
+#   # This will work in RStudio or desktop R
+#   if (interactive()) {
+#     selected_dir <- tryCatch({
+#       utils::choose.dir(default = save_directory(), caption = "Select Save Directory")
+#     }, error = function(e) {
+#       # For non-Windows systems, use tcltk
+#       tryCatch({
+#         tcltk::tk_choose.dir(default = save_directory(), caption = "Select Save Directory")
+#       }, error = function(e2) {
+#         NULL
+#       })
+#     })
+#     
+#     if (!is.null(selected_dir) && selected_dir != "") {
+#       shiny::updateTextInput(session, "save_dir_path", value = selected_dir)
+#       save_directory(selected_dir)
+#     }
+#   } else {
+#     # In web-deployed apps, show instruction
+#     shiny::showModal(shiny::modalDialog(
+#       title = "Directory Selection",
+#       "In web-deployed apps, please manually enter the directory path in the text field above.",
+#       easyClose = TRUE
+#     ))
+#   }
+# })
 
 # Display current save directory
 output$current_save_dir <- shiny::renderText({
@@ -1238,10 +1249,10 @@ shiny::observeEvent(input$load_data, {
       source = full_data(),
       fill_color = mapgl::step_expr(
         column = "asunum",
-        base = "#808080",  # Grey for asunum == 0 (and anything < first break)
+        base = "#E0E0E0",  # Grey for asunum == 0 (and anything < first break)
         stops = brewer_pal,
         values = asu_breaks,
-        na_color = "#444444"
+        na_color = "#E0E0E0"
       ),
       fill_opacity = 0.5,
       fill_outline_color = "black",
