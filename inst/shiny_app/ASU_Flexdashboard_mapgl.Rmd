@@ -94,6 +94,19 @@ edit_table <- shiny::reactiveVal(NULL)
 edit_summary <- shiny::reactiveVal(NULL)
 current_selection <- shiny::reactiveVal(NULL)
 
+# New England Optional year selection logic
+output$is_new_england <- shiny::reactive({
+  if (is.null(state())) return(FALSE)
+  
+  # New England state FIPS codes
+  new_england_fips <- c("09", "23", "25", "33", "44", "50")  # CT, ME, MA, NH, RI, VT
+  
+  state() %in% new_england_fips
+})
+
+# Make it available to the UI
+shiny::outputOptions(output, "is_new_england", suspendWhenHidden = FALSE)
+
 # Tract Hunter staged state -----------------------------------------
 th_state <- shiny::reactiveVal(NULL)
 th_tract_list <- shiny::reactiveVal(NULL)
@@ -240,6 +253,29 @@ shiny::conditionalPanel(
   )
 )
 
+# ---- New England year override controls ------------------------------
+shiny::conditionalPanel(
+  condition = "output.is_new_england === true",
+  shiny::tagList(
+    shiny::hr(style = "margin: 0.8rem 0;"),
+    shiny::h5("New England Year Selection"),
+    shiny::radioButtons(
+      inputId = "ne_year_choice",
+      label   = "Choose tract year:",
+      choices = list(
+        "Use detected year (default)" = "detected",
+        "Use 2021 (last NECTA year)"  = "2021"
+      ),
+      selected = "detected",
+      inline = FALSE
+    ),
+    shiny::p(
+      style = "font-size: 0.9em; color: #666;",
+      "Note: 2021 is the last year NECTA-based tracts were available for New England states."
+    )
+  )
+)
+
 # ---- dynamic algorithm description -----------------------------------
 output$algo_blurb <- shiny::renderUI({
 
@@ -306,12 +342,33 @@ shiny::observeEvent(input$process, {
   ## 0 · Basic checks ----------------------------------------------------
   shiny::req(uploaded_data(), state(), tract_year())
 
+  # ADD THIS NEW CODE HERE:
+  # Determine which year to use
+  selected_year <- tract_year()  # default to detected year
+  
+  # Check if this is New England and user selected 2021
+  state_val <- state()
+  if (!is.null(state_val) && length(state_val) > 0) {
+    new_england_fips <- c("09", "23", "25", "33", "44", "50")
+    if (state_val %in% new_england_fips && 
+        !is.null(input$ne_year_choice) && 
+        input$ne_year_choice == "2021") {
+      selected_year <- "2021"
+    }
+  }
+
   ## 1 · Wrap the whole long job in withProgress -------------------------
   shiny::withProgress(message = "Running ASU initialisation…", value = 0, {
+    
+    # Add force year = 2021 option for New England  # <-- you can remove this comment now
 
     ## 1a · Build tracts + neighbours (can take ~10–60 s the first time)
     shiny::incProgress(0.10, detail = "Downloading Census shapefiles…")
-    tract_list <- tigris::tracts(state = state(), year = tract_year()) |>
+    
+    # CHANGE THIS LINE FROM:
+    # tract_list <- tigris::tracts(state = state(), year = tract_year()) |>
+    # TO:
+    tract_list <- tigris::tracts(state = state(), year = selected_year) |>
       dplyr::mutate(
         row_num    = dplyr::row_number(),
         continuous = sfdep::st_contiguity(geometry)
