@@ -19,20 +19,36 @@ library(sf)
 library(sfdep)
 library(tidyverse)
 library(readxl)
+## ---- compile-helpers-if-needed -----------------------------------------
 library(Rcpp)
+library(here)
 
-#––– Only re-compile when you’re running the app straight from the repo –––#
-# if (interactive()) {
-# 
-#   if (!exists("choose_best_neighbor", mode = "function"))
-#     Rcpp::sourceCpp("src/choose_best_neighbor.cpp")
-# 
-#   if (!exists("build_edges", mode = "function"))
-#     Rcpp::sourceCpp("src/build_edges.cpp")
-# 
-#   if (!exists("choose_best_drop", mode = "function"))
-#     Rcpp::sourceCpp("src/choose_best_drop.cpp")
-# }
+# Are we in a development repo?
+src_cpp_files <- c("choose_best_neighbor.cpp",
+                   "build_edges.cpp",
+                   "choose_best_drop.cpp")
+
+src_paths <- here::here("src", src_cpp_files)
+in_repo   <- all(file.exists(src_paths))   # all files present in src/
+
+# Compile C++ functions if not yet defined
+maybe_sourceCpp <- function(fun, path) {
+  if (!exists(fun, mode = "function") && file.exists(path)) {
+    message("Compiling ", basename(path))
+    Rcpp::sourceCpp(path)
+  }
+}
+
+if (in_repo) {
+  message("→ Dev mode: sourcing C++ files")
+  maybe_sourceCpp("choose_best_neighbor", src_paths[1])
+  maybe_sourceCpp("build_edges",          src_paths[2])
+  maybe_sourceCpp("choose_best_drop",     src_paths[3])
+} else {
+  message("→ Installed package mode")
+  library(ASUbuildR)  # Loads compiled .dll/.so with registered functions
+}
+## ------------------------------------------------------------------------
 
 ## ---- tigris cache ----------------------------------------------------
 ## put cached TIGER/Line ZIPs in a per-user cache folder that is always
