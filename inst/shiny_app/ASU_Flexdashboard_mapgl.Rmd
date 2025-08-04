@@ -36,7 +36,22 @@ if (in_repo) {
   maybe_sourceCpp("choose_best_drop",     src_paths[3])
 } else {
   message("→ Installed package mode (shared library already loaded)")
+
 }
+
+# ---- dev mode: source helper functions relative to this file ----------
+is_dev_mode <- file.exists("../../DESCRIPTION") && dir.exists("../../R")
+
+if (is_dev_mode) {
+  message("→ Dev mode: sourcing from ../../R/")
+  r_dir <- normalizePath("../../R", winslash = "/", mustWork = TRUE)
+
+  source(file.path(r_dir, "run_tract_hunter.R"))
+  source(file.path(r_dir, "run_asu_original.r"))
+} else {
+  message("→ Installed package mode: functions should already be available")
+}
+
 
 ## ---- tigris cache ----------------------------------------------------
 ## put cached TIGER/Line ZIPs in a per-user cache folder that is always
@@ -55,14 +70,6 @@ options(tigris_cache_dir = cache_dir)
 # tell tigris to look there first before re‑downloading
 options(tigris_use_cache = TRUE)
 
-# ---- resolve paths from the project root ----------------------------
-# 'here()' always points at the directory that contains ASUbuildR.Rproj
-# no matter where this .Rmd lives.
-if (!requireNamespace("here", quietly = TRUE))
-  install.packages("here")
-
-source(here::here("R", "run_asu_original.r"))   # local = FALSE by default
-source(here::here("R", "run_tract_hunter.R"))
 
 # cache every tigris download automatically
 options(
