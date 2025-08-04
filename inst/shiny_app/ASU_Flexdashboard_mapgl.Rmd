@@ -11,15 +11,17 @@ editor_options:
 ---
 
 ```{r setup, include=FALSE}
-# Are we in a development repo?
+# Figure out full paths to src/ C++ files, going up two levels
 src_cpp_files <- c("choose_best_neighbor.cpp",
                    "build_edges.cpp",
                    "choose_best_drop.cpp")
 
-src_paths <- here::here("src", src_cpp_files)
-in_repo   <- all(file.exists(src_paths))   # all files present in src/
+src_paths <- normalizePath(file.path("..", "..", "src", src_cpp_files),
+                           winslash = "/", mustWork = FALSE)
 
-# Compile C++ functions if not yet defined
+# Check that all source files are there
+in_repo <- all(file.exists(src_paths))
+
 maybe_sourceCpp <- function(fun, path) {
   if (!exists(fun, mode = "function") && file.exists(path)) {
     message("Compiling ", basename(path))
@@ -28,15 +30,13 @@ maybe_sourceCpp <- function(fun, path) {
 }
 
 if (in_repo) {
-  message("→ Dev mode: sourcing C++ files")
+  message("→ Dev mode: compiling C++ helpers from src/")
   maybe_sourceCpp("choose_best_neighbor", src_paths[1])
   maybe_sourceCpp("build_edges",          src_paths[2])
   maybe_sourceCpp("choose_best_drop",     src_paths[3])
 } else {
-  message("→ Installed package mode")
+  message("→ Installed package mode (shared library already loaded)")
 }
-
-
 
 ## ---- tigris cache ----------------------------------------------------
 ## put cached TIGER/Line ZIPs in a per-user cache folder that is always
