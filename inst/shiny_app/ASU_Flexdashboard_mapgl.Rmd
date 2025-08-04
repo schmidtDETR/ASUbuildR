@@ -11,11 +11,47 @@ editor_options:
 ---
 
 ```{r setup, include=FALSE}
-# Remove all library() calls and use explicit namespace references
+# Figure out full paths to src/ C++ files, going up two levels
+src_cpp_files <- c("choose_best_neighbor.cpp",
+                   "build_edges.cpp",
+                   "choose_best_drop.cpp")
 
-Rcpp::sourceCpp("../../src/choose_best_neighbor.cpp")
-Rcpp::sourceCpp("../../src/build_edges.cpp")
-Rcpp::sourceCpp("../../src/choose_best_drop.cpp")
+src_paths <- normalizePath(file.path("..", "..", "src", src_cpp_files),
+                           winslash = "/", mustWork = FALSE)
+
+# Check that all source files are there
+in_repo <- all(file.exists(src_paths))
+
+maybe_sourceCpp <- function(fun, path) {
+  if (!exists(fun, mode = "function") && file.exists(path)) {
+    message("Compiling ", basename(path))
+    Rcpp::sourceCpp(path)
+  }
+}
+
+if (in_repo) {
+  message("→ Dev mode: compiling C++ helpers from src/")
+  maybe_sourceCpp("choose_best_neighbor", src_paths[1])
+  maybe_sourceCpp("build_edges",          src_paths[2])
+  maybe_sourceCpp("choose_best_drop",     src_paths[3])
+} else {
+  message("→ Installed package mode (shared library already loaded)")
+
+}
+
+# ---- dev mode: source helper functions relative to this file ----------
+is_dev_mode <- file.exists("../../DESCRIPTION") && dir.exists("../../R")
+
+if (is_dev_mode) {
+  message("→ Dev mode: sourcing from ../../R/")
+  r_dir <- normalizePath("../../R", winslash = "/", mustWork = TRUE)
+
+  source(file.path(r_dir, "run_tract_hunter.R"))
+  source(file.path(r_dir, "run_asu_original.r"))
+} else {
+  message("→ Installed package mode: functions should already be available")
+}
+
 
 ## ---- tigris cache ----------------------------------------------------
 ## put cached TIGER/Line ZIPs in a per-user cache folder that is always
@@ -34,14 +70,6 @@ options(tigris_cache_dir = cache_dir)
 # tell tigris to look there first before re‑downloading
 options(tigris_use_cache = TRUE)
 
-# ---- resolve paths from the project root ----------------------------
-# 'here()' always points at the directory that contains ASUbuildR.Rproj
-# no matter where this .Rmd lives.
-if (!requireNamespace("here", quietly = TRUE))
-  install.packages("here")
-
-source(here::here("R", "run_asu_original.r"))   # local = FALSE by default
-source(here::here("R", "run_tract_hunter.R"))
 
 # cache every tigris download automatically
 options(
