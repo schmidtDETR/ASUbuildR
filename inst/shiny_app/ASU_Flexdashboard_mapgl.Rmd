@@ -1001,23 +1001,28 @@ filtered_tracts_memo <- shiny::reactive({
   
   potential_highlights <- full_data() |>
     dplyr::filter(GEOID %in% selected_tracts(),
-           tract_pop_cur > 0)
+           tract_pop_cur > 0, tract_ASU_clf > 0)
+
   
-  if (input$unemployment_filter == "low") {
-    threshold <- stats::quantile(potential_highlights$tract_ASU_urate, input$percentile/100)
-    
-    filtered_selected <- potential_highlights |>
-      dplyr::filter(tract_ASU_urate <= threshold,
-             tract_ASU_urate > 0) |>
-      dplyr::pull(GEOID)
-  } else {
-    threshold <- stats::quantile(potential_highlights$tract_ASU_urate, 1-(input$percentile/100))
-    
-    filtered_selected <- potential_highlights |>
-      dplyr::filter(tract_ASU_urate >= threshold,
-             tract_ASU_urate > 0) |>
-      dplyr::pull(GEOID)
-  }
+if (input$unemployment_filter == "low") {
+  
+  # Remove tracts where tract_ASU_clf is 0
+
+  # Calculate dynamic threshold from eligible tracts
+  threshold <- stats::quantile(potential_highlights$tract_ASU_urate, input$percentile / 100)
+  
+  filtered_selected <- potential_highlights |>
+    dplyr::filter(tract_ASU_urate <= threshold) |>
+    dplyr::pull(GEOID)
+  
+} else {
+
+  threshold <- stats::quantile(potential_highlights$tract_ASU_urate, 1 - (input$percentile / 100))
+  
+  filtered_selected <- potential_highlights |>
+    dplyr::filter(tract_ASU_urate >= threshold) |>
+    dplyr::pull(GEOID)
+}
   
   return(filtered_selected)
 }) |> 
