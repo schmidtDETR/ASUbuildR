@@ -596,7 +596,24 @@ shiny::observeEvent(input$th_pass, {
         source             = map_data,
         fill_color         = pal$fill,
         fill_opacity       = 0.5,
-        fill_outline_color = "black"
+        fill_outline_color = "black",
+        tooltip = mapgl::concat(
+          "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
+          "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"),  "<br>",
+          "<strong>UR: </strong>",
+          mapgl::number_format(mapgl::get_column("tract_ASU_urate"),
+                        style = "decimal", maximum_fraction_digits = 2),
+          "%<br>",
+          "<strong>Unemp: </strong>",
+          mapgl::number_format(mapgl::get_column("tract_ASU_unemp"),
+                        style = "decimal", maximum_fraction_digits = 0), "<br>"
+        )
+      ) |>
+      mapgl::add_legend(
+        "ASU Number",
+        values = pal$legend_vals,
+        colors = pal$legend_cols,
+        type   = "categorical"
       )
   })
 })
@@ -680,7 +697,24 @@ shiny::observeEvent(input$th_combine, {
         source             = map_data,
         fill_color         = pal$fill,
         fill_opacity       = 0.5,
-        fill_outline_color = "black"
+        fill_outline_color = "black",
+        tooltip = mapgl::concat(
+          "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
+          "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"),  "<br>",
+          "<strong>UR: </strong>",
+          mapgl::number_format(mapgl::get_column("tract_ASU_urate"),
+                        style = "decimal", maximum_fraction_digits = 2),
+          "%<br>",
+          "<strong>Unemp: </strong>",
+          mapgl::number_format(mapgl::get_column("tract_ASU_unemp"),
+                        style = "decimal", maximum_fraction_digits = 0), "<br>"
+        )
+      ) |>
+      mapgl::add_legend(
+        "ASU Number",
+        values = pal$legend_vals,
+        colors = pal$legend_cols,
+        type   = "categorical"
       )
   })
 })
