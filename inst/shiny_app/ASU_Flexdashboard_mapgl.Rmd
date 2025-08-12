@@ -807,15 +807,12 @@ shiny::renderUI(shiny::HTML("<hr>"))
 shiny::actionButton("reset", "Reset to Initial Data")
 ```
 
-## Output {data-width="850"}
+## Interactive Map {data-width="600"}
 
 ```{r}
-mapgl::maplibreOutput("edit_map", height = "90vh")
-
-shiny::tableOutput("selection_data")
-
-shiny::tableOutput("selection_summary")
-
+# The map
+  mapgl::maplibreOutput("edit_map", height = "100vh")
+  
 output$edit_map <- mapgl::renderMaplibre({
   
   shiny::req(full_data())
@@ -931,6 +928,9 @@ shiny::observeEvent(clear_selection_debounced(), {
   # Use set_filter to hide selection
   mapgl::maplibre_proxy("edit_map") |>
     mapgl::set_filter("selected", list("==", c("get", "GEOID"), "__NONE__"))
+  
+  # Reset ASU dropdown to "None"
+    shiny::updateSelectInput(session, "select_asunum", selected = "None")
 })
 
 # OPTIMIZATION 3: Efficient ASU selection with set_filter
@@ -979,6 +979,10 @@ shiny::observeEvent(input$select_geoid, {
     dplyr::filter(GEOID == input$manual_geoid)
   
   if (nrow(selected_tract) > 0) {
+    # Reset ASU dropdown to "None" FIRST
+    shiny::updateSelectInput(session, "select_asunum", selected = "None")
+    
+    # THEN update the map and selection
     mapgl::maplibre_proxy("edit_map") |>
       mapgl::set_filter("selected", list("==", c("get", "GEOID"), as.character(input$manual_geoid))) |>
       mapgl::fit_bounds(selected_tract, animate = TRUE)
@@ -1058,38 +1062,6 @@ shiny::observeEvent(filter_debounced(), {
 shiny::observeEvent(list(input$clear_percentile, input$select_asunum), {
   mapgl::maplibre_proxy("edit_map") |>
     mapgl::set_filter("highlighted", list("==", c("get", "GEOID"), "__NONE__"))
-})
-
-# OPTIMIZATION 6: Cached preview calculation
-preview_data <- shiny::reactive({
-  shiny::req(selected_tracts())
-
-  replacement_data <- full_data() |>
-    sf::st_drop_geometry() |>
-    subset(GEOID %in% selected_tracts())
-
-  summary_data <- replacement_data |>
-    dplyr::ungroup() |>
-    dplyr::summarize(
-      tracts = dplyr::n(),
-      population = sum(tract_pop_cur, na.rm = TRUE),
-      lf = sum(tract_ASU_clf, na.rm = TRUE),
-      unemp = sum(tract_ASU_unemp, na.rm = TRUE),
-      ur = round(unemp/lf*100, 5)
-    )
-  
-  list(data = replacement_data, summary = summary_data)
-}) |>
-  shiny::bindCache(selected_tracts(), full_data())
-
-shiny::observeEvent(input$preview, {
-  preview_result <- preview_data()
-  edit_table(preview_result$data)
-  edit_summary(preview_result$summary)
-
-  output$selection_summary <- shiny::renderTable({
-    edit_summary()
-  })
 })
 
 # Helper function to calculate color scheme
@@ -1276,6 +1248,156 @@ shiny::observe({
   if (exists("gc")) gc()
 }) |> 
 shiny::bindEvent(input$update, ignoreInit = TRUE)
+
+# Trigger map resize when panels are resized
+shiny::observeEvent(input$map_resize, {
+  # Force map to resize/redraw
+  mapgl::maplibre_proxy("edit_map") |>
+    mapgl::maplibre_resize()
+}, ignoreInit = TRUE)
+```
+
+## Selection Summary {data-width="250"}
+
+```{r}
+# Your existing preview_data reactive (keep this as-is)
+preview_data <- shiny::reactive({
+  shiny::req(selected_tracts())
+  replacement_data <- full_data() |>
+    sf::st_drop_geometry() |>
+    subset(GEOID %in% selected_tracts())
+  summary_data <- replacement_data |>
+    dplyr::ungroup() |>
+    dplyr::summarize(
+      tracts = dplyr::n(),
+      population = sum(tract_pop_cur, na.rm = TRUE),
+      lf = sum(tract_ASU_clf, na.rm = TRUE),
+      unemp = sum(tract_ASU_unemp, na.rm = TRUE),
+      ur = round(unemp/lf*100, 5)
+    )
+  
+  list(data = replacement_data, summary = summary_data)
+}) |>
+  shiny::bindCache(selected_tracts(), full_data())
+
+# Update the preview button observer to handle existing logic
+shiny::observeEvent(input$preview, {
+  if (length(selected_tracts()) > 0) {
+    # Your existing preview logic
+    preview_result <- preview_data()
+    edit_table(preview_result$data)
+    edit_summary(preview_result$summary)
+    output$selection_summary <- shiny::renderTable({
+      edit_summary()
+    })
+  } else {
+    shiny::showNotification("No tracts selected", type = "warning")
+  }
+})
+
+# Conditional display based on selection
+shiny::conditionalPanel(
+  condition = "output.has_selection == true",
+  style = "height: calc(100vh - 20px); display: flex; flex-direction: column;",
+  
+  shiny::h3(" Summary of Selected Tracts"),
+  shiny::hr(),
+  
+  # Summary statistics
+  shiny::div(
+    style = "background-color: #f8f9fa; padding: 15px; border-radius: 5px; margin-bottom: 15px; flex-shrink: 0;",
+    shiny::textOutput("summary_count"),
+    shiny::br(),
+    shiny::textOutput("summary_total_pop"),
+    shiny::textOutput("summary_total_labor_force"),
+    shiny::textOutput("summary_avg_unemployment_rate"),
+    shiny::textOutput("summary_total_unemployment")
+  ),
+  
+  shiny::hr(style = "flex-shrink: 0;"),
+  
+  # Detailed table
+  shiny::h4("Tract Details", style = "flex-shrink: 0;"),
+  shiny::div(
+    style = "flex: 1; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 5px; min-height: 200px;",
+    shiny::tableOutput("summary_table")
+  )
+)
+
+# No selection message
+shiny::conditionalPanel(
+  condition = "output.has_selection == false",
+  shiny::div(
+    style = "text-align: center; color: #6c757d; font-style: italic; padding: 50px 20px;",
+    shiny::h4("No tracts currently selected"),
+    shiny::p("Select tracts on the map or use the controls to view summary data here.")
+  )
+)
+
+# Server logic for conditional display
+output$has_selection <- shiny::reactive({
+  length(selected_tracts()) > 0
+})
+shiny::outputOptions(output, "has_selection", suspendWhenHidden = FALSE)
+
+# Summary statistics outputs using your existing preview_data reactive
+output$summary_count <- shiny::renderText({
+  shiny::req(selected_tracts())
+  preview_result <- preview_data()
+  paste("Number of selected tracts:", preview_result$summary$tracts)
+})
+
+output$summary_total_pop <- shiny::renderText({
+  shiny::req(selected_tracts())
+  preview_result <- preview_data()
+  paste("Total population:", format(preview_result$summary$population, big.mark = ","))
+})
+
+output$summary_total_labor_force <- shiny::renderText({
+  shiny::req(selected_tracts())
+  preview_result <- preview_data()
+  paste("Total labor force:", format(preview_result$summary$lf, big.mark = ","))
+})
+
+output$summary_avg_unemployment_rate <- shiny::renderText({
+  shiny::req(selected_tracts())
+  preview_result <- preview_data()
+  paste("Average unemployment rate:", preview_result$summary$ur, "%")
+})
+
+output$summary_total_unemployment <- shiny::renderText({
+  shiny::req(selected_tracts())
+  preview_result <- preview_data()
+  paste("Total unemployment:", format(preview_result$summary$unemp, big.mark = ","))
+})
+
+# Detailed table output using your existing preview_data reactive
+output$summary_table <- shiny::renderTable({
+  shiny::req(selected_tracts())
+  
+  preview_result <- preview_data()
+  selected_data <- preview_result$data |>
+    dplyr::select(GEOID, asunum, tract_pop_cur, tract_ASU_clf, 
+           tract_ASU_urate, tract_ASU_unemp) |>
+    dplyr::arrange(GEOID)
+  
+  # Format the data for display
+  selected_data |>
+    dplyr::mutate(
+      tract_pop_cur = format(tract_pop_cur, big.mark = ","),
+      tract_ASU_clf = format(tract_ASU_clf, big.mark = ","),
+      tract_ASU_urate = round(tract_ASU_urate, 2),
+      tract_ASU_unemp = format(tract_ASU_unemp, big.mark = ",")
+    ) |>
+    dplyr::rename(
+      "GEOID" = GEOID,
+      "ASU" = asunum,
+      "Population" = tract_pop_cur,
+      "Labor Force" = tract_ASU_clf,
+      "Unemp. Rate %" = tract_ASU_urate,
+      "Unemp." = tract_ASU_unemp
+    )
+}, striped = TRUE, hover = TRUE, spacing = "xs")
 ```
 
 # Save and Load Data
