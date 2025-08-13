@@ -860,7 +860,7 @@ output$edit_map <- mapgl::renderMaplibre({
       id = "selected",
       source = full_data(),
       line_color = "red",
-      line_width = 3,
+      line_width = 2,
       line_opacity = 1,
       filter = list("==", c("get", "GEOID"), "__NONE__")  # Initially hide all features
     ) |>
@@ -1434,35 +1434,6 @@ shiny::observeEvent(input$save_dir_path, {
   }
 })
 
-# # Alternative browse button (opens file dialog for directory selection)
-# shiny::observeEvent(input$browse_dir, {
-#   # This will work in RStudio or desktop R
-#   if (interactive()) {
-#     selected_dir <- tryCatch({
-#       utils::choose.dir(default = save_directory(), caption = "Select Save Directory")
-#     }, error = function(e) {
-#       # For non-Windows systems, use tcltk
-#       tryCatch({
-#         tcltk::tk_choose.dir(default = save_directory(), caption = "Select Save Directory")
-#       }, error = function(e2) {
-#         NULL
-#       })
-#     })
-#     
-#     if (!is.null(selected_dir) && selected_dir != "") {
-#       shiny::updateTextInput(session, "save_dir_path", value = selected_dir)
-#       save_directory(selected_dir)
-#     }
-#   } else {
-#     # In web-deployed apps, show instruction
-#     shiny::showModal(shiny::modalDialog(
-#       title = "Directory Selection",
-#       "In web-deployed apps, please manually enter the directory path in the text field above.",
-#       easyClose = TRUE
-#     ))
-#   }
-# })
-
 # Display current save directory
 output$current_save_dir <- shiny::renderText({
   paste("Current save directory: ", save_directory())
@@ -1508,101 +1479,6 @@ shiny::observeEvent(input$save_data, {
   })
 })
 
-# # Observer for loading the data
-# # Observer for loading the data
-# shiny::observeEvent(input$load_data, {
-#   shiny::req(input$load_data)
-#   
-#   # Read the RDS file into a data frame
-#   loaded_data <- tryCatch({
-#     readRDS(input$load_data$datapath)
-#   }, error = function(e) {
-#     shiny::showModal(shiny::modalDialog(
-#       title = "Error Loading Data",
-#       "Failed to load the data. Please check the file format.",
-#       easyClose = TRUE
-#     ))
-#     return(NULL)
-#   })
-#   
-#   # If loaded_data is NULL (failed to load), exit the observer
-#   shiny::req(!is.null(loaded_data))
-#   
-#   # Ensure the loaded data is an sf object
-#   if (!inherits(loaded_data, "sf")) {
-#     shiny::showModal(shiny::modalDialog(
-#       title = "Error Loading Data",
-#       "The loaded data is not a valid sf object.",
-#       easyClose = TRUE
-#     ))
-#     return(NULL)
-#   }
-#   
-#   # Update full_data with the loaded data
-#   full_data(loaded_data)
-#   
-#   # Provide feedback to the user
-#   shiny::showModal(shiny::modalDialog(
-#     title = "Data Loaded",
-#     "Your data has been successfully loaded.",
-#     easyClose = TRUE
-#   ))
-#   
-#   # Calculate new color scheme using helper function
-#   color_scheme <- calculate_color_scheme(loaded_data)
-#   
-#   # OPTIMIZATION: For data loading, we need to recreate layers but preserve zoom
-#   # Store current map state if possible
-#   current_zoom <- NULL  # Would need to get from map state if available
-#   current_center <- NULL
-#   
-#   # Update the map layers (necessary when loading completely new data)
-#   mapgl::maplibre_proxy("edit_map") |>
-#     mapgl::clear_layer("basemap") |>
-#     mapgl::clear_layer("highlighted") |>
-#     mapgl::clear_layer("selected") |>
-#     mapgl::add_fill_layer(
-#       id = "basemap",
-#       source = loaded_data,
-#       fill_color = mapgl::step_expr(
-#         column = "asunum",
-#         base = "#E0E0E0",
-#         stops = color_scheme$colors,
-#         values = color_scheme$breaks,
-#         na_color = "#E0E0E0"
-#       ),
-#       fill_opacity = 0.5,
-#       fill_outline_color = "black",
-#       tooltip = mapgl::concat(
-#         "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
-#         "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"), "<br>",
-#         "<strong>Tract Population: </strong>", mapgl::number_format(mapgl::get_column("tract_pop_cur"), style = "decimal", maximum_fraction_digits = 0), "<br>",
-#         "<strong>Tract Labor Force: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_clf"), style = "decimal", maximum_fraction_digits = 0), "<br>",
-#         "<strong>Tract Unemployment Rate: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2), "%<br>",
-#         "<strong>Tract Unemployment: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0), "<br>"
-#       )
-#     ) |>
-#     mapgl::add_line_layer(
-#       id = "selected",
-#       source = loaded_data,
-#       line_color = "red",
-#       line_width = 3,
-#       line_opacity = 1,
-#       filter = list("==", c("get", "GEOID"), "__NONE__")
-#     ) |>
-#     mapgl::add_fill_layer(
-#       id = "highlighted",
-#       source = loaded_data,
-#       fill_color = "black",
-#       fill_opacity = 0.8,
-#       filter = list("==", c("get", "GEOID"), "__NONE__")
-#     ) |>
-#     mapgl::fit_bounds(loaded_data, animate = TRUE)
-#   
-#   # Clear any existing selections/highlights
-#   selected_tracts(NULL)
-#   highlighted_tracts(NULL)
-# })
 
 ```
 
@@ -1961,7 +1837,7 @@ data on Save and Load Data.
 
 This tab is where all edits to the ASU selections are made. A number of
 tools are provided to aid in the optimization of the ASUs. In general,
-*selected* tracts will be outlined in red on the map.
+*selected* tracts will be outlined in red on the map.  A summary of selected tracts as well as aggregate statistics will be displayed on the right of the map.
 
 -   Hover over the map. Hovering the mouse over the map will display
     information about that tract useful to the selection process.
