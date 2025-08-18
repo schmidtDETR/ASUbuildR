@@ -1038,9 +1038,13 @@ filter_debounced <- shiny::debounce(shiny::reactive({
   list(input$filter_percentile, input$unemployment_filter)
 }), 250)  # 250ms delay
 
+# In your existing filter_debounced observer, add this line:
 shiny::observeEvent(filter_debounced(), {
   filtered_selected <- filtered_tracts_memo()
   highlighted_tracts(filtered_selected)
+  
+  # Clear DT table selections when using percentile filtering
+  DT::dataTableProxy("summary_table") |> DT::clearSearch()
   
   # Use set_filter instead of clear + add
   if (length(filtered_selected) > 0 && !any(is.na(filtered_selected))) {
@@ -1319,8 +1323,8 @@ shiny::conditionalPanel(
   # Detailed table
   shiny::h4("Tract Details", style = "flex-shrink: 0;"),
   shiny::div(
-    style = "flex: 1; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 5px; min-height: 200px;",
-    shiny::tableOutput("summary_table")
+    style = "flex: 1; overflow: hidden; border: 1px solid #dee2e6; border-radius: 5px; min-height: 200px;",
+    DT::dataTableOutput("summary_table", width = "100%", height = "100%")
   )
 )
 
@@ -1372,7 +1376,8 @@ output$summary_total_unemployment <- shiny::renderText({
 })
 
 # Detailed table output using your existing preview_data reactive
-output$summary_table <- shiny::renderTable({
+# Server side - replace renderTable with renderDataTable
+output$summary_table <- DT::renderDataTable({
   shiny::req(selected_tracts())
   
   preview_result <- preview_data()
@@ -1397,7 +1402,50 @@ output$summary_table <- shiny::renderTable({
       "Unemp. Rate %" = tract_ASU_urate,
       "Unemp." = tract_ASU_unemp
     )
-}, striped = TRUE, hover = TRUE, spacing = "xs")
+}, options = list(
+  pageLength = -1,
+  dom = 't',
+  ordering = TRUE,
+  class = 'stripe hover',
+  columnDefs = list(list(className = 'dt-center', targets = '_all')),
+  selection = list(mode = 'multiple', target = 'row')  # Enable row selection
+))
+
+# Observer to handle DT table row selections for map highlighting
+shiny::observeEvent(input$summary_table_rows_selected, {
+  shiny::req(selected_tracts())
+  
+  if (is.null(input$summary_table_rows_selected) || length(input$summary_table_rows_selected) == 0) {
+    # No rows selected in table - clear highlights
+    mapgl::maplibre_proxy("edit_map") |>
+      mapgl::set_filter("highlighted", list("==", c("get", "GEOID"), "__NONE__"))
+    return()
+  }
+  
+  # Get the GEOIDs corresponding to the selected rows in the table
+  preview_result <- preview_data()
+  table_data <- preview_result$data |>
+    dplyr::select(GEOID, asunum, tract_pop_cur, tract_ASU_clf, 
+           tract_ASU_urate, tract_ASU_unemp) |>
+    dplyr::arrange(GEOID)
+  
+  # Get GEOIDs for selected rows
+  selected_row_indices <- input$summary_table_rows_selected
+  highlighted_geoids <- table_data$GEOID[selected_row_indices]
+  
+  # Update map highlighting using the existing highlighted layer
+  if (length(highlighted_geoids) > 0 && !any(is.na(highlighted_geoids))) {
+    if (length(highlighted_geoids) == 1) {
+      filter_expr <- list("==", c("get", "GEOID"), as.character(highlighted_geoids[1]))
+    } else {
+      filter_expr <- list("in", c("get", "GEOID"), list("literal", as.character(highlighted_geoids)))
+    }
+    
+    mapgl::maplibre_proxy("edit_map") |>
+      mapgl::set_filter("highlighted", filter_expr)
+  }
+})
+
 ```
 
 # Save and Load Data
