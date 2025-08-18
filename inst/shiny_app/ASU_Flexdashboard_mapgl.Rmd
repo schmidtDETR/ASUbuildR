@@ -333,7 +333,7 @@ output$algo_blurb <- shiny::renderUI({
        </ul>
        <p>You can stop after any step to inspect the map, or run the buttons
           in sequence for the full, automatic workflow. We suggest iteratively running the Run Hunter and Combine Groups steps until Total Unemployment in ASUs no longer increases.  Each step updates the
-          colour map and the unemployment totals shown on the right.</p>"
+          color map to the right and the unemployment totals shown below.</p>"
     )
   }
 })
@@ -366,8 +366,6 @@ shiny::observeEvent(input$process, {
   ## 1 · Wrap the whole long job in withProgress -------------------------
   shiny::withProgress(message = "Running ASU initialisation…", value = 0, {
     
-    # Add force year = 2021 option for New England  # <-- you can remove this comment now
-
     ## 1a · Build tracts + neighbours (can take ~10–60 s the first time)
     shiny::incProgress(0.10, detail = "Downloading Census shapefiles…")
     
@@ -1087,43 +1085,81 @@ calculate_color_scheme <- function(data) {
   return(list(breaks = asu_breaks, colors = brewer_pal))
 }
 
+
+# OPTIMIZATION 1: Pre-calculate and cache color schemes
+color_schemes_cache <- shiny::reactiveValues()
+
+calculate_color_scheme_cached <- function(max_asu) {
+  cache_key <- as.character(max_asu)
+  
+  if (!exists(cache_key, envir = color_schemes_cache)) {
+    number_categories <- min(c(max_asu, 8))
+    
+    if (number_categories <= 1) {
+      scheme <- list(breaks = 1, colors = "#7FC97F")
+    } else {
+      asu_breaks <- seq(from = 1, to = max_asu, length.out = number_categories)
+      actual_categories <- max(3, number_categories)
+      full_brewer_pal <- RColorBrewer::brewer.pal(actual_categories, "Accent")
+      brewer_pal <- full_brewer_pal[1:number_categories]
+      scheme <- list(breaks = asu_breaks, colors = brewer_pal)
+    }
+    
+    color_schemes_cache[[cache_key]] <- scheme
+  }
+  
+  return(color_schemes_cache[[cache_key]])
+}
+
 # Update with dynamic color changes
 shiny::observeEvent(input$update, {
   shiny::req(selected_tracts(), full_data())
   
-  old_data <- full_data()
+  # Store current data and new ASU value
+  current_data <- full_data()
   new_asu <- as.numeric(input$new_asu)
+  selected_ids <- selected_tracts()
   
-  # Batch update for better performance
-  updated_data <- old_data |>
-    dplyr::mutate(
-      asunum = dplyr::case_when(
-        GEOID %in% selected_tracts() ~ new_asu,
-        TRUE ~ asunum
+  # CRITICAL: Isolate this heavy computation from reactive context
+  shiny::isolate({
+    # Batch update - more efficient than row-by-row
+    updated_data <- current_data |>
+      dplyr::mutate(
+        asunum = ifelse(GEOID %in% selected_ids, new_asu, asunum)
       )
+    
+    # Update data ONCE
+    full_data(updated_data)
+  })
+  
+  # Only update colors if the maximum ASU changed
+  old_max <- max(current_data$asunum, na.rm = TRUE)
+  new_max <- max(updated_data$asunum, na.rm = TRUE)
+  
+  if (old_max != new_max) {
+    # Use cached color scheme calculation
+    color_scheme <- calculate_color_scheme_cached(new_max)
+    
+    new_color_expr <- mapgl::step_expr(
+      column = "asunum",
+      base = "#E0E0E0",
+      stops = color_scheme$colors,
+      values = color_scheme$breaks,
+      na_color = "#E0E0E0"
     )
+    
+    # Update colors without full re-render
+    mapgl::maplibre_proxy("edit_map") |>
+      mapgl::set_paint_property("basemap", "fill-color", new_color_expr)
+  } else {
+    # If max ASU didn't change, just trigger a paint refresh
+    # This is much faster than updating the entire color expression
+    mapgl::maplibre_proxy("edit_map") |>
+      mapgl::set_paint_property("basemap", "fill-opacity", 0.5)
+  }
   
-  full_data(updated_data)
-  
-  # Calculate new color scheme
-  color_scheme <- calculate_color_scheme(updated_data)
-  
-  # Update the fill color dynamically using set_paint_property
-  new_color_expr <- mapgl::step_expr(
-    column = "asunum",
-    base = "#E0E0E0",  # Grey for asunum == 0
-    stops = color_scheme$colors,
-    values = color_scheme$breaks,
-    na_color = "#E0E0E0"
-  )
-  
-  # Update the basemap colors without redrawing
-  mapgl::maplibre_proxy("edit_map") |>
-    mapgl::set_paint_property("basemap", "fill-color", new_color_expr)
-  
+  # Clear selection efficiently
   selected_tracts(NULL)
-  
-  # Clear selection with set_filter
   mapgl::maplibre_proxy("edit_map") |>
     mapgl::set_filter("selected", list("==", c("get", "GEOID"), "__NONE__"))
 })
@@ -1848,7 +1884,7 @@ tab will be described in detail below.
 **Data Initialization**
 
 To begin the ASU building process, click the `Browse` button on the left
-side of the page. Once a file has been selected, an overview of the file
+side of the page and select a XLSX file that has the BLS ASU data input structure. Once a file has been selected, an overview of the file
 will appear on the right to confirm the file has successfully loaded.
 You may review the contents of the columns to ensure that data appears
 to be loaded correctly. This script assumes the columns are maintained
@@ -1859,7 +1895,7 @@ When review is complete, continue to the next tab - Load Initial ASU.
 
 **Load Initial ASU**
 
-There are two options available to the user at this stage.  The **Tract Hunter** is a process that will iteratively build ASU regions by seeding an initial map, then comparing potential targeted tracts to add or remove, with the goal of achieving the maximum level of unemployment within ASUs. Tract Hunter includes logic to only allow ASUs that meet the minimum 10,000 population threshold.
+There are two options available to the user at this stage.  The **Tract Hunter** is a process that will iteratively build ASU regions by seeding an initial map, then comparing potential targeted tracts to add or remove, with the goal of achieving the maximum level of unemployment within all ASUs. Tract Hunter includes logic to only allow ASUs that meet the minimum 10,000 population threshold.
 
 The original **Simple Snake** methodology starts from tracts with an unemployment rate of at least 6.45%, then sequentially adding the adjacent tract with the highest unemployment rate until the combined region is less than 6.45%. Because this starts from single tracts, it does not consider whether the combined population qualifies as an ASU.
 
@@ -1885,7 +1921,7 @@ data on Save and Load Data.
 
 This tab is where all edits to the ASU selections are made. A number of
 tools are provided to aid in the optimization of the ASUs. In general,
-*selected* tracts will be outlined in red on the map.  A summary of selected tracts as well as aggregate statistics will be displayed on the right of the map.
+*selected* tracts will be outlined in red on the map.  A summary of selected tracts as well as aggregate statistics will be displayed on the right of the map. Clicking on a row of that table will _highlight_ that tract in black.
 
 -   Hover over the map. Hovering the mouse over the map will display
     information about that tract useful to the selection process.
@@ -1905,18 +1941,13 @@ tools are provided to aid in the optimization of the ASUs. In general,
     tracts to the same ASU. Further, changing the ASU number to 0 is how
     selected tracts are removed from any ASUs.
 
--   Show Data for Selected Tracts: This will generate a table below the
-    map which has the aggregated ASU data for all selected tracts. This
-    may help with determining whether it is efficient to add a tract or
-    group of tracts to an existing ASU.
-
--   Percentile Threshold: This allows you to examine the tracts in your current selection with either high or low unemployment rates.  This is useful for identifying tracts outside of current ASUs that you may wish to include in an ASU or identifying tracts inside of current ASUs that you may with to drop.  Please choose whether you want to highlight Low or High unemployment tracts and enter a number in the Percentile Threshold box to highlight the top or bottom X% of tracts (X is the number you enter).  For example, if you have 200 tracts selected and choose 5 as your threshold and High unemployment, clicking the **Highlight Tracts** button will turn the color of the 10 tracts with the highest unemployment rates black.  Selecting **Clear Highlights** will clear all current highlighting.
+-   Percentile Threshold: This allows you to examine the tracts in your current selection with either high or low unemployment rates.  This is useful for identifying tracts outside of current ASUs that you may wish to include in an ASU or identifying tracts inside of current ASUs that you may with to drop.  Please choose whether you want to highlight Low or High unemployment tracts and enter a number in the Percentile Threshold box to highlight the top or bottom X% of tracts (X is the number you enter).  For example, if you have 200 tracts selected and choose 5 as your threshold and High unemployment, clicking the **Highlight Tracts** button will turn the color of the 10 tracts with the highest unemployment rates black.  Selecting **Clear Highlights** will clear all current highlighting (including highlights from clicking individual tracts in the selection summary).
 
 -   Enter a GEOID / Select a Single Tract: This functionality is most
     useful when using the CSV output that this app generates on the
     **ASU Review and Finalization** tab. Given the 11-character GEOID,
     you can input that to highlight a single tract to examine where it
-    fits. This can be helpful for fine-tuning - reviewing the
+    fits. This can be helpful for fine-tuning - for example, reviewing the
     highest-unemployment tracts not included in an ASU to ensure they
     cannot be connected in to improve the ASU.
 
