@@ -758,6 +758,12 @@ These tools allow you to select, inspect, and change ASU designations for indivi
 shiny::htmlOutput("total_unemp2")
 shiny::renderUI(shiny::HTML("<hr>"))
 
+# List available ASUs
+asu_choices <- shiny::reactive({
+  shiny::req(full_data())          # only run after full_data exists
+  full_data() |> dplyr::pull(asunum) |> unique() |> sort()
+})
+
 # Select an ASU
 asu_selection_ui <- shiny::reactive({
   shiny::selectInput("select_asunum", "Select ASU Number:",
@@ -776,12 +782,9 @@ shiny::renderUI(shiny::HTML("<hr>"))
 shiny::actionButton("clear", "Clear Selected Tracts")
 shiny::renderUI(shiny::HTML("<hr>"))
 
-# Show Data for Selection
-shiny::actionButton("preview", "Show Data for Selected Tracts")
-asu_choices <- shiny::reactive({
-  shiny::req(full_data())                     # only run after full_data exists
-  full_data() |> dplyr::pull(asunum) |> unique() |> sort()
-})
+# Show Data for Selection - remove.  Preview panel now permanent
+# shiny::actionButton("preview", "Show Data for Selected Tracts")
+
 
 shiny::renderUI(shiny::HTML("<hr>"))
 
@@ -1172,8 +1175,8 @@ shiny::observeEvent(input$reset, {
   reset_data <- full_data_reset()
   full_data(reset_data)
   
-  # Trigger map re-render for reset
-  initial_map_data(reset_data)
+  # # Trigger map re-render for reset
+  # initial_map_data(reset_data)
   
   selected_tracts(NULL)
   
@@ -1217,7 +1220,7 @@ shiny::observeEvent(input$load_data, {
   full_data(loaded_data)
   
   # Trigger map re-render with new data
-  initial_map_data(loaded_data)
+  #initial_map_data(loaded_data)
   
   # Provide feedback to the user
   shiny::showModal(shiny::modalDialog(
@@ -1320,20 +1323,21 @@ preview_data <- shiny::reactive({
 }) |>
   shiny::bindCache(selected_tracts(), full_data())
 
-# Update the preview button observer to handle existing logic
-shiny::observeEvent(input$preview, {
-  if (length(selected_tracts()) > 0) {
-    # Your existing preview logic
-    preview_result <- preview_data()
-    edit_table(preview_result$data)
-    edit_summary(preview_result$summary)
-    output$selection_summary <- shiny::renderTable({
-      edit_summary()
-    })
-  } else {
-    shiny::showNotification("No tracts selected", type = "warning")
-  }
-})
+# # Update the preview button observer to handle existing logic
+# Remove - removing button
+# shiny::observeEvent(input$preview, {
+#   if (length(selected_tracts()) > 0) {
+#     # Your existing preview logic
+#     preview_result <- preview_data()
+#     edit_table(preview_result$data)
+#     edit_summary(preview_result$summary)
+#     output$selection_summary <- shiny::renderTable({
+#       edit_summary()
+#     })
+#   } else {
+#     shiny::showNotification("No tracts selected", type = "warning")
+#   }
+# })
 
 # Conditional display based on selection
 shiny::conditionalPanel(
@@ -1587,6 +1591,8 @@ display as 6.45%, but will fail the validation.
 
 Note, you *may* go back and forth between the selection and review
 screens.
+
+The output directory is displayed below.  To change the output directory, please change the directory through the input box on the *Save and Load Data* tab.
 
 When ready to create an output file, the *Generate LSS .txt File* button
 will create a formatted batch file for upload to LSS.
