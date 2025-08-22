@@ -166,6 +166,8 @@ shiny::fileInput("file", "Choose Excel File", accept = c(".xls", ".xlsx"))
 shiny::textOutput("selected_state")
 
 shiny::textOutput("selected_year")
+
+shiny::textOutput("tigris_year")
 ```
 
 ## Output {data-width="850"}
@@ -222,8 +224,11 @@ shiny::observeEvent(input$file, {
   })
   
   output$selected_year <- shiny::renderText({
-    paste0("Tract Population Year is: ", tract_year(),
-           "<br>Default TIGER File Year is: ", tigris_year())
+    paste0("Tract Population Year is: ", tract_year())
+  })
+  
+  output$tigris_year <- shiny::renderText({
+    paste0("Default TIGER File Year is: ", tigris_year())
   })
 })
 ```
