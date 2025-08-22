@@ -83,6 +83,7 @@ options(shiny.maxRequestSize = 50 * 1024^2)  # Set to 50MB or your desired limit
 uploaded_data <- shiny::reactiveVal(NULL)
 state <- shiny::reactiveVal(NULL)
 tract_year <- shiny::reactiveVal(NULL)
+tigris_year <- shiny::reactiveVal(NULL)
 tract_data <- shiny::reactiveVal(NULL)
 asu_data <- shiny::reactiveVal(NULL)
 asu_tracts <- shiny::reactiveVal(NULL)
@@ -165,6 +166,8 @@ shiny::fileInput("file", "Choose Excel File", accept = c(".xls", ".xlsx"))
 shiny::textOutput("selected_state")
 
 shiny::textOutput("selected_year")
+
+shiny::textOutput("tigris_year")
 ```
 
 ## Output {data-width="850"}
@@ -206,6 +209,12 @@ shiny::observeEvent(input$file, {
     stringr::str_remove("tract_pop") |>
     tract_year()
   
+  tract_year() |>
+    as.integer() |>
+    (\(x) x - 1)() |>
+    as.character() |>
+    tigris_year()
+  
   output$data_preview <- shiny::renderTable({
     head(uploaded_data(),50)
   })
@@ -216,6 +225,10 @@ shiny::observeEvent(input$file, {
   
   output$selected_year <- shiny::renderText({
     paste0("Tract Population Year is: ", tract_year())
+  })
+  
+  output$tigris_year <- shiny::renderText({
+    paste0("Default TIGER File Year is: ", tigris_year())
   })
 })
 ```
@@ -350,7 +363,7 @@ shiny::observeEvent(input$process, {
   shiny::req(uploaded_data(), state(), tract_year())
 
   # Determine which year to use
-  selected_year <- tract_year()  # default to detected year
+  selected_year <- tigris_year()  # default to year before detected year
   
   # Check if this is New England and user selected 2021
   state_val <- state()
