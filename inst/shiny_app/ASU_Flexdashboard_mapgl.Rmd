@@ -1146,7 +1146,7 @@ shiny::observeEvent(input$reset, {
   full_data(reset_data)
   
   # Trigger map re-render for reset
-  initial_map_data(reset_data)
+  #initial_map_data(reset_data)
   
   selected_tracts(NULL)
   
@@ -1190,7 +1190,7 @@ shiny::observeEvent(input$load_data, {
   full_data(loaded_data)
   
   # Trigger map re-render with new data
-  initial_map_data(loaded_data)
+  #initial_map_data(loaded_data)
   
   # Provide feedback to the user
   shiny::showModal(shiny::modalDialog(
