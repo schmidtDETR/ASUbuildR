@@ -812,7 +812,7 @@ shiny::actionButton("filter_percentile", "Highlight Tracts")
 shiny::actionButton("clear_percentile", "Clear Highlights")
 shiny::renderUI(shiny::HTML("<hr>"))
 
-# Single GROID Selection
+# Single GEOID Selection
 shiny::textInput("manual_geoid", "Enter a GEOID:", placeholder = "32031990000")
 shiny::actionButton("select_geoid", "Select a Single Tract")
 shiny::renderUI(shiny::HTML("<hr>"))
