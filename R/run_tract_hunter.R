@@ -361,7 +361,7 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
       remaining_unemp   <- remaining_unemp - unemp_vec[new_drop_index]
       remaining_emp     <- remaining_emp   - emp_vec[new_drop_index]
 
-      if (sum(unemp_vec[dropped_indexes], na.rm = TRUE) > unemp_buffer) return(FALSE)
+      if (sum(unemp_vec[dropped_indexes], na.rm = TRUE) >= unemp_buffer) return(FALSE)
 
       denom <- remaining_unemp + total_new_unemp + remaining_emp + total_new_emp
       if (denom <= 0) {
