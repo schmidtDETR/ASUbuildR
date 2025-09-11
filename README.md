@@ -1,4 +1,3 @@
-
 <!-- README.md is generated from README.Rmd. Please edit that file -->
 
 # ASUbuildR
@@ -17,20 +16,16 @@ prior year.
 
 ## Installation
 
-You can install the development version of ASUbuildR from
-[GitHub](https://github.com/) with:
+**!!DO NOT TRY INSTALLING FROM MAIN BRANCH — MAIN BRANCH IS BROKEN!!**
 
-``` r
-# install.packages("remotes")
-# Install from your GitHub repo
-remotes::install_github("aisolori/ASUbuildR")
-```
 
-## Running the Application
+Please download the latest release at  
+https://github.com/aisolori/ASUbuildR/releases/download/ASUbuildR/ASUbuildR.Dashboard-0.5.21.zip
 
-ASUbuildR launches an interactive Shiny application, which you can open
-by running this function:
+- Unzip folder and run **"ASUbuildR Dashboard.exe"**
 
-``` r
-#ASUbuildR::launch_ASUbuildR()
-```
+## Common issues
+
+- This will only work on Windows computers with x64 architecture (this is the most common in modern times)  
+- I recommend unzipping into a directory in your main drive  
+- For larger states, map rendering can be a bit slow — just give it a couple minutes  
