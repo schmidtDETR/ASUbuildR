@@ -22,6 +22,7 @@ build_asu <- function(
     rel_gap = NA_real_,
     verbose = interactive()
 ) {
+  asu_use_python(required = FALSE)
   if (!reticulate::py_module_available("ortools"))
     stop("Python env missing 'ortools'. Run ASUbuildR::setup_asu_python() first.")
 

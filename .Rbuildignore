@@ -2,4 +2,12 @@
 ^\.Rproj\.user$
 ^LICENSE\.md$
 ^README\.Rmd$
+^\.github$
+^\.gitignore$
+^\.condarc$
+^rhub\.yaml$
+^inst/python/__pycache__($|/)
+\.py[cod]$
+^ASUbuildR\.Rcheck$
+^ASUbuildR_[0-9.]+\.tar\.gz$
 

@@ -8,3 +8,7 @@ inst/shinny_app/_tigris_cache/
 ASUbuildR.Rproj
 inst/Tract Hunter V3.Rmd
 *.o
+__pycache__/
+*.py[cod]
+ASUbuildR.Rcheck/
+ASUbuildR_*.tar.gz

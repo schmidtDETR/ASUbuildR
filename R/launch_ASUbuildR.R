@@ -1,10 +1,45 @@
 # Script to run ASU Flexdashboard RMD file
 # This script renders and launches the Shiny-based flexdashboard
 
-# Load required libraries
-library(rmarkdown)
-library(flexdashboard)
-library(shiny)
+asu_ensure_pandoc <- function() {
+  if (rmarkdown::pandoc_available()) return(invisible(TRUE))
+
+  if (.Platform$OS.type == "windows") {
+    local_app_data <- Sys.getenv("LOCALAPPDATA")
+    program_files <- unique(c(
+      Sys.getenv("ProgramFiles"),
+      Sys.getenv("ProgramW6432")
+    ))
+    candidates <- c(
+      file.path(local_app_data, "Programs", "RStudio", "resources", "app",
+                "bin", "quarto", "bin", "tools"),
+      file.path(local_app_data, "Programs", "RStudio", "resources", "app",
+                "resources", "pandoc"),
+      file.path(local_app_data, "Programs", "Quarto", "bin", "tools"),
+      unlist(lapply(program_files, function(path) {
+        c(
+          file.path(path, "RStudio", "resources", "app", "bin", "quarto",
+                    "bin", "tools"),
+          file.path(path, "RStudio", "resources", "app", "resources", "pandoc"),
+          file.path(path, "Quarto", "bin", "tools")
+        )
+      }), use.names = FALSE)
+    )
+
+    for (path in unique(candidates[nzchar(candidates)])) {
+      if (file.exists(file.path(path, "pandoc.exe"))) {
+        Sys.setenv(RSTUDIO_PANDOC = normalizePath(path, winslash = "/"))
+        rmarkdown::find_pandoc(cache = FALSE)
+        if (rmarkdown::pandoc_available()) return(invisible(TRUE))
+      }
+    }
+  }
+
+  stop(
+    "Pandoc 1.12.3 or later is required to launch ASUbuildR. ",
+    "Install RStudio or Quarto, or add pandoc to PATH."
+  )
+}
 
 #' Launch ASU Flexdashboard Application
 #'
@@ -36,6 +71,8 @@ launch_ASUbuildR <- function(rmd_file = NULL,
                              host = "127.0.0.1",
                              port = NULL,
                              launch.browser = TRUE) {
+
+  asu_ensure_pandoc()
 
   # If no file specified, use the package's built-in dashboard
   if (is.null(rmd_file)) {

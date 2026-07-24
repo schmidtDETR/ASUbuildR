@@ -5,27 +5,37 @@
 <!-- badges: start -->
 <!-- badges: end -->
 
-ASUbuildR provides a GUI interface to equip state to more easily
-generate Areas of Substantial Unemployment (ASU) that maximize
-unemploymnet within ASUs in a state. This package depends on receiving
-an Excel file from the U.S. Bureau of Labor Statistics which includes
-their tract-level labor force estimates reflecting the twelve months
-ending in June, with preliminary estimates for June, revised estimates
-for January-May, and benchmarked estimates for July-December in the
-prior year.
+ASUbuildR provides an interactive dashboard for constructing Areas of
+Substantial Unemployment (ASUs) from Census tract and U.S. Bureau of
+Labor Statistics data. It includes multiple tract-grouping algorithms,
+an interactive map for reviewing results, and tools for exporting
+completed ASUs.
+
+The dashboard expects the BLS Excel workbook containing tract-level
+labor force estimates for the 12 months ending in June.
 
 ## Installation
 
-**!!DO NOT TRY INSTALLING FROM MAIN BRANCH — MAIN BRANCH IS BROKEN!!**
+Install the package directly from GitHub with
+[pak](https://pak.r-lib.org/):
 
+``` r
+# install.packages("pak")
+pak::pak("aisolori/ASUbuildR")
+```
+ASUbuildR requires R 4.1 or later and Pandoc, which is included with
+RStudio and Quarto. The CP-SAT solver also uses Python 3.9 or later with
+OR-Tools, NumPy, pandas, and NetworkX. Configure those Python
+dependencies once after installing the R package:
 
-Please download the latest release at  
-https://github.com/aisolori/ASUbuildR/releases/download/ASUbuildR/ASUbuildR.Dashboard-0.5.21.zip
+``` r
+ASUbuildR::setup_asu_python()
+```
 
-- Unzip folder and run **"ASUbuildR Dashboard.exe"**
+## Running the Application
 
-## Common issues
+Launch the interactive dashboard with:
 
-- This will only work on Windows computers with x64 architecture (this is the most common in modern times)  
-- I recommend unzipping into a directory in your main drive  
-- For larger states, map rendering can be a bit slow — just give it a couple minutes  
+``` r
+ASUbuildR::launch_ASUbuildR()
+```

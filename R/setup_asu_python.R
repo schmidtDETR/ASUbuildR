@@ -25,7 +25,8 @@ setup_asu_python <- function(force = FALSE) {
   env_name <- "asu-cpsat"
 
   # Determine whether conda is available; if not, install Miniconda
-  have_conda <- tryCatch(!is.na(reticulate::conda_binary()), error = function(e) FALSE)
+  conda_bin <- tryCatch(reticulate::conda_binary(), error = function(e) "")
+  have_conda <- length(conda_bin) == 1L && !is.na(conda_bin) && nzchar(conda_bin)
   just_installed <- FALSE
   if (!have_conda) {
     message("Conda not found. Installing Miniconda...")
@@ -91,26 +92,21 @@ setup_asu_python <- function(force = FALSE) {
 #' @return Logical. TRUE if properly configured, FALSE otherwise.
 #' @export
 check_asu_python <- function() {
-  env_name <- "asu-cpsat"
-
-  envs <- reticulate::conda_list()$name
-  if (!(env_name %in% envs)) {
+  if (!asu_use_python(required = FALSE)) {
     message("Conda environment not found.")
     message("Run setup_asu_python() to set up the Python environment.")
     return(FALSE)
   }
 
-  reticulate::use_condaenv(env_name, required = TRUE)
-
   required <- c("numpy", "pandas", "networkx", "ortools")
   available <- sapply(required, reticulate::py_module_available)
 
   if (all(available)) {
-    message("✓ Python environment is properly configured")
+    message("Python environment is properly configured")
     return(TRUE)
   } else {
     missing <- required[!available]
-    message("✗ Missing packages: ", paste(missing, collapse = ", "))
+    message("Missing packages: ", paste(missing, collapse = ", "))
     message("Run setup_asu_python() to install missing packages.")
     return(FALSE)
   }

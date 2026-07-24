@@ -9,6 +9,23 @@ setup_asu_python(force = FALSE)
 \arguments{
 \item{force}{Logical. If TRUE, recreates the conda environment even if it exists.}
 }
+\value{
+Invisible NULL. Called for side effects.
+}
 \description{
-This function sets up the Python environment needed for ASUbuildR using a conda environment that relies solely on the \emph{conda-forge} channel (avoiding channels that require Terms of Service acceptance). It checks for an existing conda installation (installing Miniconda if necessary) and ensures all required packages are available.
+This function sets up the Python environment needed for ASUbuildR
+using a conda environment that relies solely on the
+\emph{conda-forge} channel (avoiding channels that require Terms of
+Service acceptance). It checks for an existing conda installation
+(installing Miniconda if necessary) and ensures all required packages
+are available.
+}
+\examples{
+\dontrun{
+# First-time setup
+setup_asu_python()
+
+# Force reinstall
+setup_asu_python(force = TRUE)
+}
 }
