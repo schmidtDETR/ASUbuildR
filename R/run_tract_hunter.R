@@ -398,8 +398,7 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
     data_merge_local <- data_merge
     tracts_not_in_asu <- data_merge_local |>
       dplyr::filter(is.na(asunum)) |>
-      dplyr::arrange(-ur)%>%
-      filter(ur>=.06455)
+      dplyr::arrange(-ur)
 
     if (nrow(tracts_not_in_asu) == 0L) {
       if (verbose) cat("\nNo more tracts to process.\n")

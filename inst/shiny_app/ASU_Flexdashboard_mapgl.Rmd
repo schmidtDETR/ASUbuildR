@@ -244,6 +244,22 @@ map_geom <- shiny::reactive({
   )
 })
 
+# Reactively tracks the GEOID set but only fires when GEOIDs actually change.
+# Because full_data() changes on every ASU edit (asunum values), map_geom()
+# is invalidated on every edit too. If output$initial_map / output$edit_map
+# depend directly on map_geom(), they are invalidated and Shiny re-sends the
+# cached HTML to the browser, which re-initialises MapLibre and wipes any
+# proxy color updates. Keying on geoid_set() instead means the map outputs
+# are only invalidated (and re-sent) when the set of tracts genuinely changes.
+geoid_set <- shiny::reactiveVal(character(0))
+shiny::observe({
+  shiny::req(full_data())
+  new_geoids <- sort(full_data()$GEOID)
+  if (!identical(geoid_set(), new_geoids)) {
+    geoid_set(new_geoids)
+  }
+})
+
 highlighted_tracts <- shiny::reactiveVal(character(0))
 
 # Load static data
@@ -277,7 +293,7 @@ excel_names <- c("record",
                  "tract_ASU_urate")
 
 #-------- Map Rendering Helpers --------------------------------
-# Helper function to calculate color scheme
+# Helper function to calculate color scheme (used for full layer rebuilds)
 calculate_color_scheme <- function(data) {
   number_asus <- max(data$asunum, na.rm = TRUE)
   number_categories <- min(c(number_asus, 8))
@@ -296,26 +312,80 @@ calculate_color_scheme <- function(data) {
   return(list(breaks = asu_breaks, colors = brewer_pal))
 }
 
+# Build a per-GEOID -> color lookup from current asunum assignments.
+# Used by update_map_efficiently() so the paint expression is keyed on GEOID
+# (a stable feature property that never changes after the initial source load)
+# rather than on asunum (which IS stale in the cached MapLibre source).
+calculate_tract_colors <- function(data) {
+  n_asu <- suppressWarnings(max(data$asunum, na.rm = TRUE))
+  n_asu <- if (is.finite(n_asu) && n_asu > 0L) as.integer(n_asu) else 1L
 
+  if (n_asu == 1L) {
+    pal <- "#7FC97F"
+  } else {
+    n_cat <- min(max(n_asu, 3L), 8L)
+    pal <- RColorBrewer::brewer.pal(n_cat, "Accent")
+  }
 
+  # pal_ext[1] = grey (asunum 0), pal_ext[2..] = palette colors for asunum 1..n
+  pal_ext <- c("#E0E0E0", rep_len(pal, n_asu))
+  idx <- as.integer(data$asunum) + 1L   # asunum 0 -> index 1, asunum 1 -> index 2, …
+  idx[is.na(idx) | idx < 1L | idx > length(pal_ext)] <- 1L
+
+  list(
+    values = as.character(data$GEOID),
+    stops  = pal_ext[idx]
+  )
+}
 
 update_map_efficiently <- function(map_id = "edit_map") {
   data <- map_geom()
   if (is.null(data) || nrow(data) == 0) return()
-  
-  # Update colors without recreating layers
-  color_scheme <- calculate_color_scheme(data)
-  
-  mapgl::maplibre_proxy(map_id) |>
-    mapgl::set_paint_property("basemap", "fill-color",
-      mapgl::step_expr(
-        column = "asunum",
-        base = "#E0E0E0",
-        stops = color_scheme$colors,
-        values = color_scheme$breaks,
-        na_color = "#E0E0E0"
+
+  cm <- calculate_tract_colors(data)
+
+  if (map_id == "edit_map") {
+    # Use set_source to update each layer's data in-place (no clear → no blink),
+    # then refresh paint and filters. MapLibre calls getSource(id).setData()
+    # atomically, so feature-property tooltips also read fresh values.
+    sel <- selected_tracts()   %||% character(0)
+    hl  <- highlighted_tracts() %||% character(0)
+
+    build_filter <- function(ids) {
+      ids <- ids[!is.na(ids)]
+      if (length(ids) == 0) return(list("==", c("get", "GEOID"), "__NONE__"))
+      if (length(ids) == 1) list("==", c("get", "GEOID"), as.character(ids))
+      else list("in", c("get", "GEOID"), list("literal", as.character(ids)))
+    }
+
+    mapgl::maplibre_proxy(map_id) |>
+      mapgl::set_source(layer_id = "basemap", source = data) |>
+      mapgl::set_paint_property(
+        "basemap", "fill-color",
+        mapgl::match_expr(
+          column  = "GEOID",
+          values  = cm$values,
+          stops   = cm$stops,
+          default = "#E0E0E0"
+        )
+      ) |>
+      mapgl::set_source(layer_id = "selected", source = data) |>
+      mapgl::set_filter("selected", build_filter(sel)) |>
+      mapgl::set_source(layer_id = "highlighted", source = data) |>
+      mapgl::set_filter("highlighted", build_filter(hl))
+  } else {
+    # For read-only maps (initial_map), a paint-property update is sufficient.
+    mapgl::maplibre_proxy(map_id) |>
+      mapgl::set_paint_property(
+        "basemap", "fill-color",
+        mapgl::match_expr(
+          column  = "GEOID",
+          values  = cm$values,
+          stops   = cm$stops,
+          default = "#E0E0E0"
+        )
       )
-    )
+  }
 }
 
 # Enhanced version that can also update the data source if needed
@@ -399,7 +469,7 @@ shiny::numericInput("tract_year_input",
                      "Census Tract Year:",
                      value = 2023,
                      min = 2010,
-                     max = 2024,
+                     max = 2025,
                      step = 1)
 shiny::helpText("Select the year of Census tract boundaries to use.
                  For New England states, 2021 is the last year with NECTA-based tracts.")
@@ -460,7 +530,14 @@ shiny::observeEvent(input$file, {
 
 # Update tigris_year reactiveVal when input changes
 shiny::observeEvent(input$tract_year_input, {
-  tigris_year(as.character(input$tract_year_input))
+  yr <- suppressWarnings(as.integer(input$tract_year_input))
+  if (is.na(yr) || yr < 2010 || yr > 2025) {
+    output$selected_tract_year <- shiny::renderText({
+      paste0("Invalid year entered (", input$tract_year_input, "); must be 2010-2025. Using previous value: ", tigris_year() %||% "not set")
+    })
+    return()
+  }
+  tigris_year(as.character(yr))
   output$selected_tract_year <- shiny::renderText({
     paste0("Census tract boundary year (user selected): ", tigris_year())
   })
@@ -1174,11 +1251,13 @@ shiny::observe({
 ```
 
 ```{r}
-# -- GLOBAL map render that reacts to map_geom() --
+# -- GLOBAL map render that reacts to geoid_set() only --
 output$initial_map <- mapgl::renderMaplibre({
-  shiny::req(map_geom())
-  map_data <- map_geom()
-  if (nrow(map_data) == 0) {
+  shiny::req(length(geoid_set()) > 0)
+  # isolate() so the render body doesn't create additional reactive dependencies
+  # that would cause re-sends on asunum-only changes.
+  map_data <- shiny::isolate(map_geom())
+  if (is.null(map_data) || nrow(map_data) == 0) {
     return(
       mapgl::maplibre(style = mapgl::carto_style("positron")) |>
       mapgl::add_control("No valid polygon geometry to display.", "top-left")
@@ -1211,10 +1290,7 @@ output$initial_map <- mapgl::renderMaplibre({
       )
     )
 }) |>
-  # PERFORMANCE: only rebuild the whole map when the tract set changes; ASU
-  # edits (same tracts, different `asunum`) are pushed via the existing
-  # maplibre_proxy() color updates below instead of a full re-render.
-  shiny::bindCache(sort(map_geom()$GEOID))
+  shiny::bindCache(geoid_set())
 ```
 
 ```{r}
@@ -1310,12 +1386,15 @@ shiny::actionButton("reset", "Reset to Initial Data")
   
 output$edit_map <- mapgl::renderMaplibre({
 
-  shiny::req(map_geom())
+  shiny::req(length(geoid_set()) > 0)
+  # isolate() prevents reactive dependency on map_geom()/full_data() so that
+  # asunum edits do not invalidate this output and cause MapLibre to reinitialise.
+  data <- shiny::isolate(map_geom())
+  if (is.null(data) || nrow(data) == 0) return(NULL)
 
-  number_asus <- max(map_geom()$asunum)
+  number_asus <- max(data$asunum, na.rm = TRUE)
   number_categories <- min(c(number_asus, 8))
-  asu_per_category <- number_asus/number_categories
-  
+
   # Create breaks for ASU categories, excluding 0
   if (number_categories == 1) {
     asu_breaks <- 1
@@ -1329,10 +1408,10 @@ output$edit_map <- mapgl::renderMaplibre({
   }
 
   mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-    mapgl::fit_bounds(map_geom(), animate = FALSE) |>
+    mapgl::fit_bounds(data, animate = FALSE) |>
     mapgl::add_fill_layer(
       id = "basemap",
-      source = map_geom(),
+      source = data,
       fill_color = mapgl::step_expr(
         column = "asunum",
         base = "#E0E0E0",
@@ -1353,24 +1432,21 @@ output$edit_map <- mapgl::renderMaplibre({
     # Pre-add empty layers for selection and highlighting - avoids repeated add/clear cycles
     mapgl::add_line_layer(
       id = "selected",
-      source = map_geom(),
+      source = data,
       line_color = "red",
       line_width = 2,
       line_opacity = 1,
-      filter = list("==", c("get", "GEOID"), "__NONE__")  # Initially hide all features
+      filter = list("==", c("get", "GEOID"), "__NONE__")
     ) |>
     mapgl::add_fill_layer(
       id = "highlighted",
-      source = map_geom(),
+      source = data,
       fill_color = "black",
       fill_opacity = 0.8,
-      filter = list("==", c("get", "GEOID"), "__NONE__")  # Initially hide all features
+      filter = list("==", c("get", "GEOID"), "__NONE__")
     )
 }) |>
-  # PERFORMANCE: only rebuild the whole map when the tract set changes; ASU
-  # edits (same tracts, different `asunum`) are pushed via the existing
-  # maplibre_proxy() color updates below instead of a full re-render.
-  shiny::bindCache(sort(map_geom()$GEOID))
+  shiny::bindCache(geoid_set())
 
 # OPTIMIZATION 1: Use set_filter instead of clear/add for selection highlighting
 shiny::observeEvent(input$edit_map_feature_click, {
@@ -1923,27 +1999,48 @@ shiny::tableOutput("asu_review")
 summarized_asu <- shiny::reactiveVal(NULL)
 
 shiny::observeEvent(input$run_asu_summary, {
-  
+
   shiny::req(full_data())
-  
-  summary_table <- full_data() |>
+
+  asu_sf <- full_data() |> dplyr::filter(asunum > 0.5)
+
+  # Contiguity check: for each ASU, build a Queen-contiguity graph over its
+  # tracts only and verify the graph is fully connected (one component).
+  # Uses the same st_contiguity() approach as the tract-loading step.
+  asu_ids <- sort(unique(asu_sf$asunum))
+  contiguous_flag <- vapply(asu_ids, function(id) {
+    grp <- asu_sf |> dplyr::filter(asunum == id)
+    if (nrow(grp) <= 1L) return(TRUE)
+    nb <- sfdep::st_contiguity(grp$geometry)
+    # sfdep may return 0 for isolated tracts; normalise to integer(0)
+    nb <- lapply(nb, function(x) {
+      if (length(x) == 1L && x == 0L) integer(0L) else as.integer(x)
+    })
+    g <- igraph::graph_from_adj_list(nb, mode = "all")
+    igraph::components(g)$no == 1L
+  }, logical(1L))
+
+  contiguity_df <- data.frame(asunum = asu_ids, contiguous = contiguous_flag)
+
+  summary_table <- asu_sf |>
     sf::st_drop_geometry() |>
     dplyr::group_by(asunum) |>
-    dplyr::filter(asunum > 0.5) |>
     dplyr::summarize(
       Tracts = dplyr::n(),
       Population = sum(tract_pop_cur, na.rm = TRUE),
       `Labor Force` = sum(tract_ASU_clf, na.rm = TRUE),
       Unemployment = sum(tract_ASU_unemp, na.rm = TRUE),
-      `Unemployment Rate` = round((Unemployment/`Labor Force`)*100, 5)
+      `Unemployment Rate` = round((Unemployment / `Labor Force`) * 100, 5),
+      .groups = "drop"
     ) |>
-    dplyr::ungroup() |>
+    dplyr::left_join(contiguity_df, by = "asunum") |>
     dplyr::mutate(
-      ur_qualified = dplyr::if_else(`Unemployment Rate` >= input$asu_ur, TRUE, FALSE),
-      pop_qualified = dplyr::if_else(Population >= input$asu_pop, TRUE, FALSE),
-      asu_qualified = ur_qualified & pop_qualified
+      ur_qualified   = dplyr::if_else(`Unemployment Rate` >= input$asu_ur, TRUE, FALSE),
+      pop_qualified  = dplyr::if_else(Population >= input$asu_pop, TRUE, FALSE),
+      contiguous     = contiguous,
+      asu_qualified  = ur_qualified & pop_qualified & contiguous
     )
-  
+
   summarized_asu(summary_table)
 })
 
