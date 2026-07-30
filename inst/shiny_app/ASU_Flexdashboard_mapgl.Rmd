@@ -374,8 +374,10 @@ update_map_efficiently <- function(map_id = "edit_map") {
       mapgl::set_source(layer_id = "highlighted", source = data) |>
       mapgl::set_filter("highlighted", build_filter(hl))
   } else {
-    # For read-only maps (initial_map), a paint-property update is sufficient.
+    # For read-only maps (initial_map), update source data AND paint property.
+    # set_source keeps tooltip feature properties (asunum, rates, etc.) current.
     mapgl::maplibre_proxy(map_id) |>
+      mapgl::set_source(layer_id = "basemap", source = data) |>
       mapgl::set_paint_property(
         "basemap", "fill-color",
         mapgl::match_expr(
@@ -467,7 +469,7 @@ shiny::fileInput("file", "Choose Excel File", accept = c(".xls", ".xlsx"))
 # Add numeric input for tract year
 shiny::numericInput("tract_year_input",
                      "Census Tract Year:",
-                     value = 2023,
+                     value = 2025,
                      min = 2010,
                      max = 2025,
                      step = 1)
@@ -1296,7 +1298,7 @@ output$initial_map <- mapgl::renderMaplibre({
 ```{r}
 # Add debounced reactive for map updates
 map_update_trigger <- shiny::debounce(shiny::reactive({
-  list(full_data(), input$update, input$th_pass, input$th_combine)
+  list(full_data(), input$update)
 }), 200)
 
 # Observer for debounced updates
