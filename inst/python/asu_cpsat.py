@@ -5,6 +5,8 @@ asu_cpsat.py — Build Areas of Substantial Unemployment (ASUs) with OR-Tools CP
 Modified to ensure:
 1. Seeds are selected from unassigned tracts with high unemployment rate
 2. Stops when no remaining unassigned tract has UR >= tau (6.45%)
+3. Warm starts can reroute around articulation points before pruning/refilling
+4. Proven-optimal ties prefer more threshold slack, then fewer tracts
 
 Two ways to provide adjacency (contiguity):
   A) Precomputed neighbors JSON (recommended on servers without a Geo stack)
@@ -563,11 +565,15 @@ def solve_one_asu_cpsat(
     hint_obj: Optional[int] = None,
     forced_selected: Optional[List[int]] = None,
     cluster_groups: Optional[List[List[int]]] = None,
+    deterministic_ties: bool = True,
+    tie_break_rank: Optional[List[int]] = None,
 ) -> Optional[CpsatResult]:
     """
         Connectivity via iterative vertex-separator cuts. Each disconnected incumbent
         adds valid constraints requiring a selected path from its components to the root.
-    Objective: maximize Σ u_i x_i
+    Objective: maximize Σ u_i x_i. If the primary objective is proven optimal,
+    remaining time is used to maximize exact threshold slack, minimize tract
+    count, and finally minimize a stable GEOID/local-index rank sum.
     """
     N = len(nb_local)
     if N == 0:
@@ -700,7 +706,7 @@ def solve_one_asu_cpsat(
                 if best_obj > lower_bound:
                     model.Add(obj_expr >= best_obj)
                     lower_bound = best_obj
-            if status == cp_model.OPTIMAL:
+            if status == cp_model.OPTIMAL and not deterministic_ties:
                 return CpsatResult(selected, root_local, objective, "OPTIMAL")
             break
 
@@ -819,7 +825,77 @@ def solve_one_asu_cpsat(
     status = solver.Solve(model)
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         selected = [i for i in range(N) if solver.BooleanValue(x[i])]
-        objective = int(round(solver.ObjectiveValue()))
+        objective = int(u_g[selected].sum())
+
+        # A secondary objective must never trade away even one unemployed
+        # person, so tie-breaking is staged only after primary optimality is
+        # proven and obj_expr is fixed exactly. Each stage uses only time left
+        # from the original per-window budget.
+        if status == cp_model.OPTIMAL and deterministic_ties and rel_gap is None:
+            model.Add(obj_expr == objective)
+            incumbent = selected
+
+            if tie_break_rank is None:
+                stable_rank = list(range(N))
+            else:
+                if len(tie_break_rank) != N:
+                    raise ValueError("tie_break_rank must have one entry per local node")
+                stable_rank = [int(rank) for rank in tie_break_rank]
+
+            rank_expr = sum((stable_rank[i] + 1) * x[i] for i in range(N))
+            tie_stages = [
+                ("slack", "max", lhs),
+                ("count", "min", selected_count),
+                ("rank", "min", rank_expr),
+            ]
+
+            def tie_value(stage_name: str, nodes: List[int]) -> int:
+                if stage_name == "slack":
+                    return sum(
+                        int(den) * int(u_g[i]) - int(num) * int(E_g[i])
+                        for i in nodes
+                    )
+                if stage_name == "count":
+                    return len(nodes)
+                return sum(stable_rank[i] + 1 for i in nodes)
+
+            for stage_name, direction, expression in tie_stages:
+                tie_remaining = float(time_limit) - (time.monotonic() - start_time)
+                if tie_remaining <= 0.01:
+                    break
+                if direction == "max":
+                    model.Maximize(expression)
+                else:
+                    model.Minimize(expression)
+
+                tie_solver = cp_model.CpSolver()
+                tie_solver.parameters.num_search_workers = max(1, int(workers))
+                tie_solver.parameters.max_time_in_seconds = tie_remaining
+                tie_solver.parameters.log_search_progress = False
+                tie_solver.parameters.cp_model_presolve = True
+                tie_solver.parameters.linearization_level = 2
+                tie_solver.parameters.ignore_subsolvers.extend([
+                    "pseudo_costs", "reduced_costs", "default_lp", "quick_restart",
+                ])
+                tie_status = tie_solver.Solve(model)
+                if tie_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                    break
+
+                candidate = [i for i in range(N) if tie_solver.BooleanValue(x[i])]
+                candidate_value = tie_value(stage_name, candidate)
+                incumbent_value = tie_value(stage_name, incumbent)
+                if (
+                    (direction == "max" and candidate_value >= incumbent_value)
+                    or (direction == "min" and candidate_value <= incumbent_value)
+                ):
+                    incumbent = candidate
+                if tie_status != cp_model.OPTIMAL:
+                    break
+
+                model.Add(expression == candidate_value)
+
+            selected = incumbent
+
         return CpsatResult(selected, root_local, objective, solver.StatusName(status))
     if best_connected is not None:
         return CpsatResult(best_connected, root_local, best_obj, "FEASIBLE")
@@ -890,6 +966,457 @@ def improve_by_trades(S0: List[int], u: np.ndarray, E: np.ndarray, P: np.ndarray
     return S
 
 
+def _selection_key(S: set, u: np.ndarray, slack: np.ndarray) -> Tuple:
+    """Lexicographic warm-start score matching the CP-SAT tie-break policy."""
+    idx = sorted(S)
+    return (
+        int(u[idx].sum()),
+        int(slack[idx].sum()),
+        -len(idx),
+        tuple(-i for i in idx),
+    )
+
+
+def _repair_rate_after_augmentation(
+    selected: set,
+    protected: set,
+    nb: List[List[int]],
+    u: np.ndarray,
+    P: np.ndarray,
+    slack: np.ndarray,
+    pop_thresh: int,
+) -> Optional[set]:
+    """
+    Restore rate feasibility after temporarily adding a connector/path.
+
+    Only non-articulation, below-threshold nodes may be removed. The removal
+    score is unemployment sacrificed per unit of exact rate slack recovered.
+    Augmentation nodes and the root's forced high-UR component are protected so
+    a proposed reroute cannot simply undo itself during repair.
+    """
+    S = set(selected)
+    slack_sum = int(slack[list(S)].sum())
+    pop_sum = int(P[list(S)].sum())
+
+    while slack_sum < 0:
+        selected_mask = np.zeros(len(nb), dtype=bool)
+        selected_mask[list(S)] = True
+        cut_vertices = _articulation_points(nb, selected_mask)
+        candidates = [
+            i for i in S - protected - cut_vertices
+            if int(slack[i]) < 0 and pop_sum - int(P[i]) >= pop_thresh
+        ]
+        if not candidates:
+            return None
+
+        def drop_key(i: int) -> Tuple:
+            recovered = -int(slack[i])
+            return (
+                int(u[i]) / recovered,
+                int(u[i]),
+                -recovered,
+                i,
+            )
+
+        dropped = min(candidates, key=drop_key)
+        S.remove(dropped)
+        slack_sum -= int(slack[dropped])
+        pop_sum -= int(P[dropped])
+
+    return S
+
+
+def _small_leaf_bundles(
+    selected: set,
+    protected: set,
+    root_local: int,
+    nb: List[List[int]],
+    u: np.ndarray,
+    P: np.ndarray,
+    slack: np.ndarray,
+    pop_thresh: int,
+    max_bundle_nodes: int,
+    max_candidates: int,
+) -> List[frozenset]:
+    """
+    Return cheap connectivity-safe ejections.
+
+    Besides ordinary non-articulation singletons, this identifies a pendant
+    branch as an articulation point plus every component it separates from the
+    root. Removing the whole bundle leaves exactly the root-side component, so
+    a poor branch can be traded even when none of its nodes is initially
+    removable on its own.
+    """
+    S = set(selected)
+    selected_mask = np.zeros(len(nb), dtype=bool)
+    selected_mask[list(S)] = True
+    cut_vertices = _articulation_points(nb, selected_mask)
+    pop_sum = int(P[list(S)].sum())
+    bundles: set = set()
+
+    for i in S - protected - cut_vertices:
+        if int(slack[i]) < 0 and pop_sum - int(P[i]) >= pop_thresh:
+            bundles.add(frozenset((i,)))
+
+    for articulation in sorted(cut_vertices - protected):
+        reached = {root_local}
+        stack = [root_local]
+        while stack:
+            v = stack.pop()
+            for w in nb[v]:
+                if w in S and w != articulation and w not in reached:
+                    reached.add(w)
+                    stack.append(w)
+
+        branch = frozenset(S - reached)
+        if (
+            1 < len(branch) <= max_bundle_nodes
+            and not (branch & protected)
+            and int(slack[list(branch)].sum()) < 0
+            and pop_sum - int(P[list(branch)].sum()) >= pop_thresh
+        ):
+            bundles.add(branch)
+
+    def bundle_key(bundle: frozenset) -> Tuple:
+        idx = list(bundle)
+        recovered = -int(slack[idx].sum())
+        lost_u = int(u[idx].sum())
+        return (lost_u / recovered, lost_u, len(bundle), tuple(sorted(bundle)))
+
+    return sorted(bundles, key=bundle_key)[:max_candidates]
+
+
+def _fractional_refill_bound(
+    candidates: List[int],
+    start: int,
+    capacity: int,
+    gain: int,
+    u: np.ndarray,
+    slack: np.ndarray,
+) -> float:
+    """Optimistic fractional-knapsack bound used only to rank beam states."""
+    bound = float(gain)
+    remaining = max(0, int(capacity))
+    for i in candidates[start:]:
+        d_i = int(slack[i])
+        u_i = int(u[i])
+        if d_i >= 0:
+            bound += u_i
+            remaining += d_i
+            continue
+        cost = -d_i
+        if remaining <= 0:
+            break
+        fraction = min(1.0, remaining / cost)
+        bound += fraction * u_i
+        remaining -= min(remaining, cost)
+    return bound
+
+
+def _beam_refill(
+    selected: set,
+    forbidden: set,
+    nb: List[List[int]],
+    u: np.ndarray,
+    slack: np.ndarray,
+    max_candidates: int,
+    beam_width: int,
+) -> set:
+    """
+    Refill available exact rate slack with a bounded connected knapsack search.
+
+    Candidates come from the current one-hop frontier, so every subset tested by
+    the beam remains connected to the base selection. The economic ordering is
+    unemployment per unit of rate deficit; the fractional upper bound preserves
+    capacity-rich states that a simple ratio-greedy pass would discard.
+    """
+    S = set(selected)
+    frontier = {
+        w for v in S for w in nb[v]
+        if w not in S and w not in forbidden and int(u[w]) > 0
+    }
+
+    def add_key(i: int) -> Tuple:
+        d_i = int(slack[i])
+        efficiency = math.inf if d_i >= 0 else int(u[i]) / -d_i
+        return (-efficiency, -int(u[i]), i)
+
+    candidates = sorted(frontier, key=add_key)[:max_candidates]
+    if not candidates:
+        return S
+
+    # (unemployment gain, remaining exact slack, selected-candidate bit mask)
+    states: List[Tuple[int, int, int]] = [
+        (0, int(slack[list(S)].sum()), 0)
+    ]
+
+    for pos, node in enumerate(candidates):
+        node_slack = int(slack[node])
+        node_u = int(u[node])
+        bit = 1 << pos
+        expanded = list(states)
+        for gain, capacity, mask in states:
+            if capacity + node_slack >= 0:
+                expanded.append((gain + node_u, capacity + node_slack, mask | bit))
+
+        # Pareto dominance: with no less slack and no less gain, a state can do
+        # everything a dominated state can do on the remaining candidates.
+        expanded.sort(key=lambda state: (-state[1], -state[0], state[2]))
+        pareto: List[Tuple[int, int, int]] = []
+        best_gain = -1
+        for state in expanded:
+            if state[0] > best_gain:
+                pareto.append(state)
+                best_gain = state[0]
+
+        if len(pareto) > beam_width:
+            pareto.sort(
+                key=lambda state: (
+                    _fractional_refill_bound(
+                        candidates, pos + 1, state[1], state[0], u, slack
+                    ),
+                    state[0],
+                    state[1],
+                    -state[2].bit_count(),
+                ),
+                reverse=True,
+            )
+            pareto = pareto[:beam_width]
+        states = pareto
+
+    best = max(
+        states,
+        key=lambda state: (state[0], state[1], -state[2].bit_count(), -state[2]),
+    )
+    for pos, node in enumerate(candidates):
+        if best[2] & (1 << pos):
+            S.add(node)
+    return S
+
+
+def _drop_redundant_zero_tracts(
+    selected: set,
+    protected: set,
+    root_local: int,
+    nb: List[List[int]],
+    u: np.ndarray,
+    E: np.ndarray,
+    P: np.ndarray,
+    pop_thresh: int,
+) -> set:
+    """Apply the tract-count tie-break without changing unemployment or slack."""
+    S = set(selected)
+    protected = set(protected) | {root_local}
+    while True:
+        selected_mask = np.zeros(len(nb), dtype=bool)
+        selected_mask[list(S)] = True
+        cut_vertices = _articulation_points(nb, selected_mask)
+        pop_sum = int(P[list(S)].sum())
+        removable = sorted(
+            (
+                i for i in S - protected - cut_vertices
+                if int(u[i]) == 0 and int(E[i]) == 0
+                and pop_sum - int(P[i]) >= pop_thresh
+            ),
+            reverse=True,
+        )
+        if not removable:
+            return S
+        S.remove(removable[0])
+
+
+def augment_prune_hint(
+    S0: List[int],
+    u: np.ndarray,
+    E: np.ndarray,
+    P: np.ndarray,
+    nb: List[List[int]],
+    tau: float,
+    pop_thresh: int,
+    root_local: int,
+    protected: Optional[List[int]] = None,
+    max_augmentation_candidates: int = 96,
+    max_anchor_candidates: int = 12,
+    max_topology_states: int = 48,
+    max_bundle_nodes: int = 12,
+    max_ejection_candidates: int = 24,
+    refill_candidates: int = 32,
+    beam_width: int = 512,
+    max_ejection_rounds: int = 4,
+) -> List[int]:
+    """
+    Connectivity-aware augment-prune-refill warm-start improvement.
+
+    The search may temporarily add one or two frontier nodes below the rate
+    threshold, then remove old connectors that the new path makes redundant.
+    It subsequently tests small pendant-branch ejections and refills their rate
+    slack with a bounded beam search. Only completed connected, population- and
+    rate-feasible states compete with the original hint.
+    """
+    if not S0:
+        return []
+
+    N = len(nb)
+    S_base = set(int(i) for i in S0)
+    protected_base = set(int(i) for i in (protected or [])) | {root_local}
+    num, den = as_fraction_tau(tau)
+    slack = den * u.astype(np.int64) - num * E.astype(np.int64)
+
+    if not component_ok(sorted(S_base), u, E, P, tau, pop_thresh, nb):
+        return sorted(S_base)
+
+    selected_mask = np.zeros(N, dtype=bool)
+    selected_mask[list(S_base)] = True
+    base_articulations = _articulation_points(nb, selected_mask)
+    frontier = {w for v in S_base for w in nb[v] if w not in S_base}
+
+    def economic_key(i: int) -> Tuple:
+        d_i = int(slack[i])
+        efficiency = math.inf if d_i >= 0 else int(u[i]) / -d_i
+        return (-efficiency, -int(u[i]), i)
+
+    structural_count = max(1, max_augmentation_candidates // 2)
+    structural = sorted(
+        frontier,
+        key=lambda i: (
+            -sum(1 for w in nb[i] if w in S_base),
+            int(slack[i]),
+            -int(u[i]),
+            i,
+        ),
+    )[:structural_count]
+    economic = sorted(frontier, key=economic_key)[:structural_count]
+    augmentation_pool = list(dict.fromkeys(structural + economic))
+    augmentation_pool = augmentation_pool[:max_augmentation_candidates]
+
+    # Each entry is (repaired state, augmentation, number of bypassed cuts).
+    topology_states: List[Tuple[set, frozenset, int]] = [
+        (set(S_base), frozenset(), 0)
+    ]
+    single_states: List[Tuple[set, frozenset, int]] = []
+
+    for node in augmentation_pool:
+        augmentation = frozenset((node,))
+        trial = S_base | set(augmentation)
+        trial_mask = np.zeros(N, dtype=bool)
+        trial_mask[list(trial)] = True
+        freed = base_articulations - _articulation_points(nb, trial_mask)
+        if not freed:
+            continue
+        repaired = _repair_rate_after_augmentation(
+            trial, protected_base | set(augmentation), nb, u, P, slack, pop_thresh
+        )
+        if repaired is not None:
+            single_states.append((repaired, augmentation, len(freed)))
+
+    def topology_state_key(item: Tuple[set, frozenset, int]) -> Tuple:
+        state, augmentation, freed_count = item
+        score = _selection_key(state, u, slack)
+        return (
+            score[0],
+            score[1],
+            score[2],
+            freed_count,
+            -len(augmentation),
+            score[3],
+        )
+
+    anchors = sorted(single_states, key=topology_state_key, reverse=True)[
+        :max_anchor_candidates
+    ]
+    topology_states.extend(single_states)
+
+    seen_pairs: set = set()
+    for _, anchor_augmentation, _ in anchors:
+        anchor = next(iter(anchor_augmentation))
+        # In addition to two direct-frontier nodes, allow a genuine two-node
+        # path whose second node touches the anchor but not the base selection.
+        path_extensions = sorted(
+            (w for w in nb[anchor] if w not in S_base and w != anchor),
+            key=economic_key,
+        )
+        pair_pool = list(dict.fromkeys(augmentation_pool + path_extensions))[
+            :max_augmentation_candidates
+        ]
+        for other in pair_pool:
+            if other == anchor:
+                continue
+            augmentation = frozenset((anchor, other))
+            if augmentation in seen_pairs:
+                continue
+            seen_pairs.add(augmentation)
+            trial = S_base | set(augmentation)
+            trial_mask = np.zeros(N, dtype=bool)
+            trial_mask[list(trial)] = True
+            freed = base_articulations - _articulation_points(nb, trial_mask)
+            if not freed:
+                continue
+            repaired = _repair_rate_after_augmentation(
+                trial, protected_base | set(augmentation), nb, u, P, slack, pop_thresh
+            )
+            if repaired is not None:
+                topology_states.append((repaired, augmentation, len(freed)))
+
+    # Deduplicate repaired selections, then retain the strongest bounded set.
+    unique_states: Dict[frozenset, Tuple[set, frozenset, int]] = {}
+    for item in topology_states:
+        state_key = frozenset(item[0])
+        old = unique_states.get(state_key)
+        if old is None or topology_state_key(item) > topology_state_key(old):
+            unique_states[state_key] = item
+    ranked_states = sorted(
+        unique_states.values(), key=topology_state_key, reverse=True
+    )[:max_topology_states]
+    if frozenset(S_base) not in {frozenset(item[0]) for item in ranked_states}:
+        ranked_states.append((set(S_base), frozenset(), 0))
+
+    best = set(S_base)
+    for repaired, augmentation, _ in ranked_states:
+        current = set(repaired)
+        permanently_forbidden = (S_base | set(augmentation)) - current
+        protected_state = protected_base | set(augmentation)
+
+        for _ in range(max_ejection_rounds):
+            options: List[Tuple[set, frozenset]] = [
+                (
+                    _beam_refill(
+                        current, permanently_forbidden, nb, u, slack,
+                        refill_candidates, beam_width,
+                    ),
+                    frozenset(),
+                )
+            ]
+            for bundle in _small_leaf_bundles(
+                current, protected_state, root_local, nb, u, P, slack,
+                pop_thresh, max_bundle_nodes, max_ejection_candidates,
+            ):
+                pruned = current - set(bundle)
+                refilled = _beam_refill(
+                    pruned, permanently_forbidden | set(bundle), nb, u, slack,
+                    refill_candidates, beam_width,
+                )
+                options.append((refilled, bundle))
+
+            candidate, ejected = max(
+                options, key=lambda item: _selection_key(item[0], u, slack)
+            )
+            if _selection_key(candidate, u, slack) <= _selection_key(current, u, slack):
+                break
+            current = candidate
+            permanently_forbidden.update(ejected)
+
+        current = _drop_redundant_zero_tracts(
+            current, protected_state, root_local, nb, u, E, P, pop_thresh
+        )
+        if (
+            component_ok(sorted(current), u, E, P, tau, pop_thresh, nb)
+            and _selection_key(current, u, slack) > _selection_key(best, u, slack)
+        ):
+            best = current
+
+    return sorted(best)
+
+
 def _prepare_window_hint(
     nb_local: List[List[int]], u_g: np.ndarray, E_g: np.ndarray, P_g: np.ndarray,
     tau: float, pop_thresh: int, root_local: int,
@@ -897,9 +1424,9 @@ def _prepare_window_hint(
     """
     Contract UR>=tau clusters, then build two candidate warm starts on the
     reduced graph -- a forward-growing greedy snake and a reverse prune that
-    starts from the whole window and drops tracts down to tau -- refine each on
-    the original graph, and keep whichever reaches the higher unemployment
-    objective.
+    starts from the whole window and drops tracts down to tau. Refine both with
+    cheap local trades, keep the stronger base, then run the connectivity-aware
+    augment-prune-refill search once on that base.
     """
     nb_r, u_r, E_r, P_r, expand_r, node_map_r = contract_high_ur_nodes(nb_local, u_g, E_g, P_g, tau)
     root_r = int(node_map_r[root_local])
@@ -920,6 +1447,24 @@ def _prepare_window_hint(
         best, hint_source = prune, "reverse_prune"
     else:
         best, hint_source = snake, "greedy_snake"
+
+    if best["hint_valid"]:
+        augmented = augment_prune_hint(
+            best["hint_improved"], u_g, E_g, P_g, nb_local, tau, pop_thresh,
+            root_local, protected=root_component,
+        )
+        if component_ok(augmented, u_g, E_g, P_g, tau, pop_thresh, nb_local):
+            num, den = as_fraction_tau(tau)
+            exact_slack = den * u_g.astype(np.int64) - num * E_g.astype(np.int64)
+            if _selection_key(set(augmented), u_g, exact_slack) > _selection_key(
+                set(best["hint_improved"]), u_g, exact_slack
+            ):
+                best = {
+                    "hint_improved": augmented,
+                    "hint_valid": True,
+                    "hint_obj_val": int(u_g[augmented].sum()),
+                }
+                hint_source += "+augment_prune_refill"
 
     return {
         "root_component": root_component,
@@ -1017,6 +1562,7 @@ def build_many_asus_cpsat(
     parallel_asus: int = 4,
     merge_adjacent: bool = True,
     export_dir: Optional[str] = None,
+    deterministic_ties: bool = True,
 ) -> Dict[str, np.ndarray]:
     """
     Build ASUs in batches of up to `parallel_asus` disjoint candidate windows, solved
@@ -1122,9 +1668,19 @@ def build_many_asus_cpsat(
             )[0]
             root_local = int(tie[np.argmax(P_g[tie])]) if len(tie) > 1 else int(top)
 
+            if "geoid" in df.columns:
+                stable_values = [str(df.iloc[int(g)]["geoid"]) for g in sub]
+            else:
+                stable_values = [str(int(g)).zfill(12) for g in sub]
+            stable_order = sorted(range(len(sub)), key=lambda i: (stable_values[i], i))
+            tie_break_rank = [0] * len(sub)
+            for rank, local_i in enumerate(stable_order):
+                tie_break_rank[local_i] = rank
+
             windows.append({
                 "seed": s, "sub": sub, "nb_local": nb_local,
                 "u_g": u_g, "E_g": E_g, "P_g": P_g, "root_local": root_local, "r": r,
+                "tie_break_rank": tie_break_rank,
             })
             reserved[sub] = True
 
@@ -1172,6 +1728,8 @@ def build_many_asus_cpsat(
                 time_limit=time_limit, workers=workers_each, rel_gap=rel_gap, log=verbose,
                 hint=w["hint_improved"], hint_obj=w["hint_obj_val"],
                 forced_selected=w["root_component"],
+                deterministic_ties=deterministic_ties,
+                tie_break_rank=w["tie_break_rank"],
                 # cluster_groups intentionally NOT passed here: tying high-UR
                 # cluster members via equality is provably correct (validated
                 # against brute force) but empirically hurts this time-limited
@@ -1323,6 +1881,11 @@ def main():
     ap.add_argument("--rel-gap", type=float, default=None, help="Optional relative gap (e.g., 0.01 for 1%)")
     ap.add_argument("--parallel-asus", type=int, default=4, help="Number of ASU windows to solve concurrently")
     ap.add_argument("--no-merge-adjacent", action="store_true", help="Disable merging of touching ASUs built in the same batch")
+    ap.add_argument(
+        "--no-deterministic-ties",
+        action="store_true",
+        help="Skip secondary optimal-solution tie-break solves",
+    )
     ap.add_argument("--output", default=None, help="Output CSV path (default: <stem>_with_asu.csv)")
     ap.add_argument("--verbose", action="store_true", help="Verbose CP-SAT logs")
     args = ap.parse_args()
@@ -1391,6 +1954,7 @@ def main():
         time_limit=args.time_limit, workers=args.workers, rel_gap=args.rel_gap,
         verbose=args.verbose, parallel_asus=args.parallel_asus,
         merge_adjacent=not args.no_merge_adjacent,
+        deterministic_ties=not args.no_deterministic_ties,
     )
 
     df_out = df.copy()
