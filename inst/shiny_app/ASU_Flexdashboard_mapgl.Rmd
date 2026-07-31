@@ -2211,7 +2211,7 @@ shiny::observeEvent(input$review_txt, {
 
 # How to Use ASUbuildR
 
-**About ASUbuildR**
+**About ASUbuildR 0.6.1**
 
 ASUbuildR is an application built in R using Shiny and Flexdashboard to
 create a point-and-click environment to build Areas of Substantial
