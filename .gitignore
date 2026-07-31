@@ -12,3 +12,6 @@ __pycache__/
 *.py[cod]
 ASUbuildR.Rcheck/
 ASUbuildR_*.tar.gz
+test folder/*
+temp_*.R
+test folder/asu_exports/

@@ -5,8 +5,9 @@
 #' necessary), creates a conda environment using only the \emph{conda-forge}
 #' channel for the Python interpreter itself (avoiding channels that require
 #' Terms of Service acceptance), and installs the required Python packages
-#' (\code{numpy}, \code{pandas}, \code{networkx}, \code{ortools}) via pip
-#' inside that environment. OR-Tools is not distributed on conda-forge, so
+#' (\code{numpy}, \code{pandas}, \code{networkx}, \code{ortools},
+#' \code{openpyxl}) via pip inside that environment. OR-Tools is not
+#' distributed on conda-forge, so
 #' pip is used for the packages rather than \code{conda install}.
 #'
 #' @param force Logical. If TRUE, recreates the conda environment even if it exists.
@@ -107,7 +108,7 @@ setup_asu_python <- function(force = FALSE) {
   # not break an environment that's already fine.
   reticulate::use_condaenv(env_name, required = TRUE)
 
-  pkgs <- c("numpy", "pandas", "networkx", "ortools")
+  pkgs <- c("numpy", "pandas", "networkx", "ortools", "openpyxl")
   already_available <- vapply(pkgs, reticulate::py_module_available, logical(1))
   missing_pkgs <- pkgs[!already_available]
 

@@ -1,7 +1,7 @@
 Package: ASUbuildR
 Type: Package
 Title: A Shiny Interface for Constructing Areas of Substantial Unemployment
-Version: 0.5
+Version: 0.6.1
 Authors@R: c(
     person("David", "Schmidt", email = "deschmidt@detr.nv.gov", role = c("aut", "cre")),
     person("Michael", "Frank", role = "aut"),
@@ -40,8 +40,8 @@ Imports:
     processx,
     rappdirs
 LinkingTo: Rcpp
-SystemRequirements: C++11; Pandoc (>= 1.12.3); Python (>= 3.9) with packages: ortools, numpy, pandas, networkx
-Suggests: knitr
+SystemRequirements: C++11; Pandoc (>= 1.12.3); Python (>= 3.9) with packages: ortools, numpy, pandas, networkx, openpyxl
+Suggests: knitr, rprojroot
 VignetteBuilder: knitr
 Config/reticulate: list(packages = list(
     list(package = "ortools"),

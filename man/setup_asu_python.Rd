@@ -13,12 +13,15 @@ setup_asu_python(force = FALSE)
 Invisible NULL. Called for side effects.
 }
 \description{
-This function sets up the Python environment needed for ASUbuildR
-using a conda environment that relies solely on the
-\emph{conda-forge} channel (avoiding channels that require Terms of
-Service acceptance). It checks for an existing conda installation
-(installing Miniconda if necessary) and ensures all required packages
-are available.
+This function sets up the Python environment needed for ASUbuildR. It
+checks for an existing conda installation (installing Miniconda if
+necessary), creates a conda environment using only the \emph{conda-forge}
+channel for the Python interpreter itself (avoiding channels that require
+Terms of Service acceptance), and installs the required Python packages
+(\code{numpy}, \code{pandas}, \code{networkx}, \code{ortools},
+\code{openpyxl}) via pip inside that environment. OR-Tools is not
+distributed on conda-forge, so
+pip is used for the packages rather than \code{conda install}.
 }
 \examples{
 \dontrun{
