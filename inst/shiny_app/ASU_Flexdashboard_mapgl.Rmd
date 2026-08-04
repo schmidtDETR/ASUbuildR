@@ -1578,12 +1578,9 @@ filtered_tracts_memo <- shiny::reactive({
 }) |>
   shiny::bindCache(input$percentile, input$unemployment_filter, selected_tracts(), full_data())
 
-# Debounced apply
-filter_debounced <- shiny::debounce(shiny::reactive({
-  list(input$filter_percentile, input$unemployment_filter)
-}), 250)
-
-shiny::observeEvent(filter_debounced(), {
+# Apply highlights only when the button is explicitly clicked
+shiny::observe({
+  shiny::req(selected_tracts())
   filtered_selected <- filtered_tracts_memo()
   highlighted_tracts(filtered_selected)
 
@@ -1598,7 +1595,7 @@ shiny::observeEvent(filter_debounced(), {
     mapgl::maplibre_proxy("edit_map") |>
       mapgl::set_filter("highlighted", list("==", c("get", "GEOID"), "__NONE__"))
   }
-})
+}) |> shiny::bindEvent(input$filter_percentile, ignoreInit = TRUE)
 
 # Clear highlights when requested or when ASU selection changes
 shiny::observeEvent(list(input$clear_percentile, input$select_asunum), {

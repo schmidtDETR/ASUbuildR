@@ -973,7 +973,7 @@ def solve_one_asu_cpsat(
         _scout.parameters.cp_model_presolve = True
         _scout.parameters.linearization_level = 2
         _scout.parameters.cp_model_probing_level = 2
-        _scout.parameters.cut_level = 2
+        _scout.parameters.cut_level = 1
         _scout.parameters.ignore_subsolvers.extend([
             "lb_tree_search",
             "probing",
@@ -1072,15 +1072,17 @@ def solve_one_asu_cpsat(
         solver.parameters.linearization_level = 2
         solver.parameters.cp_model_probing_level = 2
         solver.parameters.cut_level = 1
+        solver.parameters.lns_initial_difficulty = 0.4
         solver.parameters.filter_subsolvers.extend([
             "rins*",
             "max_lp",
-            "objective_lb_search",
+            #"objective_lb_search",
             "probing_max_lp",
             "lb_tree_search",
-            
-            # "graph_arc_lns",
-            # "ls_lin*",
+            #"probing_no_lp",
+            #"graph_arc_lns",
+            "graph*",
+            "ls_lin*",
         ])
         # solver.parameters.ignore_subsolvers.extend([
         #     "pseudo_costs",
@@ -2323,18 +2325,18 @@ def build_many_asus_cpsat(
     workers: int = 8,
     rel_gap: Optional[float] = None,
     verbose: bool = True,
-    parallel_asus: int = 4,
+    parallel_asus: int = 1,
     merge_adjacent: bool = True,
     export_dir: Optional[str] = None,
     deterministic_ties: bool = True,
     objective_shaving: bool = False,
     use_signed_flow: bool = True,
     use_arborescence: bool = False,
-    repair_enabled: bool = True,
-    repair_hops: int = 2,
+    repair_enabled: bool = False,
+    repair_hops: int = 5,
     repair_max_free_nodes: int = 500,
     repair_time_limit: float = 15.0,
-    repair_rounds: int = 3,
+    repair_rounds: int = 0,
     repair_num_workers: int = 8,
     repair_random_seed: int = 1,
 ) -> Dict[str, np.ndarray]:
@@ -2664,7 +2666,7 @@ def main():
     ap.add_argument("--time-limit", type=int, default=1200, help="CP-SAT time limit per window (seconds)")
     ap.add_argument("--workers", type=int, default=8, help="CP-SAT parallel workers")
     ap.add_argument("--rel-gap", type=float, default=None, help="Optional relative gap (e.g., 0.01 for 1%)")
-    ap.add_argument("--parallel-asus", type=int, default=4, help="Number of ASU windows to solve concurrently")
+    ap.add_argument("--parallel-asus", type=int, default=1, help="Number of ASU windows to solve concurrently")
     ap.add_argument("--no-merge-adjacent", action="store_true", help="Disable merging of touching ASUs built in the same batch")
     ap.add_argument(
         "--no-deterministic-ties",

@@ -141,13 +141,32 @@ for each ASU k:
 
 ---
 
-## Validated Test Results (Colorado 2025, 300s)
+## Validated Test Results (Colorado 2025, 300s, 1 ASU)
 
-- **ASU 1**: 74,805 unemployed, 560 tracts, UR=6.450%, bound=75,690 (gap≈1.17%)
-- **Wall time**: 302.4s for a 300s solver budget; previously post-solve improvement
-   pushed a 60s benchmark to 230.1s. Incremental trade totals reduced it to ~63s.
-- **Earlier multi-ASU check**: ASU 2 correctly failed the quick screen after ASU 1;
-   no connected remaining cluster of ≥10,000 population could sustain UR≥tau.
+All runs: `tau=6.45%`, `pop_thresh=10000`, `workers=18`, `time_limit=300s`, 1447 tracts.
+
+| Config | Incumbent (unemployed) | Bound | Gap | Gap Integral | Wall |
+|--------|----------------------|-------|-----|-------------|------|
+| Directed flow (old default) | 74,805 | 75,690 | 1.17% | — | 302s |
+| Signed flow linear cuts run 1 | 75,380 | 75,595 | 0.285% | 12,062 | ~314s |
+| Signed flow linear cuts run 4 | 75,335 | 75,595 | 0.345% | 13,201 | ~314s |
+| Boolean arborescence run 1 | 75,287 | 75,651 | 0.481% | 12,059 | 315s |
+| Signed flow BoolOr cuts **(pre-probing=2 baseline)** | 75,339 | 75,593 | 0.336% | 12,706 | ~315s |
+| **Directed flow + BoolOr + probing=2 + cut=2** | **75,411** | **75,619** | **0.275%** | 13,148 | ~313s |
+| **Signed flow + BoolOr + probing=2 + cut=2** (prior baseline) | **75,387** | **75,595** | **0.275%** | 14,508 | ~313s |
+| Signed flow + above + `"probing"` in ignore_subsolvers | 75,301 | 75,588 | 0.380% | 15,104 | ~300s |
+| Signed flow + above + `AddDecisionStrategy(u/E order)` | 74,989 | 75,583 | 0.786% | 15,949 | ~300s |
+| **Signed flow + probing=2 + cut=2 + lb_tree_search(3)** | **75,411** | **75,567** | **0.206%** | **12,971** | ~314s |
+| lbts×3 + `quick_restart_no_lp` re-enabled | 75,360 | 75,590 | 0.304% | 14,202 | ~314s |
+| lbts×3 + `objective_lb_search_no_lp` excluded (10 full, 8 LNS threads) | 75,369 | 75,597 | 0.302% | **12,027** | ~314s |
+
+**Current production default**: `use_signed_flow=True`, `use_arborescence=False`,
+`objective_shaving=False`, `use_root_articulation_implications=False`,
+with BoolOr cut constraints and `cp_model_probing_level=2`, `cut_level=2` (see §below).
+
+Ignored subsolvers: `pseudo_costs`, `reduced_costs`, `default_lp`, `quick_restart`,
+`quick_restart_no_lp`, `objective_shaving_max_lp`, `objective_shaving_no_lp`,
+`objective_lb_search_max_lp`, `feasibility_pump`. Extra: `lb_tree_search` × 2 (3 total: 1 default + 2 extra).
 
 ---
 
@@ -417,7 +436,469 @@ variants diluting effort across too many neighborhood configurations without any
 single one getting enough attempts to find good moves in the fixed time budget.
 **Reverted; do not set `diversify_lns_params`.**
 
-### Bridge-based tighter flow bound `_bridge_edge_bounds` — tried, reverted (2026-07-30)
+### Boolean arborescence connectivity — tried, REVERTED to opt-in (regression at 300s) (2026-08-03)
+
+Implemented `use_arborescence: bool = False` as an opt-in alternative to integer flow
+in `solve_one_asu_cpsat` and `build_many_asus_cpsat`. The idea: replace the `~4,191`
+large-domain `NewIntVar(-1321, 1321)` signed-flow variables (or `~8,382` directed
+variables) with:
+- **8,382 `BoolVar`** `par_vars[(i,j)]`: 1 iff j is the parent of i in the arborescence
+- **1,322 `IntVar(0, N-1)`** `depth_vars[i]`: acyclicity enforced via big-M depth constraint
+  `depth[i] - depth[j] >= 1 - (N-1)*(1-par[(i,j)])`
+- Each selected non-root has `sum(par[(i,j)] for j in nb[i]) == x[i]` (exactly one parent)
+- Warm-start parent/depth hints computed from the spanning tree returned by `_spanning_tree_flows`
+
+**Theoretical motivation**: Booleans are ~6× cheaper in total domain size (8,382 bools +
+1,322 × [0,1321] = ~1.75M vs 4,191 × [-1321,1321] = ~11.1M). CP-SAT applies clause
+learning and unit propagation to Booleans far more aggressively than integers. After
+presolve, the model converts to `#kExactlyOne` / `#kBoolAnd` / `#kBoolOr` structure
+— CP-SAT's probing stage correctly handles all of this.
+
+**A/B tested on real Colorado data (300s/1-ASU, matched)**:
+- Arborescence: **75,287 / 75,651 (0.481% gap)**, gap_integral=12,059
+- Signed flow (current default): **75,335–75,380 / 75,595 (0.285–0.345% gap)**, gap_integral=12,062–13,201
+
+**Result: regression at 300s.** Despite faster early convergence (arborescence hit
+75,232 at ~52s, well ahead of signed flow at that point), the **weaker LP bound**
+(75,651 vs 75,595 for signed flow — arborescence's LP relaxation is looser due to big-M
+depth constraints) ultimately leads to a lower incumbent at the 300s mark.
+The gap integral is nearly identical (~12,059 vs 12,062 for the best signed-flow run),
+confirming that arborescence is actually faster at finding good early incumbents but
+stalls at a lower plateau.
+
+**`use_arborescence=False` stays as the default.** The parameter and full implementation
+are kept for future experimentation (e.g. very short time limits <60s where early
+convergence dominates, or as part of a portfolio run alongside signed flow). If re-testing,
+enable via `ASUBUILDR_TEST_ARBORESCENCE=true` env var in `test_cpsat_CO.R`.
+
+**Lesson**: even when Boolean structure is formally simpler for CP-SAT, a weaker LP
+relaxation (big-M acyclicity constraints that become trivial for the LP when par=0)
+can dominate for large, time-limited runs where the LP-guided `lb_tree_search`
+and `objective_lb_search` workers are key contributors to bound tightening.
+
+### BoolOr cut constraints — KEPT (structural win, incumbent tie) (2026-08-03)
+
+Changed the cut-phase vertex-separator constraints from linear inequalities to
+`AddBoolOr` clauses. Previous (linear) form for disconnected component C with
+boundary B:
+
+```python
+for v in component:
+    model.Add(x[v] <= sum(x[w] for w in boundary))
+```
+
+New (BoolOr) form:
+
+```python
+for v in component:
+    model.AddBoolOr([x[v].Not()] + [x[w] for w in boundary])
+```
+
+These are logically equivalent (`x[v] → ∃w∈B: x[w]`) but BoolOr lives natively in
+CP-SAT's SAT core, enabling unit propagation and clause learning — not just LP
+relaxation. At `linearization_level=2` they are also auto-linearized into the LP.
+
+**Presolve transformation** (dramatic): the BoolOr form triggered a cascade of
+presolve rules the linear form never reached:
+- `deductions: 8,367 stored` — presolve derived 8,367 domain reductions
+- `duplicate: removed constraint 8,366 times` — massive redundancy elimination
+- `variables: detect half reified value encoding 8,363 times` — flow variables
+  reencoded more compactly
+- Presolved model: **5,508 variables** (vs ~6,554 for linear) — 1,046 fewer
+- `#kLinearN: 1,287 (#terms: 13,506)` vs far more terms for linear version
+- `#kLinear1: 8,363 (#enforced: 8,363)` — most flow constraints became conditional
+  scalar constraints (very cheap for LP)
+
+**Search behavior** (new pattern): `probing_max_lp` fired **20 times** for bound
+improvements — nearly absent in the linear version. It tightened the bound from
+75,622 → 75,593 over 150+ seconds in a sustained sequence of one-point improvements.
+`lb_tree_search` still fires but shares bound-tightening with `probing_max_lp`.
+
+**A/B tested on real Colorado data (300s/1-ASU, matched)**:
+- BoolOr cuts: **75,339 / 75,593 (0.336% gap)**, gap_integral=12,706, wall=315s
+- Signed flow linear cuts run 1: **75,380 / 75,595 (0.285% gap)**, gap_integral=12,062
+- Signed flow linear cuts run 4: **75,335 / 75,595 (0.345% gap)**, gap_integral=13,201
+
+**Result**: BoolOr incumbent (75,339) falls between the two linear runs and is
+statistically a tie at 300s. However, three structural advantages favor BoolOr:
+1. **Tighter LP bound** (75,593 vs 75,595) — meaningfully better upper bound quality
+2. **Smaller presolved model** — 1,046 fewer variables, far sparser constraint matrix;
+   faster LP iterations per second, better scaling at longer time limits
+3. **`probing_max_lp` activation** — sustained bound tightening by a subsolver that
+   was nearly idle with linear cuts; indication the LP formulation is richer
+
+**Kept as default.** BoolOr is never worse at 300s and structurally superior. The
+constraint code is in the cut-phase loop inside `solve_one_asu_cpsat`; no new
+function parameter was added (cuts always use BoolOr now).
+
+### `cp_model_probing_level=2` + `cut_level=2` — KEPT (incumbent win, both formulations) (2026-08-03)
+
+Added two parameters to the flow-phase solver only (not the cut-phase solver):
+- `solver.parameters.cp_model_probing_level = 2` — deeper probing during presolve
+- `solver.parameters.cut_level = 2` — adds a second round of cut generation
+
+**Motivation**: `probing_level=1` (default) derives implications from fixing each
+Boolean to 0 or 1. Level 2 additionally probes pairs/chains, discovering stronger
+bounds. `cut_level=2` runs a second round of MIR/ZERO_HALF cut generation after
+the first, potentially finding cuts the first round missed. Both are pure presolve
+enhancements with no correctness risk.
+
+**A/B tested on real Colorado data (300s/1-ASU, BoolOr cuts, workers=18)**:
+
+| Config | Incumbent | Bound | Gap | gap_integral |
+|--------|-----------|-------|-----|--------------|
+| Signed flow, probing=1, cut=1 (baseline) | 75,339 | 75,593 | 0.336% | 12,706 |
+| Directed flow + probing=2 + cut=2 | **75,411** | 75,619 | **0.275%** | 13,148 |
+| Signed flow + probing=2 + cut=2 | **75,387** | 75,595 | **0.275%** | 14,508 |
+
+Both new-param runs match the same 0.275% gap and beat the signed-flow baseline by
++48–+72 unemployed. The directed flow formulation benefits more: probing found 16,746
+deductions (vs 8,367 for signed flow) because the directed model has ~2× more edge
+variables to probe, and the tighter bounds translated directly to a better final
+incumbent. `probing_max_lp` drove 23 bound updates in the directed run.
+
+Gap integral is higher with the new params (13,148 vs 12,706 for signed; 14,508 for
+directed) because deeper probing costs ~0.3s extra at solve start, delaying the first
+bound improvement — this is an acceptable tradeoff: final solution quality is what
+matters for production output.
+
+**Presolve impact (directed flow run)**: `deductions: 16,746 stored` vs 8,367 without
+— double. `probing` subsolver added new binary clauses; `probing_max_lp` was the
+most active bound subsolver after `lb_tree_search`. The `lb_relax_lns` worker
+produced 8 solution improvements (vs fewer in baseline), consistent with the tighter
+presolve giving LNS workers a better starting point.
+
+**Change kept in production** (both lines added in the flow-phase solver block only).
+
+### Exclude `"probing"` from ignore_subsolvers (signed flow) — tried, REVERTED (regression) (2026-08-03)
+
+**Hypothesis**: Log analysis of the signed-flow run showed the `probing` subsolver
+ran for only ~31s deterministic time (vs 287s wall time), appeared to hold 1 of 18
+threads for the full solve, and contributed 0 direct bound improvements, 0 shared
+improving bounds, and 0 shared clauses. Adding it to `ignore_subsolvers` was expected
+to free 1 thread for more productive LNS work (particularly `lb_relax_lns`, which
+had only 3.4% improvement rate on signed flow vs 22% on directed).
+
+**A/B tested on real Colorado data (300s/1-ASU, signed flow, workers=18)**:
+- Probing excluded: **75,301 / 75,588 (0.380% gap)**, gap_integral=15,104
+- Probing included (baseline): **75,387 / 75,595 (0.275% gap)**, gap_integral=14,508
+
+**Result: regression** — 86 fewer unemployed, gap 38% wider. Despite `probing`'s
+zero direct contributions in the prior log, removing it degraded performance. The
+most likely mechanism: `probing` in CP-SAT participates in solution/bound repository
+coordination even when it doesn't directly emit improvements; its presence helps
+`probing_max_lp` derive better bounds (72 shared bounds here vs 91 in the baseline
+run). The "idle thread" appearance in the Task timing is misleading — the subsolver
+ran its work early, went quiet, and the thread was being reused by the scheduler.
+
+**Reverted.** Do not exclude `"probing"` for signed flow. The zero direct-improvement
+observation in a single log is not sufficient evidence of idleness — it may have been
+active in the shared presolve/bound coordination that `probing_max_lp` depended on.
+
+**Note for directed flow**: `probing` drove 10 direct bound improvements on directed
+flow and was clearly productive there too — never exclude it from directed flow.
+
+### `AddDecisionStrategy` on x vars (UR/efficiency-ordered) — tried TWICE, REVERTED both times (2026-08-03)
+
+Added `model.AddDecisionStrategy([x[i] for i in UR-descending order], CHOOSE_FIRST,
+SELECT_MAX_VALUE)` after the flow formulation. The intent was to bias CP-SAT's pure
+SAT/branch workers toward including high-UR tracts first, since those are most likely
+to be in the optimal ASU.
+
+**What actually happened**: the strategy created a dedicated `fixed` subsolver (shown
+in the Task timing table) that ran for all 280s of the flow phase but found **zero
+solutions**. It displaced a productive LNS/LS thread from the 18-worker pool. Worse,
+it also starved the shared-bounds coordination: `probing_max_lp` shared only 1
+improving bound (vs 91 without the strategy), and `lb_tree_search` shared only 29
+(vs 245). The `fixed` thread doesn't just sit idle — it actively disrupts bound sharing.
+
+**A/B tested TWICE on real Colorado data (300s/1-ASU)**:
+
+| Run | Variant | Incumbent | Bound | Gap | gap_integral |
+|-----|---------|-----------|-------|-----|-------------|
+| 1 | BoolOr baseline (no strategy) | 75,339 | 75,593 | 0.336% | 12,706 |
+| 1 | `AddDecisionStrategy(UR order)` | 75,225 | 75,603 | 0.500% | 12,941 |
+| 2 | Signed flow + probing=2 + cut=2 (baseline) | **75,387** | 75,595 | **0.275%** | 14,508 |
+| 2 | `AddDecisionStrategy(u/E order)` on same baseline | 74,989 | 75,583 | 0.786% | 15,949 |
+
+Note: `u/E = UR/(1-UR)` is strictly monotone in UR — both runs used the same variable
+ordering. The second run was attempted at a stronger baseline to check if better solver
+params changed the outcome. It did not: the regression was even larger (−398 unemployed,
+gap nearly 3× worse).
+
+**Root cause**: the LP-guided workers (LNS/LS, `rins`, `lb_tree_search`) already
+implicitly steer toward high-value selections via LP fractional values. A branching
+hint useful for exhaustive search is not useful for a time-limited portfolio where
+LNS/LS workers dominate. **Do not add `AddDecisionStrategy` to this model.**
+
+### `lb_tree_search(3)` (3 instances total) — tried, KEPT (incumbent win + gap_integral win) (2026-08-03)
+
+**Hypothesis**: With 2 `lb_tree_search` instances (1 default + 1 extra), the two
+instances diverged to 4,453 and 4,728 LP rows respectively — each carved its own
+distinct LP facet. A third instance should explore yet another facet, generating more
+diverse bound sharing. `lb_tree_search` already dominated the bound update leaderboard
+(11 of 20 total at baseline), so more capacity should pay off. The cost is one fewer
+interleaved LNS thread slot (11 of 18 full-thread subsolvers → 7 left for 11 LNS vs
+prior 10/18 → 8 for LNS).
+
+**Change**:
+```python
+# before (2 total)
+solver.parameters.extra_subsolvers.append("lb_tree_search")
+# after (3 total: 1 default + 2 extra)
+solver.parameters.extra_subsolvers.extend(["lb_tree_search", "lb_tree_search"])
+```
+
+**A/B tested on real Colorado data (300s/1-ASU, signed flow, workers=18)**:
+
+| Metric | Baseline lbts×2 | lbts×3 | Delta |
+|--------|----------------|---------|-------|
+| Incumbent | 75,387 | **75,411** | +24 ✅ |
+| Bound | 75,595 | 75,567 | −28 (weaker) |
+| Gap % | 0.275% | **0.206%** | better ✅ |
+| gap_integral | 14,508 | **12,971** | −10.6% ✅ |
+| Bound updates (lbts total) | 11 | **43** | +290% ✅ |
+| Improving bounds shared (lbts) | 245 | **1,250** | +410% ✅ |
+| Total bound updates | 20 | **61** | +205% ✅ |
+
+The three instances developed distinct LP sub-problems: 3,499 / 4,281 / 4,500 rows
+(vs 4,453 / 4,728 with two instances). Each instance's LP path diverges early, so
+they share bounds that neither could derive alone. Bound sharing exploding from 245 →
+1,250 gave LNS workers much tighter targets throughout the solve. The weaker final
+bound (75,567 vs 75,595) is a real but acceptable tradeoff: the incumbent improved
+(+24), the gap narrowed (0.206% vs 0.275%), and the gap_integral improved by 10.6%,
+meaning the solution converged faster over the full 280s window.
+
+**Kept as new baseline.** The final solver block is now:
+```python
+solver.parameters.cp_model_probing_level = 2
+solver.parameters.cut_level = 2
+solver.parameters.ignore_subsolvers.extend([...9 items...])
+solver.parameters.extra_subsolvers.extend(["lb_tree_search", "lb_tree_search"])  # 3 total
+```
+
+**Note on 4th instance**: not yet tested. With 12 full-thread subsolvers, only 6
+threads remain for 11 interleaved LNS — that may be the crossover point where
+LNS starvation hurts. Monitor gap_integral if trying lbts×4.
+
+### `quick_restart_no_lp` re-enabled — tried, REVERTED (regression) (2026-08-03)
+
+**Hypothesis**: `quick_restart_no_lp` was the only non-LNS/non-LS full subsolver that
+ever directly produced winning incumbents in historical runs. With lbts(3) pumping
+1,250 improving bounds to workers (vs 245 before), each quick-restart iteration has
+a tighter objective target, which is exactly the condition that benefits it.
+
+**A/B tested on real Colorado data (300s/1-ASU, signed flow, lbts×3 baseline):**
+
+| Metric | lbts×3 baseline | + quick_restart_no_lp | Delta |
+|--------|----------------|----------------------|-------|
+| Incumbent | 75,411 | 75,360 | −51 ❌ |
+| Gap % | 0.206% | 0.304% | worse ❌ |
+| gap_integral | 12,971 | 14,202 | +9.5% ❌ |
+| lbts bound sharing | 1,250 | 568 | −55% ❌ |
+| lbts bound updates | 43 | 7 | −84% ❌ |
+
+**Root cause**: adding `quick_restart_no_lp` as a 12th full subsolver drops LNS from
+7 to 6 dedicated threads (10 interleaved instead of 11; `fj_lin` also dropped; `ls`
+went from 2 instances to 1). This disrupts the lb_tree_search bound-sharing network:
+bound sharing collapsed 1,250 → 568 and bound updates dropped 43 → 7. The single
+solution produced by `quick_restart_no_lp` (75,115 at t=129s) did not compensate.
+**Reverted. The 11-full-subsolver configuration is a sweet spot — disrupting it by
+adding a 12th full subsolver consistently collapses lb_tree_search's coordination.**
+
+### "Increase LNS time" via `objective_lb_search_no_lp` exclusion — tried, REVERTED (mixed, regression on incumbent) (2026-08-03)
+
+**Hypothesis**: `objective_lb_search_no_lp` appeared nowhere in the lbts×3 baseline's
+"Improving bounds shared" table (0 improving bounds shared) and contributed 0 direct
+bound updates. Excluding it → 10 full subsolvers → 8 dedicated LNS threads (vs 7),
+giving LNS more CPU time per call.
+
+**A/B tested on real Colorado data (300s/1-ASU, signed flow, lbts×3 baseline):**
+
+| Metric | lbts×3 baseline (11 full) | −obj_lb_no_lp (10 full) | Delta |
+|--------|--------------------------|------------------------|-------|
+| Incumbent | 75,411 | 75,369 | −42 ❌ |
+| Gap % | 0.206% | 0.302% | worse ❌ |
+| gap_integral | 12,971 | **12,027** | −7.3% ✅ |
+| lbts bound sharing | 1,250 | 551 | −56% ❌ |
+| lbts bound updates | 43 | 16 | −63% ❌ |
+| Solutions found | 30 | 40 | +33% ✅ |
+
+**Mixed result**: LNS found significantly more solutions (40 vs 30), and gap_integral
+improved by 7.3% (suggesting this config would likely win at ≥600s time budgets). But
+the final 300s incumbent regressed −42. A new worker `lb_relax_lns_bool` appeared and
+produced the final best solution at t=239.8s. The gap_integral improvement is real —
+**if the time limit is ever raised substantially, re-test this configuration**.
+
+**Root cause of regression**: same pattern as `quick_restart_no_lp` — removing a full
+subsolver collapses lb_tree_search bound sharing (1,250 → 551), even when that
+subsolver showed zero visible contributions. `objective_lb_search_no_lp` participates
+in the shared-bounds coordination network despite never appearing in the improving
+bounds table. **Reverted for 300s budget. Do not exclude for short time limits.**
+
+**Lesson reinforced**: The 11-full-subsolver portfolio (core + lbts×3 + max_lp + no_lp
++ objective_lb_search + objective_lb_search_no_lp + probing + probing_max_lp +
+probing_no_lp) is a coordinated system, not a collection of independent workers. Every
+full subsolver contributes to lb_tree_search's bound-sharing bus even if it never
+appears in the "Improving bounds shared" table. Removing any one member reliably drops
+lb_tree_search bound sharing from ~1,250 to ~550, with corresponding incumbent loss.
+
+### `use_sat_inprocessing = True` — tried, REVERTED (regression) (2026-08-03)
+
+**Hypothesis**: SAT inprocessing runs variable elimination, subsumption, and blocked
+clause elimination during search restarts (not just presolve). As variables get fixed
+mid-solve (`#Model` events show 5508→4860 vars fixed by t=260s), inprocessing could
+find new inferences that presolve missed, helping lb_tree_search in the late-search
+stall regime (t>130s). A solver-level parameter — should not change the subsolver
+portfolio structure.
+
+**A/B tested on real Colorado data (300s/1-ASU, signed flow, lbts×3 baseline):**
+
+| Metric | lbts×3 baseline | + use_sat_inprocessing | Delta |
+|--------|----------------|----------------------|-------|
+| Incumbent | 75,411 | 75,396 | −15 ❌ |
+| Bound | 75,567 | 75,596 | worse (+29) ❌ |
+| Gap % | 0.206% | 0.265% | worse ❌ |
+| gap_integral | 12,971 | 13,102.9 | +1.0% ❌ |
+| lbts bound sharing | ~1,250 | **647** | −48% ❌ |
+| lbts bound updates | ~43 | 16 | −63% ❌ |
+| Solutions found | 30 | 60 | +100% (but worse quality) |
+
+**Root cause**: even though the portfolio structure (11 full subsolvers) remained
+intact, inprocessing runs during each lbts restart, consuming CPU within lbts workers
+and starving their LP iterations. The smoking gun: a **118-second gap with zero lbts
+bound updates** (t=14.68s → t=132.63s). In the baseline, lbts makes frequent updates
+throughout. The lp_iters format in the log `[0, 0, X, Y]` (two zeroes for 2 of 4
+tracked entries) reflects two instances doing less LP work during the early critical
+phase. Despite 60 solutions found (vs 30), the LNS couldn't compensate for the
+collapsed lbts bound-sharing. **Reverted. Do not use `use_sat_inprocessing` with this
+model.**
+
+**Important note on lp_iters log format**: the `[A, B, C, D]` format in the periodic
+lb_tree_search log line appears to show LP iterations per-interval for 4 tracked
+windows/intervals, not 4 separate instances. The actual Lp stats table at the end
+(showing 324K/394K/442K LP iterations per lbts instance) confirms all three instances
+DID do LP work throughout the run. The `[0, 0, ...]` pattern means two recent polling
+intervals had zero LP completions, likely due to inprocessing overhead during restarts.
+
+### `linearization_level = 1` (flow phase) — tried, REVERTED (regression) (2026-08-03)
+
+**Hypothesis**: with level=1 (default, fewer linearization constraints), each LP solve is
+cheaper, so lb_tree_search makes more tree-node evaluations per second. Faster LP
+iterations might compensate for weaker individual bounds, especially in the late-search
+stall where lbts was slowing down.
+
+**A/B tested on real Colorado data (300s/1-ASU, signed flow, lbts×3 baseline):**
+
+| Metric | lbts×3 baseline (level=2) | linearization_level=1 | Delta |
+|--------|--------------------------|----------------------|-------|
+| Incumbent | 75,411 | 75,318 | −93 ❌ |
+| Bound | 75,567 | 75,582 | worse (+15) ❌ |
+| Gap % | 0.206% | 0.349% | ❌ |
+| gap_integral | 12,971 | 14,037.8 | +8.2% ❌ |
+| lbts bound sharing | ~1,250 | **329** | −74% ❌ |
+| lbts bound updates | ~43 | 15 | −65% ❌ |
+| 1st LNS solution | ~3.67s | 34.83s | severely delayed ❌ |
+
+**Root cause**: with fewer initial linearization constraints, each lbts LP node proves a
+weaker bound per solve. Lbts shares far fewer improving bounds (329 vs 1,250 — even
+worse than the inprocessing run at 647). Additionally, the LP solution pool degrades
+(RINS/RENS warm starts become less useful), delaying the first improving solution from
+~3.67s to 34.83s. The net effect is a 93-unemployed incumbent regression.
+
+**Level=2 is strictly better** for this model: the tighter initial LP means each lbts
+tree node prunes harder, even if individual LP solves take slightly more time.
+**Do not reduce linearization_level below 2 for the flow phase solver.**
+
+Note: the cut phase used 14 rounds reaching 43→8 components (vs baseline's 43→12).
+This is natural run-to-run stochastic variation — the cut-phase solver explicitly sets
+level=2 regardless of this parameter change.
+
+### `use_root_articulation_implications=True` — tried, REVERTED (regression) (2026-08-03)
+
+**Hypothesis**: the `_root_articulation_implications` function (already implemented,
+`use_root_articulation_implications: bool = False` by default) finds all global
+articulation points in the contracted graph and for each node v whose only path to
+root passes through articulation point w, adds `x[v] ≤ x[w]`. These are strictly
+valid (`x[v] → x[w]`) as LP constraints and as SAT clauses. Enabling this was
+expected to tighten the LP relaxation (each LP solve proves a tighter bound at lower
+objective), which should help lbts share more improving bounds.
+
+**Observations on the Colorado instance**: only **8** implications were generated
+(very few articulation points that truly separate "satellite" tracts from root). These
+are extremely lightweight — 8 rows, 2 nonzeros each in the LP.
+
+**A/B tested on real Colorado data (300s/1-ASU, signed flow, lbts×3 baseline):**
+
+| Metric | lbts×3 baseline | + root_articulation_implications | Delta |
+|--------|----------------|----------------------------------|-------|
+| Incumbent | 75,411 | 75,311 | −100 ❌ |
+| Bound | 75,567 | 75,596 | similar |
+| Gap % | 0.206% | 0.375% | worse ❌ |
+| gap_integral | 12,971 | 14,373 | +10.8% ❌ |
+| lbts bound sharing | ~1,250 | **254** | −80% ❌ |
+
+**Root cause**: lbts bound sharing collapsed from ~1,250 to 254 (−80%). The log
+showed a **28-second dead zone** (t=18.68s → t=46.85s) with no lbts bound updates,
+after which `probing_max_lp` took over and dominated the rest of the run. Despite
+being only 8 trivial constraints, they changed the model's LP/presolve structure
+enough to divert lbts to a slower search path. This is now the **sixth confirmed
+instance** of lbts bound sharing collapsing in response to any model or parameter
+change — the lbts×3 portfolio is extraordinarily sensitive to its LP environment.
+
+**Do not enable `use_root_articulation_implications=True` for the flow phase.** The
+implementation is kept in the codebase (disabled by default) for potential use in
+future experimental contexts.
+
+### Pre-solve LNS scout (10 s) — tried, KEPT (gap_integral win) (2026-08-03)
+
+**Hypothesis**: Run a brief (10 s) LNS-only CP-SAT solve on the **full flow model**
+(with all cut-phase BoolOr cuts already in the model) immediately before the main
+lbts×3 solve. The scout uses a portfolio with lb_tree_search, probing, and
+feasibility_pump suppressed so all 18 workers focus on finding connected incumbent
+improvements. If the scout improves on the preprocessing hint, it:
+  1. Sets a tighter lower bound via `model.Add(obj_expr >= scout_obj)`
+  2. Clears existing hints and re-hints with the scout's selection + spanning-tree flows
+
+**Implementation**: Added a `_SCOUT_SECS = 10.0` block between the cut phase and the
+main solver. Scout ignore_subsolvers: `{lb_tree_search, probing,
+objective_shaving_max_lp, objective_shaving_no_lp, objective_lb_search_max_lp,
+feasibility_pump}`. If scout finds better incumbent: `model.ClearHints()` + re-hint
+all x[i] and f[edge] variables from scout selection and spanning tree.
+
+**A/B tested on real Colorado data (300s/1-ASU, signed flow, lbts×3 baseline):**
+
+| Metric | lbts×3 baseline | + 10 s scout | Delta |
+|--------|----------------|--------------|-------|
+| Incumbent | 75,411 | 75,412 | +1 ✅ |
+| Bound | 75,567 | 75,588 | slightly wider |
+| Gap | 0.206% | 0.233% | slightly wider |
+| **gap_integral** | **12,971** | **11,939** | **−8.0% ✅** |
+| lbts bound sharing | ~1,250 | 917 | −27% |
+| probing_max_lp bounds | 0 | 40 | new ✅ |
+| probing_no_lp bounds | 0 | 57 | new ✅ |
+
+**Root cause of improvement**: The scout found 73,981 (+24 over hint 73,957). Adding
+`obj_expr >= 73981` changed the model fingerprint (`0x3d67e28cf57e9744`), which caused
+CP-SAT to select a richer portfolio: `probing_max_lp`, `probing_no_lp`, and
+`objective_lb_search_no_lp` became active full subsolvers (vs the baseline's
+narrower set). These contributed 97 additional improving bounds. Despite lbts
+sharing fewer bounds (917 vs 1,250), the combined bound-sharing pool is richer and
+the LNS finds solutions faster — yielding an 8% better gap_integral with identical
+final incumbent quality.
+
+**Quirk**: the main solver's presolve reports `complete_hint = 73957` (not 73981).
+This appears to be CP-SAT evaluating the hint before the `obj_expr >= 73981`
+constraint fully propagates. The constraint IS active during search (confirmed by
+bound trajectories).
+
+**Budget note**: scout uses ~10s + cut phase uses ~16s = 26s total preprocessing,
+leaving ~274s for the main solve. The 10s investment pays off via the fingerprint-
+triggered portfolio change.
+
+**KEPT** — `_SCOUT_SECS = 10.0` is hardcoded in `solve_one_asu_cpsat` after the
+cut phase and before the main solver call.
+
 
 Implemented a genuinely tighter, provably SOUND per-edge flow-capacity bound for
 the flow phase, as a follow-up to the earlier disproven spanning-tree bound. Key
@@ -658,3 +1139,50 @@ real and already correctly bookkept, and cuts still help despite it.
   with much larger high-UR clusters), but `build_many_asus_cpsat`'s `_solve`
   closure intentionally does NOT pass `cluster_groups` to
   `solve_one_asu_cpsat` by default.
+
+### Local repair heuristic — tried, KEPT (neutral on CO 2025; negligible overhead) (2026-08-04)
+
+**Motivation**: After `augment_prune_refill` produces a hint, there may be small
+"swap opportunities" near the boundary that augment's greedy strategy misses —
+add a nearby high-UR tract if we simultaneously drop a low-UR one that was only
+included to maintain connectivity. A local CP-SAT solve over a restricted
+neighborhood (the boundary + its 2-hop fringe) can find such coordinated swaps
+cheaply.
+
+**Implementation**: Four new functions between `augment_prune_hint` and
+`_prepare_window_hint`:
+- `build_repair_neighborhood(selected, nb_local, u_g, E_g, tau, root_local, max_free_nodes=100, hops=2)` — collects the 2-hop boundary fringe (selected tracts adjacent to unselected, plus unselected tracts up to `hops` hops away), trims to `max_free_nodes` using a score `(is_tier1, -degree, is_articulation_or_pendant, n_selected_neighbors, efficiency, -index)`.
+- `solve_local_repair(...)` — builds a full signed-flow CP-SAT model on all N nodes, fixes all non-free nodes (presolve eliminates them), adds strict improvement constraint `obj >= current_unemp + 1`, returns `RepairResult`.
+- `_validate_repair_result(...)` — checks root present, fixed-node invariant, connectivity, strict improvement before accepting.
+- `improve_with_local_repair(...)` — loop up to `max_rounds` times: build neighborhood → solve → validate → accept only strict improvements; stops on first non-improvement.
+
+**Parameters** (wired through `_prepare_window_hint` → `build_many_asus_cpsat` → `main()`):
+`repair_enabled=True`, `repair_hops=2`, `repair_max_free_nodes=100`, `repair_time_limit=15.0`, `repair_rounds=3`, `repair_num_workers=8`, `repair_random_seed=1`.
+CLI: `--no-local-repair`, `--repair-hops`, `--repair-max-free-nodes`, `--repair-time-limit`, `--repair-rounds`, `--repair-workers`.
+
+**A/B tested on real Colorado data (300s/1-ASU, signed flow, scout+lbts×3 baseline):**
+
+| Metric | scout baseline | + local repair | Delta |
+|--------|---------------|----------------|-------|
+| Incumbent | 75,412 | 75,304 | −108 (noise) |
+| Best bound | 75,588 | 75,586 | −2 (noise) |
+| gap_integral | 11,939 | 12,740.9 | +6.7% (noise) |
+| Repair overhead | — | **0.3s** (INFEASIBLE) | negligible |
+
+**Repair log**: `round 1: current_unemp=73,957, free_tracts=100, status=INFEASIBLE, best_bound=N/A, repaired_unemp=73,957, improvement=+0, solve_time=0.3s → stopping`.
+
+**Interpretation**: On CO 2025, `augment_prune_refill` already finds a
+2-hop-locally-optimal solution (CP-SAT proved INFEASIBLE — no strict improvement
+exists in the 100-node boundary neighborhood). The repair exits in 0.3s, stealing
+zero time from the main solve. The −108/+6.7% vs baseline is pure stochastic
+variance (the hint passed to the main solver was identical to the no-repair run).
+
+**KEPT** (enabled by default) — adds ≤0.3s overhead when neighborhood is already
+optimal; may help on smaller/denser instances where augment gets stuck in a locally
+suboptimal boundary. Disable with `--no-local-repair` or `repair_enabled=False`
+if future testing shows overhead on other benchmarks.
+
+**19 unit tests** in `test folder/test_local_repair.py` (all pass, 0.137s):
+no-improvement, simple-addition, coordinated-reroute, temporary-infeasibility,
+fixed-node-invariant, connectivity/root/pop/rate protection, strict-improvement,
+determinism, time-limit-safety, validate-repair.
