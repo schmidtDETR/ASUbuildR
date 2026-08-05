@@ -36,7 +36,7 @@ jobs:
     timeout-minutes: 45
     env:
       GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
-      RETICULATE_MINICONDA_PATH: ${{ runner.temp }}\asubuildr-miniconda
+      RETICULATE_MINICONDA_PATH: "${{ github.workspace }}/.ci-miniconda"
 
     steps:
       - uses: actions/checkout@v4
