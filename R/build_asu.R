@@ -22,19 +22,20 @@ build_asu <- function(
     rel_gap = NA_real_,
     verbose = interactive()
 ) {
-  asu_use_python(required = FALSE)
+  asu_use_python(required = TRUE)
   if (!reticulate::py_module_available("ortools"))
     stop("Python env missing 'ortools'. Run ASUbuildR::setup_asu_python() first.")
 
   # Normalize neighbor indexing to 0-based
   if (is.null(neighbors)) stop("Provide `neighbors` as a list of integer vectors (contiguity).")
   n <- nrow(df)
-  nb <- lapply(neighbors, function(v) {
-    v <- as.integer(v)
-    if (length(v) == 0) return(integer())
-    # if any index >= n, assume 1-based and convert
-    if (max(v, na.rm = TRUE) >= n) v <- v - 1L
-    v[v >= 0L & v < n]
+  nb <- lapply(neighbors, as.integer)
+  all_indices <- unlist(nb, use.names = FALSE)
+  one_based <- length(all_indices) > 0L && !any(all_indices == 0L) &&
+    all(all_indices >= 1L & all_indices <= n)
+  if (one_based) nb <- lapply(nb, function(v) v - 1L)
+  nb <- lapply(nb, function(v) {
+    as.list(v[v >= 0L & v < n])
   })
 
   # Load python module and call

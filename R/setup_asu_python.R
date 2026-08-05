@@ -45,7 +45,8 @@ setup_asu_python <- function(force = FALSE) {
 
   # Determine whether conda is available; if not, install Miniconda
   conda_bin <- tryCatch(reticulate::conda_binary(), error = function(e) "")
-  have_conda <- length(conda_bin) == 1L && !is.na(conda_bin) && nzchar(conda_bin)
+  have_conda <- length(conda_bin) == 1L && !is.na(conda_bin) &&
+    nzchar(conda_bin) && file.exists(conda_bin)
   just_installed <- FALSE
   if (!have_conda) {
     message("Conda not found. Installing Miniconda...")
@@ -61,7 +62,12 @@ setup_asu_python <- function(force = FALSE) {
   }
 
   # Path to conda executable (re-resolved in case Miniconda was just installed)
-  conda_bin <- reticulate::conda_binary()
+  conda_bin <- tryCatch(reticulate::conda_binary(), error = function(e) "")
+  if (length(conda_bin) != 1L || is.na(conda_bin) || !nzchar(conda_bin) ||
+      !file.exists(conda_bin)) {
+    stop("Miniconda installation did not provide a usable conda executable.",
+         call. = FALSE)
+  }
 
   # Remove existing environment if force = TRUE
   envs <- reticulate::conda_list()$name

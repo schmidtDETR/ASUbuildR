@@ -1,0 +1,119 @@
+name: Python environment smoke test
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 9 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - DESCRIPTION
+      - R/setup_asu_python.R
+      - R/asu_python_bridge.R
+      - R/build_asu.R
+      - inst/python/**
+      - .github/workflows/python-setup-smoke.yaml
+  pull_request:
+    paths:
+      - DESCRIPTION
+      - R/setup_asu_python.R
+      - R/asu_python_bridge.R
+      - R/build_asu.R
+      - inst/python/**
+      - .github/workflows/python-setup-smoke.yaml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-setup-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clean-windows-bootstrap:
+    name: Clean Windows bootstrap
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+      RETICULATE_MINICONDA_PATH: ${{ runner.temp }}\asubuildr-miniconda
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          needs: check
+
+      - name: Install ASUbuildR from source
+        shell: Rscript {0}
+        run: |
+          install.packages(".", repos = NULL, type = "source")
+
+      - name: Bootstrap Python and solver dependencies
+        shell: Rscript {0}
+        run: |
+          miniconda_root <- Sys.getenv("RETICULATE_MINICONDA_PATH")
+          unlink(miniconda_root, recursive = TRUE, force = TRUE)
+          stopifnot(!dir.exists(miniconda_root))
+
+          windows_root <- Sys.getenv("SystemRoot")
+          clean_path <- c(
+            file.path(windows_root, "System32"),
+            windows_root,
+            file.path(windows_root, "System32", "Wbem")
+          )
+          Sys.setenv(PATH = paste(clean_path, collapse = .Platform$path.sep))
+
+          stopifnot(!nzchar(Sys.which("python")))
+          stopifnot(!nzchar(Sys.which("python3")))
+          conda_before <- tryCatch(
+            reticulate::conda_binary(),
+            error = function(e) ""
+          )
+          stopifnot(!nzchar(conda_before) || !file.exists(conda_before))
+
+          ASUbuildR::setup_asu_python()
+          stopifnot(ASUbuildR::check_asu_python())
+
+          required <- c("numpy", "pandas", "networkx", "ortools", "openpyxl")
+          available <- vapply(
+            required,
+            reticulate::py_module_available,
+            logical(1)
+          )
+          stopifnot(all(available))
+
+          config <- reticulate::py_config()
+          expected_root <- normalizePath(miniconda_root, winslash = "/")
+          selected_python <- normalizePath(config$python, winslash = "/")
+          stopifnot(startsWith(tolower(selected_python), tolower(expected_root)))
+          stopifnot(startsWith(as.character(config$version), "3.11"))
+
+          solver <- ASUbuildR:::asu_load_py()
+          stopifnot(is.function(solver[["build_many_asus_cpsat"]]))
+
+          input <- data.frame(
+            geoid = c("a", "b"),
+            tract_ASU_unemp = c(10L, 8L),
+            tract_ASU_emp = c(90L, 92L),
+            tract_pop2024 = c(1000L, 1000L)
+          )
+          result <- ASUbuildR::build_asu(
+            input,
+            neighbors = list(1L, 0L),
+            tau = 0.05,
+            pop_thresh = 1000L,
+            max_asus = 1L,
+            time_limit = 5L,
+            workers = 1L,
+            verbose = FALSE
+          )
+          stopifnot(nrow(result) == 2L, "asu_id" %in% names(result))
+
+          ASUbuildR::setup_asu_python()
+          stopifnot(ASUbuildR::check_asu_python())

@@ -6,6 +6,8 @@
 <!-- badges: start -->
 
 [![R-CMD-check](https://github.com/aisolori/ASUbuildR/actions/workflows/R-CMD-check.yaml/badge.svg)](https://github.com/aisolori/ASUbuildR/actions/workflows/R-CMD-check.yaml)
+[![Python environment smoke
+test](https://github.com/aisolori/ASUbuildR/actions/workflows/python-setup-smoke.yaml/badge.svg)](https://github.com/aisolori/ASUbuildR/actions/workflows/python-setup-smoke.yaml)
 <!-- badges: end -->
 
 ASUbuildR provides an interactive dashboard for constructing Areas of
