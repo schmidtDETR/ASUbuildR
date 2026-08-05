@@ -171,8 +171,8 @@ check_asu_python <- function() {
     return(FALSE)
   }
 
-  required <- c("numpy", "pandas", "networkx", "ortools")
-  available <- sapply(required, reticulate::py_module_available)
+  required <- c("numpy", "pandas", "networkx", "ortools", "openpyxl")
+  available <- vapply(required, reticulate::py_module_available, logical(1))
 
   if (all(available)) {
     message("Python environment is properly configured")

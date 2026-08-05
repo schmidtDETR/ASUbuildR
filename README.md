@@ -1,8 +1,11 @@
+
 <!-- README.md is generated from README.Rmd. Please edit that file -->
 
 # ASUbuildR
 
 <!-- badges: start -->
+
+[![R-CMD-check](https://github.com/aisolori/ASUbuildR/actions/workflows/R-CMD-check.yaml/badge.svg)](https://github.com/aisolori/ASUbuildR/actions/workflows/R-CMD-check.yaml)
 <!-- badges: end -->
 
 ASUbuildR provides an interactive dashboard for constructing Areas of
@@ -20,17 +23,27 @@ Install the package directly from GitHub with
 [pak](https://pak.r-lib.org/):
 
 ``` r
-# install.packages("pak")
+# Run this once if pak is not installed:
+install.packages("pak")
+
 pak::pak("aisolori/ASUbuildR")
 ```
+
 ASUbuildR requires R 4.1 or later and Pandoc, which is included with
-RStudio and Quarto. The CP-SAT solver also uses Python 3.9 or later with
-OR-Tools, NumPy, pandas, and NetworkX. Configure those Python
-dependencies once after installing the R package:
+RStudio and Quarto. Tract Hunter and Simple Snake require no separate
+Python setup.
+
+The optional CP-SAT solver uses a managed Python 3.11 environment with
+OR-Tools, NumPy, pandas, NetworkX, and openpyxl. Configure it once after
+installing the R package:
 
 ``` r
 ASUbuildR::setup_asu_python()
+ASUbuildR::check_asu_python()
 ```
+
+The first setup can take several minutes because it installs Miniconda
+when Conda is not already available.
 
 ## Running the Application
 
@@ -39,3 +52,8 @@ Launch the interactive dashboard with:
 ``` r
 ASUbuildR::launch_ASUbuildR()
 ```
+
+Within the dashboard, import the state BLS ASU workbook, choose Census
+tract boundaries for the matching year, build an initial solution,
+refine tract assignments on the map, and validate and export the
+completed ASUs.

@@ -4,7 +4,7 @@
 .Ruserdata
 inst/doc
 .Rproj
-inst/shinny_app/_tigris_cache/
+inst/shiny_app/_tigris_cache/
 ASUbuildR.Rproj
 inst/Tract Hunter V3.Rmd
 *.o
