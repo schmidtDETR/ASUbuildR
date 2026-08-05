@@ -179,6 +179,7 @@ cpsat_df_csv     <- shiny::reactiveVal(NULL)
 cpsat_nb_json    <- shiny::reactiveVal(NULL)
 cpsat_out_json   <- shiny::reactiveVal(NULL)
 cpsat_log_file   <- shiny::reactiveVal(NULL)
+cpsat_log_saved  <- shiny::reactiveVal(NULL)
 cpsat_running <- shiny::reactiveVal(FALSE)
 
 append_cpsat_log <- function(...) {
@@ -188,6 +189,8 @@ append_cpsat_log <- function(...) {
   if (nchar(new) > 12000) new <- substr(new, nchar(new) - 11999, nchar(new))
   cpsat_log_buf(new)
   output$cpsat_log_tail <- shiny::renderText(new)
+  lf <- cpsat_log_file()
+  if (!is.null(lf)) try(cat(line, "\n", file = lf, append = TRUE), silent = TRUE)
 }
 
 # keep log output live even if hidden
@@ -369,9 +372,7 @@ update_map_efficiently <- function(map_id = "edit_map") {
           default = "#E0E0E0"
         )
       ) |>
-      mapgl::set_source(layer_id = "selected", source = data) |>
       mapgl::set_filter("selected", build_filter(sel)) |>
-      mapgl::set_source(layer_id = "highlighted", source = data) |>
       mapgl::set_filter("highlighted", build_filter(hl))
   } else {
     # For read-only maps (initial_map), update source data AND paint property.
@@ -428,7 +429,7 @@ update_map_with_data <- function(map_id = "edit_map", new_data = NULL) {
         id = "selected",
         source = data,
         line_color = "red",
-        line_width = 2,
+        line_width = 4,
         line_opacity = 1,
         filter = list("==", c("get", "GEOID"), "__NONE__")
       ) |>
@@ -623,7 +624,11 @@ shiny::conditionalPanel(
     shiny::numericInput("cpsat_max",       "Max ASUs",                  value = 30,     min = 1, step = 1),
     shiny::numericInput("cpsat_timelimit", "Time limit (sec) per window", value = 18000, min = 0, step = 60),
     shiny::numericInput("cpsat_workers",   "Parallel workers (Defaults to Number of Dectected Cores - 2)",          value = max(1, parallel::detectCores()-2), min = 1, step = 1),
-    shiny::numericInput("cpsat_relgap",    "Relative gap (optional)",   value = NULL,   min = 0, step = 0.0001)
+    shiny::numericInput("cpsat_relgap",        "Relative gap (optional)",    value = NULL, min = 0, step = 0.0001),
+    shiny::hr(style = "margin: 0.4rem 0;"),
+    shiny::numericInput("cpsat_repair_rounds",   "Repair rounds",              value = 3,    min = 0, step = 1),
+    shiny::numericInput("cpsat_repair_timelimit", "Repair time limit (sec)",   value = 60,   min = 0, step = 5),
+    shiny::uiOutput("cpsat_log_link")
   )
 )
 
@@ -834,10 +839,12 @@ if (identical(algo_choice, "cpsat")) {
     max_asus <- if (is.null(input$cpsat_max))       30     else as.integer(input$cpsat_max)
     tlimit   <- if (is.null(input$cpsat_timelimit)) 1200   else as.integer(input$cpsat_timelimit)
     workers  <- if (is.null(input$cpsat_workers))   max(1L, parallel::detectCores()-5L) else as.integer(input$cpsat_workers)
-    rel_gap  <- if (!is.null(input$cpsat_relgap) && !is.na(input$cpsat_relgap)) as.numeric(input$cpsat_relgap) else NA_real_
-    append_cpsat_log(sprintf("[run] params: tau=%.6f pop=%d max=%d limit=%ds workers=%d rel_gap=%s",
+    rel_gap       <- if (!is.null(input$cpsat_relgap) && !is.na(input$cpsat_relgap)) as.numeric(input$cpsat_relgap) else NA_real_
+    repair_rounds <- if (is.null(input$cpsat_repair_rounds))    3L  else as.integer(input$cpsat_repair_rounds)
+    repair_tlimit <- if (is.null(input$cpsat_repair_timelimit)) 60  else as.numeric(input$cpsat_repair_timelimit)
+    append_cpsat_log(sprintf("[run] params: tau=%.6f pop=%d max=%d limit=%ds workers=%d rel_gap=%s repair_rounds=%d repair_tlimit=%.0fs",
                              tau, pop_thr, max_asus, tlimit, workers,
-                             if (is.na(rel_gap)) "None" else as.character(rel_gap)))
+                             if (is.na(rel_gap)) "None" else as.character(rel_gap), repair_rounds, repair_tlimit))
     # ---- 2) Build tracts + neighbors ----------------------------------
     shiny::incProgress(0.15, detail = "Downloading tracts & building neighbors")
     append_cpsat_log(sprintf("[NB] Downloading TIGER tracts for state %s (year=%s)…", st_fips, sel_year))
@@ -941,11 +948,13 @@ if (identical(algo_choice, "cpsat")) {
     utils::write.csv(df_py, df_csv, row.names = FALSE)
     jsonlite::write_json(nb_lists, nb_json, auto_unbox = TRUE)
 
+    log_file <- file.path(run_dir, "solver.log")
     cpsat_run_dir(run_dir)
     cpsat_df_csv(df_csv)
     cpsat_nb_json(nb_json)
     cpsat_out_json(out_json)
-    cpsat_log_file(NULL)   # streaming logs; no file needed
+    cpsat_log_file(log_file)
+    cpsat_log_saved(NULL)
 
     append_cpsat_log(paste0("[run] Folder: ", run_dir))
     append_cpsat_log(paste0("[run] df.csv: ", df_csv))
@@ -986,6 +995,9 @@ kwargs = dict(
 REL = %s
 if REL is not None and not (isinstance(REL, float) and math.isnan(REL)):
     kwargs['rel_gap'] = REL
+kwargs['repair_enabled'] = %s
+kwargs['repair_rounds']  = %d
+kwargs['repair_time_limit'] = %s
 print('[runner] launching CP-SAT…', flush=True)
 res = build_many_asus_cpsat(**kwargs)
 print('[runner] solver finished; writing json', flush=True)
@@ -999,6 +1011,7 @@ print('[runner] OK', flush=True)
       py_mod_path, df_csv, nb_json,
       format(tau, scientific = FALSE), pop_thr, max_asus, tlimit, workers,
       if (is.na(rel_gap)) "None" else as.character(rel_gap),
+      if (repair_rounds > 0L) "True" else "False", repair_rounds, repair_tlimit,
       out_json
     )
     writeLines(runner_code, runner)
@@ -1113,6 +1126,9 @@ print('[runner] OK', flush=True)
           append_cpsat_log("[run][error] Solver failed or out.json missing.")
         }
 
+        lf <- cpsat_log_file()
+        if (!is.null(lf) && file.exists(lf)) cpsat_log_saved(lf)
+        cpsat_log_file(NULL)
         cpsat_running(FALSE)
       }
     })
@@ -1241,6 +1257,50 @@ output$log_overlay <- shiny::renderUI({
 # Add this observer to handle closing the log manually
 shiny::observeEvent(input$close_log, {
   cpsat_running(FALSE)
+})
+
+output$cpsat_log_saved_banner <- shiny::renderUI({
+  lf <- cpsat_log_saved()
+  if (is.null(lf)) return(NULL)
+  shiny::div(
+    style = "position:fixed; bottom:20px; right:20px; z-index:1100; background:#f0f8ff; border:1px solid #4a90d9; border-radius:4px; padding:10px 14px; font-size:13px; box-shadow:0 2px 8px rgba(0,0,0,.2); max-width:520px;",
+    shiny::strong("Solver log saved:"), shiny::br(),
+    shiny::span(style = "font-family:monospace; font-size:11px; word-break:break-all;", lf),
+    shiny::br(), shiny::br(),
+    shiny::actionButton("open_log_folder", "Open folder", class = "btn-xs btn-info", style = "margin-right:6px;"),
+    shiny::actionButton("open_log_file",   "Open log",    class = "btn-xs btn-default")
+  )
+})
+
+output$cpsat_log_link <- shiny::renderUI({
+  lf <- cpsat_log_saved()
+  if (is.null(lf)) return(NULL)
+  shiny::tagList(
+    shiny::hr(style = "margin: 0.4rem 0;"),
+    shiny::div(style = "font-size:11px; color:#555; margin-bottom:4px;", "Last log:"),
+    shiny::div(style = "font-family:monospace; font-size:10px; word-break:break-all; color:#333; margin-bottom:6px;", lf),
+    shiny::div(
+      shiny::actionButton("open_log_folder2", "Open folder", class = "btn-xs btn-info", style = "margin-right:4px;"),
+      shiny::actionButton("open_log_file2",   "Open log",    class = "btn-xs btn-default")
+    )
+  )
+})
+
+shiny::observeEvent(input$open_log_folder, {
+  lf <- cpsat_log_saved()
+  if (!is.null(lf)) try(shell.exec(dirname(normalizePath(lf, mustWork = FALSE))), silent = TRUE)
+})
+shiny::observeEvent(input$open_log_file, {
+  lf <- cpsat_log_saved()
+  if (!is.null(lf) && file.exists(lf)) try(shell.exec(normalizePath(lf)), silent = TRUE)
+})
+shiny::observeEvent(input$open_log_folder2, {
+  lf <- cpsat_log_saved()
+  if (!is.null(lf)) try(shell.exec(dirname(normalizePath(lf, mustWork = FALSE))), silent = TRUE)
+})
+shiny::observeEvent(input$open_log_file2, {
+  lf <- cpsat_log_saved()
+  if (!is.null(lf) && file.exists(lf)) try(shell.exec(normalizePath(lf)), silent = TRUE)
 })
 
 # Make sure the log text stays updated
@@ -1385,6 +1445,7 @@ shiny::actionButton("reset", "Reset to Initial Data")
 ```{r}
 # The map
   mapgl::maplibreOutput("edit_map", height = "100vh")
+  shiny::uiOutput("cpsat_log_saved_banner")
   
 output$edit_map <- mapgl::renderMaplibre({
 
@@ -1436,7 +1497,7 @@ output$edit_map <- mapgl::renderMaplibre({
       id = "selected",
       source = data,
       line_color = "red",
-      line_width = 2,
+      line_width = 4,
       line_opacity = 1,
       filter = list("==", c("get", "GEOID"), "__NONE__")
     ) |>

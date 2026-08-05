@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import heapq
 import json
 import math
 import os
@@ -1080,8 +1081,7 @@ def solve_one_asu_cpsat(
             "probing_max_lp",
             "lb_tree_search",
             #"probing_no_lp",
-            #"graph_arc_lns",
-            "graph*",
+            "graph_arc_lns",
             "ls_lin*",
         ])
         # solver.parameters.ignore_subsolvers.extend([
@@ -1513,6 +1513,254 @@ def _drop_redundant_zero_tracts(
         S.remove(removable[0])
 
 
+def articulation_reroute(
+    S0: List[int],
+    u: np.ndarray,
+    E: np.ndarray,
+    P: np.ndarray,
+    nb: List[List[int]],
+    tau: float,
+    pop_thresh: int,
+    root_local: int,
+    lambda_value: float = 2.2,
+    max_removed_bundle: int = 5,
+    max_reroute_candidates: int = 20,
+    protected: Optional[List[int]] = None,
+    refill_candidates: int = 32,
+    beam_width: int = 512,
+    time_limit_s: float = 30.0,
+) -> List[int]:
+    """
+    Articulation-point rerouting heuristic.
+
+    Identifies low-value connector bundles in the current selection and replaces
+    them with alternative paths through more economically productive tracts.
+
+    For each candidate bundle (articulation point + pendant branch, up to
+    max_removed_bundle nodes):
+    1. Remove the bundle from the selection.
+    2. Find cheapest reconnecting paths via multi-source Dijkstra, where each
+       unselected node v has path_cost = max(epsilon, -economic_value[v]) and
+       already-selected nodes in S_remaining are traversed for free.
+    3. Accept if delta_unemployment > 0 and all constraints are met.
+    4. Refill released rate slack with beam search and drop redundant zero tracts.
+
+    Economic score:
+        cap_cost[i]      = tau * emp[i] - (1 - tau) * unemp[i]  (> 0 iff UR < tau)
+        economic_value[i]= unemp[i] - lambda_value * cap_cost[i]
+        path_cost[i]     = max(epsilon, -economic_value[i])
+
+    Articulation keep score (low = candidate for replacement):
+        keep_score[i] = economic_value[i]
+                        + 5 * selected_neighbor_count
+                        - 10 * unselected_neighbor_count
+    """
+    if not S0:
+        return []
+
+    N = len(nb)
+    S = set(int(i) for i in S0)
+    protected_base = set(int(i) for i in (protected or [])) | {root_local}
+
+    if not component_ok(sorted(S), u, E, P, tau, pop_thresh, nb):
+        return sorted(S)
+
+    num, den = as_fraction_tau(tau)
+    slack = den * u.astype(np.int64) - num * E.astype(np.int64)
+    cap_cost_arr = tau * E.astype(float) - (1.0 - tau) * u.astype(float)
+    economic_val = u.astype(float) - lambda_value * cap_cost_arr
+    _eps = 0.01
+    path_cost_arr = np.maximum(_eps, -economic_val)
+
+    t_start = time.monotonic()
+    best = set(S)
+
+    def _comps_of(sel: set) -> List[set]:
+        seen: set = set()
+        result: List[set] = []
+        for v in sel:
+            if v not in seen:
+                comp: set = {v}
+                stk = [v]
+                seen.add(v)
+                while stk:
+                    cur = stk.pop()
+                    for w in nb[cur]:
+                        if w in sel and w not in seen:
+                            seen.add(w)
+                            comp.add(w)
+                            stk.append(w)
+                result.append(comp)
+        return result
+
+    def _reconnect(S_rem: set, removed: set) -> Optional[frozenset]:
+        """
+        Dijkstra from root's component only.
+        S_rem nodes (already selected) cost 0 to traverse; unselected nodes cost
+        path_cost_arr[v]. Removed bundle nodes are excluded.
+        Returns frozenset of unselected bridge nodes, or None if unreachable.
+        """
+        root_comp: set = set()
+        stk = [root_local]
+        root_comp.add(root_local)
+        while stk:
+            v = stk.pop()
+            for w in nb[v]:
+                if w in S_rem and w not in root_comp:
+                    root_comp.add(w)
+                    stk.append(w)
+
+        non_root = [c for c in _comps_of(S_rem) if root_local not in c]
+        if not non_root:
+            return frozenset()  # already connected
+
+        INF = float("inf")
+        dist: Dict[int, float] = {}
+        prev: Dict[int, int] = {}
+        heap_q: List[Tuple[float, int]] = []
+
+        for v in root_comp:
+            dist[v] = 0.0
+            prev[v] = -1  # sentinel: this is a root-comp source node
+            heapq.heappush(heap_q, (0.0, v))
+
+        while heap_q:
+            d, v = heapq.heappop(heap_q)
+            if d > dist.get(v, INF):
+                continue
+            for w in nb[v]:
+                if w in removed:
+                    continue
+                nd = d if w in S_rem else d + float(path_cost_arr[w])
+                if nd < dist.get(w, INF):
+                    dist[w] = nd
+                    prev[w] = v
+                    heapq.heappush(heap_q, (nd, w))
+
+        added: set = set()
+        for comp in non_root:
+            best_v = min(comp, key=lambda v: dist.get(v, INF))
+            if dist.get(best_v, INF) == INF:
+                return None  # component unreachable
+            # Trace path back to root_comp, collecting unselected bridge nodes
+            cur = best_v
+            while True:
+                p = prev.get(cur, -1)
+                if p == -1:
+                    break  # reached a root_comp source
+                if cur not in S_rem and cur not in removed:
+                    added.add(cur)
+                cur = p
+                if cur in root_comp:
+                    break
+        return frozenset(added)
+
+    any_improved = True
+    while any_improved and (time.monotonic() - t_start < time_limit_s):
+        any_improved = False
+
+        sel_mask = np.zeros(N, dtype=bool)
+        sel_mask[list(best)] = True
+        cut_verts = _articulation_points(nb, sel_mask)
+        pop_sum = int(P[sorted(best)].sum())
+
+        bundles_scored: List[Tuple[float, frozenset]] = []
+        seen_bundles: set = set()
+
+        for art in sorted(cut_verts - protected_base):
+            n_sel = sum(1 for w in nb[art] if w in best)
+            n_ext = sum(1 for w in nb[art] if w not in best)
+            score = float(economic_val[art]) + 5.0 * n_sel - 10.0 * n_ext
+
+            singleton = frozenset({art})
+            if singleton not in seen_bundles:
+                seen_bundles.add(singleton)
+                bundles_scored.append((score, singleton))
+
+            # Bundle: articulation point + its pendant branch disconnected from root
+            reachable: set = {root_local}
+            stk = [root_local]
+            while stk:
+                v = stk.pop()
+                for w in nb[v]:
+                    if w in best and w != art and w not in reachable:
+                        reachable.add(w)
+                        stk.append(w)
+            branch = frozenset((best - reachable) - {art})
+
+            if 1 <= len(branch) <= max_removed_bundle - 1 and not (branch & protected_base):
+                full_bundle = frozenset({art} | branch)
+                if full_bundle not in seen_bundles:
+                    seen_bundles.add(full_bundle)
+                    avg_ev = sum(float(economic_val[v]) for v in full_bundle) / len(full_bundle)
+                    avg_ns = sum(
+                        sum(1 for w in nb[v] if w in best) for v in full_bundle
+                    ) / len(full_bundle)
+                    avg_nx = sum(
+                        sum(1 for w in nb[v] if w not in best) for v in full_bundle
+                    ) / len(full_bundle)
+                    bundles_scored.append((avg_ev + 5.0 * avg_ns - 10.0 * avg_nx, full_bundle))
+
+        # Weakest connectors (lowest keep_score) first
+        bundles_scored.sort(key=lambda x: x[0])
+
+        for _, bundle in bundles_scored[:max_reroute_candidates]:
+            if time.monotonic() - t_start >= time_limit_s:
+                break
+
+            bundle_list = sorted(bundle)
+            if pop_sum - int(P[bundle_list].sum()) < pop_thresh:
+                continue
+
+            S_rem = best - set(bundle)
+            if root_local not in S_rem:
+                continue
+
+            path_nodes = _reconnect(S_rem, set(bundle))
+            if path_nodes is None:
+                continue  # some non-root component unreachable
+
+            S_new = S_rem | set(path_nodes)
+            removed_u = int(u[bundle_list].sum())
+            added_u = int(u[sorted(path_nodes)].sum()) if path_nodes else 0
+            if added_u - removed_u <= 0:
+                continue  # no unemployment gain
+
+            # Restore rate feasibility if violated after the exchange
+            if int(slack[sorted(S_new)].sum()) < 0:
+                S_repaired = _repair_rate_after_augmentation(
+                    S_new, protected_base, nb, u, P, slack, pop_thresh
+                )
+                if S_repaired is None:
+                    continue
+                S_new = S_repaired
+                if int(u[sorted(S_new)].sum()) <= int(u[sorted(best)].sum()):
+                    continue
+
+            if int(P[sorted(S_new)].sum()) < pop_thresh:
+                continue
+            if not component_ok(sorted(S_new), u, E, P, tau, pop_thresh, nb):
+                continue
+
+            # Accept: refill released slack, drop redundant zero-employment tracts
+            S_refilled = _beam_refill(
+                S_new, set(bundle), nb, u, slack, refill_candidates, beam_width
+            )
+            if component_ok(sorted(S_refilled), u, E, P, tau, pop_thresh, nb):
+                S_new = S_refilled
+
+            S_new = _drop_redundant_zero_tracts(
+                S_new, protected_base, root_local, nb, u, E, P, pop_thresh
+            )
+
+            if _selection_key(S_new, u, slack) > _selection_key(best, u, slack):
+                best = S_new
+                any_improved = True
+                break  # restart outer loop with updated selection
+
+    return sorted(best)
+
+
 def augment_prune_hint(
     S0: List[int],
     u: np.ndarray,
@@ -1736,13 +1984,14 @@ def build_repair_neighborhood(
     """
     Build a free-node pool for local repair.
 
-    Uses an explicit two-pool budget:
+        Uses an explicit two-pool budget:
       - Up to 40% of max_free_nodes for interior weak selected nodes: non-root,
         non-articulation selected nodes sorted by cap = tau*E-(1-tau)*u descending
         (high cap = low UR = most worth dropping), regardless of BFS distance.
-      - Remaining budget from the boundary BFS pool (boundary, frontier, hops
-        expansion, pendant branches up to 30 nodes, multi-connected unselected).
-    Root is always fixed; articulation points of the selection are never freed.
+            - Remaining boundary budget reserves one third for selected structural nodes
+                and uses the rest for unselected alternatives ranked by unemployment per
+                rate-capacity cost.
+        Root is always fixed.
     Returns a deterministic sorted list trimmed to max_free_nodes.
     """
     N = len(nb_local)
@@ -1829,29 +2078,39 @@ def build_repair_neighborhood(
     )
     weak_interior = set(interior_candidates[:weak_budget])
 
-    # --- Explicit budget allocation: weak_interior first, BFS fills remainder ---
+    # --- Explicit budget allocation: weak interior, structural, alternatives ---
     remaining = max_free_nodes - len(weak_interior)
 
     if len(bfs_pool) <= remaining:
         bfs_chosen = bfs_pool
     else:
-        def _score_bfs(i: int) -> tuple:
+        selected_bfs = bfs_pool & sel_set
+        unselected_bfs = bfs_pool - sel_set
+
+        def _score_selected(i: int) -> tuple:
             d = bfs_dist.get(i, hops + 2)
-            is_tier1 = i in boundary_sel or i in frontier_unsel
+            is_tier1 = i in boundary_sel
             is_art = i in art_pts
             is_pendant = i in pendant_members
             n_sel_nb = sum(1 for w in nb_local[i] if w in sel_set)
             cap = tau * float(E_g[i]) - (1.0 - tau) * float(u_g[i])
-            if i in sel_set:
-                eff = float(u_g[i]) / cap if cap > 0 else 1e12
-                eff_score = -eff
-            else:
-                eff = float(u_g[i]) / cap if cap > 0 else 1e12
-                eff_score = eff
-            return (is_tier1, -d, is_art or is_pendant, n_sel_nb, eff_score, -i)
+            removal_efficiency = float(u_g[i]) / cap if cap > 0 else 1e12
+            return (is_tier1, -d, is_art or is_pendant, n_sel_nb, -removal_efficiency, -i)
 
-        ranked_bfs = sorted(bfs_pool, key=_score_bfs, reverse=True)
-        bfs_chosen = set(ranked_bfs[:remaining])
+        def _score_unselected(i: int) -> tuple:
+            d = bfs_dist.get(i, hops + 2)
+            cap = tau * float(E_g[i]) - (1.0 - tau) * float(u_g[i])
+            add_efficiency = float(u_g[i]) / cap if cap > 0 else 1e12
+            n_sel_nb = sum(1 for w in nb_local[i] if w in sel_set)
+            return (i in frontier_unsel, -d, add_efficiency, n_sel_nb, int(u_g[i]), -i)
+
+        structural_budget = min(len(selected_bfs), remaining // 3)
+        structural = sorted(selected_bfs, key=_score_selected, reverse=True)
+        alternatives = sorted(unselected_bfs, key=_score_unselected, reverse=True)
+        bfs_chosen = set(structural[:structural_budget])
+        bfs_chosen.update(alternatives[:remaining - len(bfs_chosen)])
+        if len(bfs_chosen) < remaining:
+            bfs_chosen.update(structural[structural_budget:remaining])
 
     return sorted(bfs_chosen | weak_interior)
 
@@ -2032,7 +2291,7 @@ def improve_with_local_repair(
     root_local: int,
     *,
     max_rounds: int = 3,
-    max_free_nodes: int = 500,
+    max_free_nodes: int = 1000,
     hops: int = 5,
     time_limit: float = 15.0,
     num_workers: int = 8,
@@ -2114,8 +2373,8 @@ def _prepare_window_hint(
     tau: float, pop_thresh: int, root_local: int, verbose: bool = False,
     repair_enabled: bool = True,
     repair_hops: int = 3,
-    repair_max_free_nodes: int = 500,
-    repair_time_limit: float = 15.0,
+    repair_max_free_nodes: int = 1000,
+    repair_time_limit: float = 60,
     repair_rounds: int = 3,
     repair_num_workers: int = 8,
     repair_random_seed: int = 1,
@@ -2183,6 +2442,33 @@ def _prepare_window_hint(
                 hint_source += "+augment_prune_refill"
             elif verbose:
                 print(f"  [heuristic] augment did not improve over {hint_source}", flush=True)
+
+        if best["hint_valid"]:
+            if verbose:
+                print(f"  [heuristic] articulation_reroute ...", flush=True)
+            rerouted = articulation_reroute(
+                best["hint_improved"], u_g, E_g, P_g, nb_local, tau, pop_thresh,
+                root_local, protected=root_component,
+            )
+            if component_ok(rerouted, u_g, E_g, P_g, tau, pop_thresh, nb_local):
+                num_rr, den_rr = as_fraction_tau(tau)
+                exact_slack_rr = den_rr * u_g.astype(np.int64) - num_rr * E_g.astype(np.int64)
+                if _selection_key(set(rerouted), u_g, exact_slack_rr) > _selection_key(
+                    set(best["hint_improved"]), u_g, exact_slack_rr
+                ):
+                    rr_u = int(u_g[rerouted].sum())
+                    rr_E = int(E_g[rerouted].sum())
+                    if verbose:
+                        print(
+                            f"  [heuristic] articulation_reroute improved: "
+                            f"tracts={len(rerouted)}, unemp={rr_u}, "
+                            f"UR={100.0 * rr_u / max(rr_u + rr_E, 1):.2f}%",
+                            flush=True,
+                        )
+                    best = {"hint_improved": rerouted, "hint_valid": True, "hint_obj_val": rr_u}
+                    hint_source += "+articulation_reroute"
+                elif verbose:
+                    print(f"  [heuristic] articulation_reroute did not improve over {hint_source}", flush=True)
 
         if repair_enabled:
             if verbose:
@@ -2334,9 +2620,9 @@ def build_many_asus_cpsat(
     use_arborescence: bool = False,
     repair_enabled: bool = False,
     repair_hops: int = 5,
-    repair_max_free_nodes: int = 500,
-    repair_time_limit: float = 15.0,
-    repair_rounds: int = 0,
+    repair_max_free_nodes: int = 1000,
+    repair_time_limit: float = 30,
+    repair_rounds: int = 3,
     repair_num_workers: int = 8,
     repair_random_seed: int = 1,
 ) -> Dict[str, np.ndarray]:
