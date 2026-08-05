@@ -470,7 +470,7 @@ shiny::fileInput("file", "Choose Excel File", accept = c(".xls", ".xlsx"))
 # Add numeric input for tract year
 shiny::numericInput("tract_year_input",
                      "Census Tract Year:",
-                     value = 2025,
+                     value = 2024,
                      min = 2010,
                      max = 2025,
                      step = 1)
@@ -625,9 +625,6 @@ shiny::conditionalPanel(
     shiny::numericInput("cpsat_timelimit", "Time limit (sec) per window", value = 18000, min = 0, step = 60),
     shiny::numericInput("cpsat_workers",   "Parallel workers (Defaults to Number of Dectected Cores - 2)",          value = max(1, parallel::detectCores()-2), min = 1, step = 1),
     shiny::numericInput("cpsat_relgap",        "Relative gap (optional)",    value = NULL, min = 0, step = 0.0001),
-    shiny::hr(style = "margin: 0.4rem 0;"),
-    shiny::numericInput("cpsat_repair_rounds",   "Repair rounds",              value = 3,    min = 0, step = 1),
-    shiny::numericInput("cpsat_repair_timelimit", "Repair time limit (sec)",   value = 60,   min = 0, step = 5),
     shiny::uiOutput("cpsat_log_link")
   )
 )
@@ -795,28 +792,11 @@ shiny::observeEvent(input$process, {
   # ensure 'res' exists even if something returns early
   res <- NULL
 
-  ## 1 · Wrap the whole long job in withProgress -------------------------
-  shiny::withProgress(message = "Running ASU initialisation…", value = 0, {
-    ## 1a · Build tracts + neighbours (can take ~10–60 s the first time)
-    shiny::incProgress(0.10, detail = "Downloading Census shapefiles…")
+  # Detect algorithm before withProgress to avoid overlapping progress bars
+  algo_choice <- shiny::isolate(input$asu_algo)
+  if (is.null(algo_choice) || identical(algo_choice, "")) algo_choice <- "orig"
 
-    # use selected_year (handles New England override)
-    tract_list <- tigris::tracts(state = state(), year = selected_year) |>
-      dplyr::mutate(
-        row_num    = dplyr::row_number(),
-        continuous = sfdep::st_contiguity(geometry)
-      )
-
-    ## 1b · Merge the BLS data (kept for potential checks/debug)
-    shiny::incProgress(0.05, detail = "Merging BLS unemployment data…")
-    data_merge <- tract_list |>
-      dplyr::left_join(uploaded_data(), by = "GEOID")
-
-    ## 2 · Run the chosen ASU algorithm ---------------------------------
-    algo_choice <- shiny::isolate(input$asu_algo)
-    if (is.null(algo_choice) || identical(algo_choice, "")) algo_choice <- "orig"
-
-    # --- CP-SAT branch (drop-in replacement) -------------------------------
+  # --- CP-SAT branch (has its own withProgress) --------------------------
 if (identical(algo_choice, "cpsat")) {
   if (!isTRUE(getOption("asu_python_ready", FALSE))) {
     shiny::showModal(shiny::modalDialog(
@@ -839,12 +819,10 @@ if (identical(algo_choice, "cpsat")) {
     max_asus <- if (is.null(input$cpsat_max))       30     else as.integer(input$cpsat_max)
     tlimit   <- if (is.null(input$cpsat_timelimit)) 1200   else as.integer(input$cpsat_timelimit)
     workers  <- if (is.null(input$cpsat_workers))   max(1L, parallel::detectCores()-5L) else as.integer(input$cpsat_workers)
-    rel_gap       <- if (!is.null(input$cpsat_relgap) && !is.na(input$cpsat_relgap)) as.numeric(input$cpsat_relgap) else NA_real_
-    repair_rounds <- if (is.null(input$cpsat_repair_rounds))    3L  else as.integer(input$cpsat_repair_rounds)
-    repair_tlimit <- if (is.null(input$cpsat_repair_timelimit)) 60  else as.numeric(input$cpsat_repair_timelimit)
-    append_cpsat_log(sprintf("[run] params: tau=%.6f pop=%d max=%d limit=%ds workers=%d rel_gap=%s repair_rounds=%d repair_tlimit=%.0fs",
+    rel_gap  <- if (!is.null(input$cpsat_relgap) && !is.na(input$cpsat_relgap)) as.numeric(input$cpsat_relgap) else NA_real_
+    append_cpsat_log(sprintf("[run] params: tau=%.6f pop=%d max=%d limit=%ds workers=%d rel_gap=%s",
                              tau, pop_thr, max_asus, tlimit, workers,
-                             if (is.na(rel_gap)) "None" else as.character(rel_gap), repair_rounds, repair_tlimit))
+                             if (is.na(rel_gap)) "None" else as.character(rel_gap)))
     # ---- 2) Build tracts + neighbors ----------------------------------
     shiny::incProgress(0.15, detail = "Downloading tracts & building neighbors")
     append_cpsat_log(sprintf("[NB] Downloading TIGER tracts for state %s (year=%s)…", st_fips, sel_year))
@@ -995,9 +973,6 @@ kwargs = dict(
 REL = %s
 if REL is not None and not (isinstance(REL, float) and math.isnan(REL)):
     kwargs['rel_gap'] = REL
-kwargs['repair_enabled'] = %s
-kwargs['repair_rounds']  = %d
-kwargs['repair_time_limit'] = %s
 print('[runner] launching CP-SAT…', flush=True)
 res = build_many_asus_cpsat(**kwargs)
 print('[runner] solver finished; writing json', flush=True)
@@ -1011,7 +986,6 @@ print('[runner] OK', flush=True)
       py_mod_path, df_csv, nb_json,
       format(tau, scientific = FALSE), pop_thr, max_asus, tlimit, workers,
       if (is.na(rel_gap)) "None" else as.character(rel_gap),
-      if (repair_rounds > 0L) "True" else "False", repair_rounds, repair_tlimit,
       out_json
     )
     writeLines(runner_code, runner)
@@ -1139,6 +1113,22 @@ print('[runner] OK', flush=True)
 }
 # --- end CP-SAT branch --------------------------------------------------
 
+  ## 1 · orig/mine: wrap the long job in a single withProgress ------------
+  shiny::withProgress(message = "Running ASU initialisation\u2026", value = 0, {
+    ## 1a · Build tracts + neighbours (can take ~10\u201360 s the first time)
+    shiny::incProgress(0.10, detail = "Downloading Census shapefiles\u2026")
+
+    # use selected_year (handles New England override)
+    tract_list <- tigris::tracts(state = state(), year = selected_year) |>
+      dplyr::mutate(
+        row_num    = dplyr::row_number(),
+        continuous = sfdep::st_contiguity(geometry)
+      )
+
+    ## 1b · Merge the BLS data (kept for potential checks/debug)
+    shiny::incProgress(0.3, detail = "Merging BLS unemployment data\u2026")
+    data_merge <- tract_list |>
+      dplyr::left_join(uploaded_data(), by = "GEOID")
 
     # (kept for backward-compat, even if not used directly)
     join_flag <- isTRUE(input$join_touching)
@@ -1147,12 +1137,11 @@ print('[runner] OK', flush=True)
     if (identical(algo_choice, "orig")) {
       res <- run_asu_original(tract_list, uploaded_data())
     } else {
-      shiny::withProgress(message = "Seeding & expanding…", value = 0, {
-        th_tract_list(tract_list)
-        th_bls_df(uploaded_data())
-        st <- tract_hunter_seed(th_tract_list(), th_bls_df(), verbose = TRUE)
-        th_state(st)
-      })
+      shiny::incProgress(0.3, detail = "Seeding & expanding\u2026")
+      th_tract_list(tract_list)
+      th_bls_df(uploaded_data())
+      st <- tract_hunter_seed(th_tract_list(), th_bls_df(), verbose = TRUE)
+      th_state(st)
       res <- tract_hunter_finalize(th_state())
     }
 
@@ -1264,12 +1253,22 @@ output$cpsat_log_saved_banner <- shiny::renderUI({
   if (is.null(lf)) return(NULL)
   shiny::div(
     style = "position:fixed; bottom:20px; right:20px; z-index:1100; background:#f0f8ff; border:1px solid #4a90d9; border-radius:4px; padding:10px 14px; font-size:13px; box-shadow:0 2px 8px rgba(0,0,0,.2); max-width:520px;",
-    shiny::strong("Solver log saved:"), shiny::br(),
+    shiny::div(
+      style = "display:flex; justify-content:space-between; align-items:flex-start;",
+      shiny::strong("Solver log saved:"),
+      shiny::actionButton("dismiss_cpsat_banner", "\u00d7",
+        class = "btn-xs btn-link",
+        style = "padding:0 4px; font-size:16px; line-height:1; color:#555; margin-left:8px;")
+    ),
     shiny::span(style = "font-family:monospace; font-size:11px; word-break:break-all;", lf),
     shiny::br(), shiny::br(),
     shiny::actionButton("open_log_folder", "Open folder", class = "btn-xs btn-info", style = "margin-right:6px;"),
     shiny::actionButton("open_log_file",   "Open log",    class = "btn-xs btn-default")
   )
+})
+
+shiny::observeEvent(input$dismiss_cpsat_banner, {
+  cpsat_log_saved(NULL)
 })
 
 output$cpsat_log_link <- shiny::renderUI({
@@ -1641,7 +1640,11 @@ filtered_tracts_memo <- shiny::reactive({
 
 # Apply highlights only when the button is explicitly clicked
 shiny::observe({
-  shiny::req(selected_tracts())
+  if (is.null(selected_tracts()) || length(selected_tracts()) == 0) {
+    shiny::showNotification("Select tracts on the map or via the ASU dropdown first.",
+                            type = "warning", duration = 4)
+    return()
+  }
   filtered_selected <- filtered_tracts_memo()
   highlighted_tracts(filtered_selected)
 
@@ -1653,13 +1656,15 @@ shiny::observe({
     }
     mapgl::maplibre_proxy("edit_map") |> mapgl::set_filter("highlighted", filter_expr)
   } else {
+    shiny::showNotification("No tracts matched the filter criteria.", type = "message", duration = 3)
     mapgl::maplibre_proxy("edit_map") |>
       mapgl::set_filter("highlighted", list("==", c("get", "GEOID"), "__NONE__"))
   }
 }) |> shiny::bindEvent(input$filter_percentile, ignoreInit = TRUE)
 
-# Clear highlights when requested or when ASU selection changes
-shiny::observeEvent(list(input$clear_percentile, input$select_asunum), {
+# Clear highlights on demand; do NOT clear on select_asunum change
+shiny::observeEvent(input$clear_percentile, {
+  highlighted_tracts(character(0))
   mapgl::maplibre_proxy("edit_map") |>
     mapgl::set_filter("highlighted", list("==", c("get", "GEOID"), "__NONE__"))
 }, ignoreInit = TRUE)
@@ -1843,7 +1848,7 @@ shiny::conditionalPanel(
   shiny::h4("Tract Details", style = "flex-shrink: 0;"),
   shiny::div(
     style = "flex: 1; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 5px; min-height: 200px;",
-    shiny::tableOutput("summary_table")
+    DT::dataTableOutput("summary_table")
   )
 )
 
@@ -1894,33 +1899,64 @@ output$summary_total_unemployment <- shiny::renderText({
   paste("Total unemployment:", format(preview_result$summary$unemp, big.mark = ","))
 })
 
-# Detailed table output using your existing preview_data reactive
-output$summary_table <- shiny::renderTable({
+# Detailed table — interactive DT with bidirectional map-highlight sync
+output$summary_table <- DT::renderDataTable({
   shiny::req(selected_tracts())
-  
-  preview_result <- preview_data()
-  selected_data <- preview_result$data |>
-    dplyr::select(GEOID, asunum, tract_pop_cur, tract_ASU_clf, 
-           tract_ASU_urate, tract_ASU_unemp) |>
-    dplyr::arrange(GEOID)
-  
-  # Format the data for display
-  selected_data |>
-    dplyr::mutate(
-      tract_pop_cur = format(tract_pop_cur, big.mark = ","),
-      tract_ASU_clf = format(tract_ASU_clf, big.mark = ","),
-      tract_ASU_urate = round(tract_ASU_urate, 2),
-      tract_ASU_unemp = format(tract_ASU_unemp, big.mark = ",")
-    ) |>
+
+  preview_data()$data |>
+    dplyr::select(GEOID, asunum, tract_pop_cur, tract_ASU_clf,
+                  tract_ASU_urate, tract_ASU_unemp) |>
+    dplyr::arrange(GEOID) |>
     dplyr::rename(
-      "GEOID" = GEOID,
-      "ASU" = asunum,
-      "Population" = tract_pop_cur,
-      "Labor Force" = tract_ASU_clf,
-      "Unemp. Rate %" = tract_ASU_urate,
-      "Unemp." = tract_ASU_unemp
-    )
-}, striped = TRUE, hover = TRUE, spacing = "xs")
+      ASU             = asunum,
+      Population      = tract_pop_cur,
+      `Labor Force`   = tract_ASU_clf,
+      `Unemp. Rate %` = tract_ASU_urate,
+      `Unemp.`        = tract_ASU_unemp
+    ) |>
+    DT::datatable(
+      selection  = "multiple",
+      rownames   = FALSE,
+      options    = list(
+        pageLength = 15,
+        scrollX    = TRUE,
+        dom        = "ftp",
+        columnDefs = list(list(className = "dt-right", targets = c(1, 2, 3, 4, 5)))
+      )
+    ) |>
+    DT::formatRound(columns = "Unemp. Rate %", digits = 2) |>
+    DT::formatCurrency(columns = c("Population", "Labor Force", "Unemp."),
+                       currency = "", digits = 0)
+}, server = FALSE)
+
+# DT row selected → highlight those tracts on the map
+shiny::observeEvent(input$summary_table_rows_selected, ignoreNULL = FALSE, {
+  shiny::req(selected_tracts(), preview_data())
+  sel_rows  <- input$summary_table_rows_selected
+  tbl_geoids <- preview_data()$data |> dplyr::arrange(GEOID) |> dplyr::pull(GEOID)
+  geoids <- if (length(sel_rows) > 0) tbl_geoids[sel_rows] else character(0)
+  highlighted_tracts(geoids)
+  filter_expr <- if (length(geoids) == 0) {
+    list("==", c("get", "GEOID"), "__NONE__")
+  } else if (length(geoids) == 1) {
+    list("==", c("get", "GEOID"), as.character(geoids))
+  } else {
+    list("in", c("get", "GEOID"), list("literal", as.character(geoids)))
+  }
+  mapgl::maplibre_proxy("edit_map") |> mapgl::set_filter("highlighted", filter_expr)
+})
+
+# highlighted_tracts() changed externally (percentile filter / map) → reflect in DT
+shiny::observe({
+  hl <- highlighted_tracts()
+  shiny::req(selected_tracts(), preview_data())
+  tbl_geoids  <- preview_data()$data |> dplyr::arrange(GEOID) |> dplyr::pull(GEOID)
+  row_indices <- which(tbl_geoids %in% hl)
+  if (!identical(as.integer(shiny::isolate(input$summary_table_rows_selected)),
+                 as.integer(row_indices))) {
+    DT::dataTableProxy("summary_table") |> DT::selectRows(row_indices)
+  }
+}) |> shiny::bindEvent(highlighted_tracts(), ignoreInit = TRUE)
 ```
 
 # Save and Load Data
@@ -2054,7 +2090,7 @@ shiny::actionButton("review_txt", "Create Summary CSV")
 ## Output {data-width="850"}
 
 ```{r}
-shiny::tableOutput("asu_review")
+DT::dataTableOutput("asu_review")
 
 summarized_asu <- shiny::reactiveVal(NULL)
 
@@ -2104,9 +2140,37 @@ shiny::observeEvent(input$run_asu_summary, {
   summarized_asu(summary_table)
 })
 
-output$asu_review <- shiny::renderTable({
-  summarized_asu()
-})
+output$asu_review <- DT::renderDataTable({
+  tbl <- summarized_asu()
+  shiny::req(tbl)
+
+  tbl |>
+    dplyr::mutate(
+      ur_qualified  = ifelse(ur_qualified,  "TRUE", "FALSE"),
+      pop_qualified = ifelse(pop_qualified, "TRUE", "FALSE"),
+      contiguous    = ifelse(contiguous,    "TRUE", "FALSE"),
+      asu_qualified = ifelse(asu_qualified, "TRUE", "FALSE")
+    ) |>
+    DT::datatable(
+      rownames  = FALSE,
+      selection = "none",
+      options   = list(
+        pageLength = 25,
+        dom        = "ftp",
+        order      = list(list(0, "asc"))
+      )
+    ) |>
+    DT::formatRound(columns = "Unemployment Rate", digits = 3) |>
+    DT::formatCurrency(
+      columns  = c("Population", "Labor Force", "Unemployment"),
+      currency = "", digits = 0
+    ) |>
+    DT::formatStyle(
+      columns     = c("ur_qualified", "pop_qualified", "contiguous", "asu_qualified"),
+      color       = DT::styleEqual(c("TRUE", "FALSE"), c("#2e7d32", "#c62828")),
+      fontWeight  = "bold"
+    )
+}, server = FALSE)
 
 shiny::observeEvent(input$lss_txt, {
   

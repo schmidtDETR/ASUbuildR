@@ -627,6 +627,7 @@ def solve_one_asu_cpsat(
     use_root_articulation_implications: bool = False,
     use_signed_flow: bool = True,
     use_arborescence: bool = False,
+    configure_subsolvers: bool = True,
 ) -> Optional[CpsatResult]:
     """
         Connectivity via iterative vertex-separator cuts. Each disconnected incumbent
@@ -975,13 +976,14 @@ def solve_one_asu_cpsat(
         _scout.parameters.linearization_level = 2
         _scout.parameters.cp_model_probing_level = 2
         _scout.parameters.cut_level = 1
-        _scout.parameters.ignore_subsolvers.extend([
-            "lb_tree_search",
-            "probing",
-            "objective_shaving_max_lp", "objective_shaving_no_lp",
-            "objective_lb_search_max_lp",
-            "feasibility_pump",
-        ])
+        if configure_subsolvers:
+            _scout.parameters.ignore_subsolvers.extend([
+                "lb_tree_search",
+                "probing",
+                "objective_shaving_max_lp", "objective_shaving_no_lp",
+                "objective_lb_search_max_lp",
+                "feasibility_pump",
+            ])
         _scout_status = _scout.Solve(model)
         if _scout_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             _scout_sel = [i for i in range(N) if _scout.BooleanValue(x[i])]
@@ -1002,6 +1004,31 @@ def solve_one_asu_cpsat(
                     else:
                         for _ei, (_eu, _ev) in enumerate(edges):
                             model.AddHint(f[_ei], _sf.get((_eu, _ev), 0))
+                else:
+                    # Rebuild arborescence hints from the scout's BFS spanning tree.
+                    # The scout added obj_expr >= _scout_obj to the model; the old
+                    # hint (pre-scout objective) would violate that hard constraint.
+                    _sf_arb = _spanning_tree_flows(_scout_sel, nb_local, root_local)
+                    _tp = {v: p for (p, v) in _sf_arb}
+                    _ch: Dict[int, List[int]] = {v: [] for v in range(N)}
+                    for _v, _p in _tp.items():
+                        if 0 <= _p < N:
+                            _ch[_p].append(_v)
+                    _dh: Dict[int, int] = {root_local: 0}
+                    _bfsq = [root_local]
+                    while _bfsq:
+                        _nd = _bfsq.pop(0)
+                        for _child in _ch[_nd]:
+                            if _child not in _dh:
+                                _dh[_child] = _dh[_nd] + 1
+                                _bfsq.append(_child)
+                    model.ClearHints()
+                    for _i in range(N):
+                        model.AddHint(x[_i], 1 if _i in _scout_set else 0)
+                    for (_ai, _aj), _pvar in par_vars.items():
+                        model.AddHint(_pvar, 1 if _tp.get(_ai) == _aj else 0)
+                    for _i in range(N):
+                        model.AddHint(depth_vars[_i], _dh.get(_i, 0))
                 if log:
                     print(f"  scout: improved incumbent to {_scout_obj} "
                           f"(+{_scout_obj - (hint_obj or 0)} vs hint)", flush=True)
@@ -1070,20 +1097,26 @@ def solve_one_asu_cpsat(
         solver.parameters.max_time_in_seconds = remaining_time
         solver.parameters.log_search_progress = bool(log)
         solver.parameters.cp_model_presolve = True
-        solver.parameters.linearization_level = 2
+        solver.parameters.linearization_level = 1
         solver.parameters.cp_model_probing_level = 2
         solver.parameters.cut_level = 1
         solver.parameters.lns_initial_difficulty = 0.4
-        solver.parameters.filter_subsolvers.extend([
-            "rins*",
-            "max_lp",
-            #"objective_lb_search",
-            "probing_max_lp",
-            "lb_tree_search",
-            #"probing_no_lp",
-            "graph_arc_lns",
-            "ls_lin*",
-        ])
+
+        lns_params = solver.parameters.subsolver_params.add()
+        lns_params.name = "lns_base"
+        lns_params.linearization_level = 1
+        if configure_subsolvers:
+            solver.parameters.filter_subsolvers.extend([
+                "rins*",
+                #"probing",
+                "max_lp",
+                "probing_max_lp",
+
+                "lb_tree_search",
+                #"quick_restart_no_lp",
+                "graph_arc_lns",
+                "ls*",
+            ])
         # solver.parameters.ignore_subsolvers.extend([
         #     "pseudo_costs",
         #     "reduced_costs",
@@ -1098,7 +1131,7 @@ def solve_one_asu_cpsat(
         #     "graph_var_lns",
         #     "rnd_cst_lns",
         # ])
-        # solver.parameters.extra_subsolvers.extend(["graph_arc_lns"]) 
+        #solver.parameters.extra_subsolvers.extend(["graph_arc_lns"]) 
         if rel_gap is not None:
             solver.parameters.relative_gap_limit = float(rel_gap)
         status = solver.Solve(model)
@@ -1162,9 +1195,10 @@ def solve_one_asu_cpsat(
                 tie_solver.parameters.log_search_progress = False
                 tie_solver.parameters.cp_model_presolve = True
                 tie_solver.parameters.linearization_level = 2
-                tie_solver.parameters.ignore_subsolvers.extend([
-                    "pseudo_costs", "reduced_costs", "default_lp", "quick_restart",
-                ])
+                if configure_subsolvers:
+                    tie_solver.parameters.ignore_subsolvers.extend([
+                        "pseudo_costs", "reduced_costs", "default_lp", "quick_restart",
+                    ])
                 tie_status = tie_solver.Solve(model)
                 if tie_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                     break
@@ -2371,13 +2405,6 @@ def improve_with_local_repair(
 def _prepare_window_hint(
     nb_local: List[List[int]], u_g: np.ndarray, E_g: np.ndarray, P_g: np.ndarray,
     tau: float, pop_thresh: int, root_local: int, verbose: bool = False,
-    repair_enabled: bool = True,
-    repair_hops: int = 3,
-    repair_max_free_nodes: int = 1000,
-    repair_time_limit: float = 60,
-    repair_rounds: int = 3,
-    repair_num_workers: int = 8,
-    repair_random_seed: int = 1,
 ) -> Dict:
     """
     Build a warm-start hint using reverse_prune on the original graph, then refine
@@ -2469,43 +2496,6 @@ def _prepare_window_hint(
                     hint_source += "+articulation_reroute"
                 elif verbose:
                     print(f"  [heuristic] articulation_reroute did not improve over {hint_source}", flush=True)
-
-        if repair_enabled:
-            if verbose:
-                print(
-                    f"  [heuristic] local repair ({repair_rounds} round(s), "
-                    f"{repair_time_limit}s/round) ...",
-                    flush=True,
-                )
-            repaired = improve_with_local_repair(
-                best["hint_improved"], nb_local, u_g, E_g, P_g, tau, pop_thresh,
-                root_local,
-                max_rounds=repair_rounds,
-                max_free_nodes=repair_max_free_nodes,
-                hops=repair_hops,
-                time_limit=repair_time_limit,
-                num_workers=repair_num_workers,
-                random_seed=repair_random_seed,
-                verbose=verbose,
-            )
-            if component_ok(repaired, u_g, E_g, P_g, tau, pop_thresh, nb_local):
-                num_rp, den_rp = as_fraction_tau(tau)
-                exact_slack_rp = den_rp * u_g.astype(np.int64) - num_rp * E_g.astype(np.int64)
-                if _selection_key(set(repaired), u_g, exact_slack_rp) > _selection_key(
-                    set(best["hint_improved"]), u_g, exact_slack_rp
-                ):
-                    rep_u = int(u_g[repaired].sum())
-                    rep_E = int(E_g[repaired].sum())
-                    if verbose:
-                        print(
-                            f"  [heuristic] local repair improved: tracts={len(repaired)}, "
-                            f"unemp={rep_u}, UR={100.0*rep_u/max(rep_u+rep_E,1):.2f}%",
-                            flush=True,
-                        )
-                    best = {"hint_improved": repaired, "hint_valid": True, "hint_obj_val": rep_u}
-                    hint_source += "+local_repair"
-                elif verbose:
-                    print(f"  [heuristic] local repair did not improve over {hint_source}", flush=True)
 
     return {
         "root_component": root_component,
@@ -2618,13 +2608,7 @@ def build_many_asus_cpsat(
     objective_shaving: bool = False,
     use_signed_flow: bool = True,
     use_arborescence: bool = False,
-    repair_enabled: bool = False,
-    repair_hops: int = 5,
-    repair_max_free_nodes: int = 1000,
-    repair_time_limit: float = 30,
-    repair_rounds: int = 3,
-    repair_num_workers: int = 8,
-    repair_random_seed: int = 1,
+    configure_subsolvers: bool = True,
 ) -> Dict[str, np.ndarray]:
     """
     Build ASUs in batches of up to `parallel_asus` disjoint candidate windows, solved
@@ -2759,13 +2743,6 @@ def build_many_asus_cpsat(
             info = _prepare_window_hint(
                 w["nb_local"], w["u_g"], w["E_g"], w["P_g"], tau, pop_thresh, w["root_local"],
                 verbose=verbose,
-                repair_enabled=repair_enabled,
-                repair_hops=repair_hops,
-                repair_max_free_nodes=repair_max_free_nodes,
-                repair_time_limit=repair_time_limit,
-                repair_rounds=repair_rounds,
-                repair_num_workers=repair_num_workers,
-                repair_random_seed=repair_random_seed,
             )
             w.update(info)
             if verbose:
@@ -2803,6 +2780,7 @@ def build_many_asus_cpsat(
                 objective_shaving=objective_shaving,
                 use_signed_flow=use_signed_flow,
                 use_arborescence=use_arborescence,
+                configure_subsolvers=configure_subsolvers,
                 # cluster_groups intentionally NOT passed here: tying high-UR
                 # cluster members via equality is provably correct (validated
                 # against brute force) but empirically hurts this time-limited
