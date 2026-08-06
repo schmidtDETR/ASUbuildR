@@ -2913,7 +2913,7 @@ def build_many_asus_cpsat(
             max_ur_remaining = UR[rem_idx_final].max() * 100
             print(f"\nStopped after {k} ASUs. Max UR among {rem_idx_final.size} remaining tracts: {max_ur_remaining:.3f}%", flush=True)
 
-    return {"asu_id": asu_id, "n_asu": int(k)}
+    return {"asu_id": asu_id.tolist(), "n_asu": int(k)}
 
 
 # ---------- CLI ----------

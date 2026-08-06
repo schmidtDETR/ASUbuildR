@@ -65,7 +65,8 @@ jobs:
           clean_path <- c(
             file.path(windows_root, "System32"),
             windows_root,
-            file.path(windows_root, "System32", "Wbem")
+            file.path(windows_root, "System32", "Wbem"),
+            file.path(windows_root, "System32", "WindowsPowerShell", "v1.0")
           )
           Sys.setenv(PATH = paste(clean_path, collapse = .Platform$path.sep))
 
