@@ -105,63 +105,71 @@ setup_asu_python <- function(force = FALSE) {
     message("Conda environment already exists. Use force=TRUE to recreate.")
   }
 
-  # Activate the env so we can check what's already importable. Checking
-  # first (rather than always re-installing) matters in practice: asking
-  # conda to re-solve numpy+pandas+networkx+ortools together against the
-  # *current* conda-forge metadata can fail (e.g. no mutually satisfiable
-  # build combination is resolvable that day) even when every package is
-  # already installed and working - re-running setup_asu_python() should
-  # not break an environment that's already fine.
-  reticulate::use_condaenv(env_name, required = TRUE)
+  pkgs <- c("numpy", "pandas", "networkx", "ortools", "openpyxl")
+
+  # Try to attach the env so we can skip already-installed packages.
+  # If Python is already initialised to a *different* interpreter in this
+  # session (reticulate one-time-init rule), fall back to installing all
+  # Locate the Python and pip executables by full path to avoid ambiguity
+  # when multiple conda installations are present (Anaconda + r-miniconda).
+  # This also bypasses reticulate's one-time-init constraint entirely.
+  envs_df     <- reticulate::conda_list()
+  env_row     <- envs_df[envs_df$name == env_name, ]
+  if (nrow(env_row) == 0)
+    stop("Conda environment '", env_name, "' not found after creation.", call. = FALSE)
+  python_path <- env_row$python[1]
+  pip_path    <- if (.Platform$OS.type == "windows")
+    file.path(dirname(python_path), "Scripts", "pip.exe")
+  else
+    file.path(dirname(python_path), "pip")
 
   pkgs <- c("numpy", "pandas", "networkx", "ortools", "openpyxl")
-  already_available <- vapply(pkgs, reticulate::py_module_available, logical(1))
-  missing_pkgs <- pkgs[!already_available]
+  pkg_list_py <- paste0("[", paste0('"', pkgs, '"', collapse = ", "), "]")
+
+  # Write Python snippets to temp files to avoid Windows cmd.exe quoting issues.
+  check_file  <- tempfile(fileext = ".py")
+  verify_file <- tempfile(fileext = ".py")
+  on.exit(unlink(c(check_file, verify_file), force = TRUE), add = TRUE)
+
+  writeLines(c(
+    "import importlib.util",
+    paste0("pkgs = ", pkg_list_py),
+    'missing = [p for p in pkgs if importlib.util.find_spec(p) is None]',
+    'print("\\n".join(missing))'
+  ), check_file)
+
+  raw          <- system2(python_path, args = check_file, stdout = TRUE, stderr = FALSE)
+  missing_pkgs <- raw[nzchar(trimws(raw))]
 
   if (length(missing_pkgs) == 0) {
     message("All required Python packages are already installed.")
   } else {
-    # OR-Tools has no conda-forge distribution, so install via pip (inside
-    # the conda environment) rather than `conda install`, which would fail
-    # to resolve 'ortools' from conda-forge no matter the Python version.
-    message("Installing missing Python packages via pip: ",
+    message("Installing Python packages via pip: ",
             paste(missing_pkgs, collapse = ", "), "...")
-    tryCatch(
-      reticulate::py_install(
-        packages = missing_pkgs,
-        envname  = env_name,
-        method   = "conda",
-        conda    = conda_bin,
-        pip      = TRUE
-      ),
-      error = function(e) {
-        stop(
-          "Failed to install the required Python packages via pip: ",
-          conditionMessage(e), "\n",
-          "Common causes: no internet connection or a proxy blocking PyPI.",
-          call. = FALSE
-        )
-      }
-    )
+    status <- system2(pip_path, args = c("install", "--quiet", "--isolated", missing_pkgs))
+    if (!identical(status, 0L))
+      stop("pip install failed (exit status: ", status, "). ",
+           "See the output above for details.", call. = FALSE)
   }
 
-  # Verify the packages actually import before declaring success - a conda
-  # "solve" can succeed while a package still fails to import (e.g. an ABI
-  # mismatch), so don't report success on install exit status alone.
-  available <- vapply(pkgs, reticulate::py_module_available, logical(1))
-  if (!all(available)) {
+  writeLines(c(
+    "import importlib.util",
+    paste0("pkgs = ", pkg_list_py),
+    'bad = [p for p in pkgs if importlib.util.find_spec(p) is None]',
+    'print(",".join(bad) if bad else "OK")'
+  ), verify_file)
+
+  verify <- trimws(system2(python_path, args = verify_file, stdout = TRUE, stderr = FALSE))
+  if (!identical(verify, "OK"))
     stop(
-      "Required Python packages are still not importable: ",
-      paste(pkgs[!available], collapse = ", "),
+      "Required Python packages are still not importable: ", verify,
       ". Try setup_asu_python(force = TRUE) to recreate the environment.",
       call. = FALSE
     )
-  }
 
-  message("\nPython setup complete! All required packages are importable.")
-  message("You can now run launch_ASUbuildR()")
+  message("\nPython setup complete! You can now run launch_ASUbuildR()")
 
-  invisible(NULL)
+
 }
 
 #' Check Python Setup for ASUbuildR

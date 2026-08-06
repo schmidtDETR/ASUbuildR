@@ -186,17 +186,23 @@ append_cpsat_log <- function(...) {
   new  <- if (nzchar(old)) paste(old, line, sep = "\n") else line
   if (nchar(new) > 12000) new <- substr(new, nchar(new) - 11999, nchar(new))
   cpsat_log_buf(new)
-  output$cpsat_log_tail <- shiny::renderText(new)
   lf <- cpsat_log_file()
   if (!is.null(lf)) try(cat(line, "\n", file = lf, append = TRUE), silent = TRUE)
 }
 
 # keep log output live even if hidden
-output$cpsat_log_tail <- shiny::renderText("")
+output$cpsat_log_tail <- shiny::renderText(cpsat_log_buf())
+shiny::outputOptions(output, "cpsat_log_tail", suspendWhenHidden = FALSE)
 output$show_cpsat_log_flag <- shiny::renderText({
   if (isTRUE(cpsat_running())) "true" else "false"
 })
 shiny::outputOptions(output, "show_cpsat_log_flag", suspendWhenHidden = FALSE)
+
+# Kill the solver process if the user closes the browser before it finishes.
+session$onSessionEnded(function() {
+  px <- shiny::isolate(cpsat_solver_proc())
+  if (!is.null(px) && px$is_alive()) px$kill()
+})
 
 # ---- New England year override logic ---------------------------------
 # Make it available to the UI
@@ -621,7 +627,7 @@ shiny::conditionalPanel(
     shiny::numericInput("cpsat_pop",       "Population threshold",      value = 10000,  min = 0, step = 100),
     shiny::numericInput("cpsat_max",       "Max ASUs",                  value = 30,     min = 1, step = 1),
     shiny::numericInput("cpsat_timelimit", "Time limit (sec) per window", value = 18000, min = 0, step = 60),
-    shiny::numericInput("cpsat_workers",   "Parallel workers (detected cores - 2)", value = max(1, parallel::detectCores()-2), min = 1, step = 1),
+    shiny::numericInput("cpsat_workers",   "Parallel workers (detected cores - 2)", value = max(1, parallel::detectCores(logical = FALSE)-2), min = 1, step = 1),
     shiny::numericInput("cpsat_relgap",        "Relative gap (optional)",    value = NULL, min = 0, step = 0.0001),
     shiny::uiOutput("cpsat_log_link")
   )

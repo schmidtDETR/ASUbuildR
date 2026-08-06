@@ -51,6 +51,9 @@ asu_ensure_pandoc <- function() {
 #' @param host Character string specifying the host. Default is "127.0.0.1".
 #' @param port Numeric port number. If NULL, R will choose an available port.
 #' @param launch.browser Logical. Should the dashboard open in browser? Default TRUE.
+#' @param auto_reload Logical. Should the app reload when the source R Markdown
+#'   file changes? By default this is disabled for the package's built-in
+#'   dashboard and enabled for a custom \code{rmd_file}.
 #'
 #' @return This function is called for its side effects (launching the dashboard).
 #'   It does not return a value.
@@ -70,9 +73,18 @@ asu_ensure_pandoc <- function() {
 launch_ASUbuildR <- function(rmd_file = NULL,
                              host = "127.0.0.1",
                              port = NULL,
-                             launch.browser = TRUE) {
+                             launch.browser = TRUE,
+                             auto_reload = NULL) {
 
   asu_ensure_pandoc()
+
+  using_builtin_dashboard <- is.null(rmd_file)
+  if (is.null(auto_reload)) {
+    auto_reload <- !using_builtin_dashboard
+  }
+  if (!is.logical(auto_reload) || length(auto_reload) != 1L || is.na(auto_reload)) {
+    stop("`auto_reload` must be TRUE or FALSE.")
+  }
 
   # If no file specified, use the package's built-in dashboard
   if (is.null(rmd_file)) {
@@ -117,6 +129,7 @@ launch_ASUbuildR <- function(rmd_file = NULL,
   # This will render and launch the dashboard in the browser
   rmarkdown::run(
     file = rmd_file,
+    auto_reload = auto_reload,
     shiny_args = list(
       host = host,
       port = port,

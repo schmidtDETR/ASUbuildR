@@ -16,3 +16,4 @@ test folder/*
 temp_*.R
 test folder/asu_exports/
 .positai
+.venv/

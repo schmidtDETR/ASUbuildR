@@ -1115,9 +1115,8 @@ def solve_one_asu_cpsat(
             solver.parameters.filter_subsolvers.extend([
                 "rins*",
                 #"probing",
-                "max_lp",
+                #"max_lp",
                 "probing_max_lp",
-
                 "lb_tree_search",
                 #"quick_restart_no_lp",
                 "graph_arc_lns",
@@ -1137,7 +1136,7 @@ def solve_one_asu_cpsat(
         #     "graph_var_lns",
         #     "rnd_cst_lns",
         # ])
-        #solver.parameters.extra_subsolvers.extend(["graph_arc_lns"]) 
+        # solver.parameters.extra_subsolvers.extend(["graph_arc_lns"]) 
         if rel_gap is not None:
             solver.parameters.relative_gap_limit = float(rel_gap)
         status = solver.Solve(model)
