@@ -121,17 +121,12 @@ cache_dir <- rappdirs::user_cache_dir("ASUbuildR", "tigris")
 if (!dir.exists(cache_dir))
   dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
 
-# 3. tell tigris to use it *this session*
-options(tigris_cache_dir = cache_dir)
-
-# tell tigris to look there first before re‑downloading
-options(tigris_use_cache = TRUE)
-
-
-# cache every tigris download automatically
 options(
-  tigris_use_cache = TRUE,                 # turn caching on
-  tigris_class     = "sf"                  # always return sf objects
+  tigris_cache_dir = cache_dir,
+  tigris_use_cache = TRUE,
+  tigris_class     = "sf",
+  download.file.method = "libcurl"
+
 )
 
 options(shiny.maxRequestSize = 50 * 1024^2)  # Set to 50MB or your desired limit
@@ -1096,6 +1091,7 @@ print('[runner] OK', flush=True)
                 )
             )
             output$asu <- shiny::renderTable(asu_summary(), digits = 3)
+            update_map_efficiently("initial_map")
             append_cpsat_log("[run] Solver finished OK; map/table updated.")
           } else {
             append_cpsat_log("[run][warn] Output JSON invalid or length mismatch.")
@@ -1364,10 +1360,11 @@ map_update_trigger <- shiny::debounce(shiny::reactive({
   list(full_data(), input$update)
 }), 200)
 
-# Observer for debounced updates
+# Observer for debounced updates — only update edit_map here to avoid
+# back-to-back set_source calls that trigger the WebGL READ-buffer warning.
+# initial_map is updated explicitly in the CP-SAT / th_pass / th_combine blocks.
 shiny::observeEvent(map_update_trigger(), {
   if (!is.null(full_data()) && nrow(full_data()) > 0) {
-    update_map_efficiently("initial_map")
     update_map_efficiently("edit_map")
   }
 }, ignoreInit = TRUE)
@@ -1689,10 +1686,7 @@ shiny::observeEvent(input$update, {
       )
     )
   full_data(updated_data)
-  
-  # Use the efficient update function
-  update_map_efficiently("edit_map")
-  
+
   selected_tracts(NULL)
   # Clear selection with set_filter
   mapgl::maplibre_proxy("edit_map") |>
