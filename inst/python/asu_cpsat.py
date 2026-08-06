@@ -1102,9 +1102,15 @@ def solve_one_asu_cpsat(
         solver.parameters.cut_level = 1
         solver.parameters.lns_initial_difficulty = 0.4
 
-        lns_params = solver.parameters.subsolver_params.add()
-        lns_params.name = "lns_base"
-        lns_params.linearization_level = 1
+        if hasattr(solver.parameters, "merge_text_format"):
+            lns_params_text = (
+                'subsolver_params { name: "lns_base" linearization_level: 1 }'
+            )
+            solver.parameters.merge_text_format(lns_params_text)
+        else:
+            lns_params = solver.parameters.subsolver_params.add()
+            lns_params.name = "lns_base"
+            lns_params.linearization_level = 1
         if configure_subsolvers:
             solver.parameters.filter_subsolvers.extend([
                 "rins*",
