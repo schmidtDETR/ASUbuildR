@@ -143,6 +143,7 @@ asu_summary <- shiny::reactiveVal(NULL)
 full_data <- shiny::reactiveVal(NULL)
 full_data_reset <- shiny::reactiveVal()
 selected_tracts <- shiny::reactiveVal(NULL)
+nb_adjacency    <- shiny::reactiveVal(NULL) # island-fixed full-state neighbor graph
 
 
 # New England Optional year selection logic
@@ -207,7 +208,7 @@ prep_map_data <- function(map_data) {
   
   map_data |>
     sf::st_make_valid() |>
-    sf::st_simplify(dTolerance = .001, preserveTopology = TRUE) |>  # Simplify geometry
+    sf::st_simplify(dTolerance = .005, preserveTopology = TRUE) |>  # Simplify geometry
     sf::st_zm(what = "ZM", drop = TRUE) |>
     dplyr::filter(!sf::st_is_empty(geometry)) |>
     dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
@@ -452,6 +453,40 @@ update_map_with_data <- function(map_id = "edit_map", new_data = NULL) {
       )
   }
 }
+# Connect every sub-graph to the largest component via nearest centroid.
+fix_nb_islands <- function(nb, intpt_lat, intpt_lon) {
+  g     <- igraph::graph_from_adj_list(nb)
+  comps <- igraph::components(g)
+  if (comps$no <= 1L) return(nb)
+  main_id  <- which.max(comps$csize)
+  main_idx <- which(comps$membership == main_id)
+  for (comp_id in setdiff(unique(comps$membership), main_id)) {
+    island_idx <- which(comps$membership == comp_id)
+    combis     <- expand.grid(island = island_idx, main = main_idx)
+    combis$dist <- sqrt(
+      (intpt_lat[combis$island] - intpt_lat[combis$main])^2 +
+      (intpt_lon[combis$island] - intpt_lon[combis$main])^2
+    )
+    closest <- combis[which.min(combis$dist), ]
+    nb[[closest$island]] <- c(nb[[closest$island]], closest$main)
+    nb[[closest$main]]   <- c(nb[[closest$main]],   closest$island)
+  }
+  nb
+}
+
+# Check whether asu_geoids form a single connected component in stored_nb.
+asu_is_contiguous <- function(asu_geoids, stored_nb) {
+  idx <- which(stored_nb$geoids %in% asu_geoids)
+  if (length(idx) <= 1L) return(TRUE)
+  local_nb <- lapply(seq_along(idx), function(i) {
+    nbrs  <- stored_nb$nb[[idx[i]]]
+    local <- which(idx %in% nbrs)
+    if (length(local) == 0L) integer(0L) else as.integer(local)
+  })
+  g <- igraph::graph_from_adj_list(local_nb, mode = "all")
+  igraph::components(g)$no == 1L
+}
+
 ```
 
 # Data Initialization
@@ -892,6 +927,15 @@ if (identical(algo_choice, "cpsat")) {
     
     # Update merged_sf with the fixed neighborhood structure
     merged_sf$continuous <- nb
+    nb_adjacency(list(geoids = merged_sf$GEOID, nb = nb))
+
+    # Pre-simplify geometry inside withProgress so map renders immediately after
+    # the solver finishes (visible to the user as part of the setup phase).
+    append_cpsat_log("[NB] Simplifying tract geometry...")
+    sf::st_geometry(merged_sf) <- sf::st_geometry(merged_sf) |>
+      sf::st_make_valid() |>
+      sf::st_simplify(dTolerance = .005, preserveTopology = TRUE) |>
+      sf::st_zm(what = "ZM", drop = TRUE)
     
     merged_df <- merged_sf |> sf::st_drop_geometry()
     append_cpsat_log(sprintf("[NB] Tracts kept: %d (after join)", nrow(merged_df)))
@@ -961,7 +1005,7 @@ import pandas as pd
 df = pd.read_csv(r'%s')
 with open(r'%s','r') as f:
     nb = json.load(f)
-print(f'[runner] inputs: rows={{len(df)}} nb_lists={{len(nb)}}')
+print('[runner] inputs: rows=' + str(len(df)) + ' nb_lists=' + str(len(nb)))
 
 kwargs = dict(
     df=df, nb=nb,
@@ -1071,6 +1115,7 @@ print('[runner] OK', flush=True)
               dplyr::mutate(asunum = ifelse(asu_id < 0L, 0L, as.integer(asu_id))) |>
               dplyr::select(-dplyr::any_of("continuous")) |>
               clean_sf_columns()
+            # geometry already simplified in merged_sf (done during withProgress)
 
             # update reactives used by the rest of the app
             full_data(final_sf)
@@ -1124,6 +1169,17 @@ print('[runner] OK', flush=True)
         row_num    = dplyr::row_number(),
         continuous = sfdep::st_contiguity(geometry)
       )
+
+    # Build and cache island-fixed neighbor graph for contiguity checks.
+    nb_adjacency(list(
+      geoids = tract_list$GEOID,
+      nb     = fix_nb_islands(
+        lapply(tract_list$continuous, function(x)
+          if (length(x) == 1L && x == 0L) integer(0L) else as.integer(x)),
+        as.numeric(tract_list$INTPTLAT),
+        as.numeric(tract_list$INTPTLON)
+      )
+    ))
 
     ## 1b · Merge the BLS data (kept for potential checks/debug)
     shiny::incProgress(0.3, detail = "Merging BLS unemployment data\u2026")
@@ -1206,6 +1262,7 @@ shiny::observeEvent(input$th_combine, {
 total_unemp <- shiny::reactive({
   shiny::req(full_data())                                  # wait until available
   full_data() |>
+    sf::st_drop_geometry() |>
     dplyr::filter(asunum > 0) |>
     dplyr::summarise(unemp = sum(tract_ASU_unemp, na.rm = TRUE)) |>
     dplyr::pull(unemp)
@@ -1784,7 +1841,7 @@ shiny::conditionalPanel(
   # Detailed table
   shiny::h4("Tract Details", style = "flex-shrink: 0;"),
   shiny::div(
-    style = "flex: 1; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 5px; min-height: 200px;",
+    style = "flex: 1; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 5px; min-height: 400px;",
     DT::dataTableOutput("summary_table")
   )
 )
@@ -1855,7 +1912,9 @@ output$summary_table <- DT::renderDataTable({
       selection  = "multiple",
       rownames   = FALSE,
       options    = list(
-        pageLength = 15,
+        pageLength = 25,
+        scrollY    = "500px",
+        scrollCollapse = TRUE,
         scrollX    = TRUE,
         dom        = "ftp",
         columnDefs = list(list(className = "dt-right", targets = c(1, 2, 3, 4, 5)))
@@ -2038,20 +2097,29 @@ shiny::observeEvent(input$run_asu_summary, {
 
   asu_sf <- full_data() |> dplyr::filter(asunum > 0.5)
 
-  # Contiguity check: for each ASU, build a Queen-contiguity graph over its
-  # tracts only and verify the graph is fully connected (one component).
-  # Uses the same st_contiguity() approach as the tract-loading step.
+  # Contiguity check: use the island-fixed full-state neighbor graph built at
+  # load time so that island tracts connected via centroid distance are handled
+  # consistently with how the solver built the ASUs.
   asu_ids <- sort(unique(asu_sf$asunum))
+
+  nb_check <- nb_adjacency()
+  if (is.null(nb_check)) {
+    # Fallback for sessions loaded from RDS: rebuild from current geometry.
+    all_sf  <- full_data()
+    raw_nb  <- lapply(
+      suppressWarnings(sfdep::st_contiguity(all_sf$geometry)),
+      function(x) if (length(x) == 1L && x == 0L) integer(0L) else as.integer(x)
+    )
+    fixed_nb <- if (all(c("INTPTLAT", "INTPTLON") %in% names(all_sf)))
+      fix_nb_islands(raw_nb, as.numeric(all_sf$INTPTLAT), as.numeric(all_sf$INTPTLON))
+    else raw_nb
+    nb_check <- list(geoids = all_sf$GEOID, nb = fixed_nb)
+    nb_adjacency(nb_check)
+  }
+
   contiguous_flag <- vapply(asu_ids, function(id) {
-    grp <- asu_sf |> dplyr::filter(asunum == id)
-    if (nrow(grp) <= 1L) return(TRUE)
-    nb <- sfdep::st_contiguity(grp$geometry)
-    # sfdep may return 0 for isolated tracts; normalise to integer(0)
-    nb <- lapply(nb, function(x) {
-      if (length(x) == 1L && x == 0L) integer(0L) else as.integer(x)
-    })
-    g <- igraph::graph_from_adj_list(nb, mode = "all")
-    igraph::components(g)$no == 1L
+    grp_geoids <- asu_sf |> dplyr::filter(asunum == id) |> dplyr::pull(GEOID)
+    asu_is_contiguous(grp_geoids, nb_check)
   }, logical(1L))
 
   contiguity_df <- data.frame(asunum = asu_ids, contiguous = contiguous_flag)
@@ -2093,7 +2161,9 @@ output$asu_review <- DT::renderDataTable({
       rownames  = FALSE,
       selection = "none",
       options   = list(
-        pageLength = 25,
+        pageLength = 50,
+        scrollY    = "600px",
+        scrollCollapse = TRUE,
         dom        = "ftp",
         order      = list(list(0, "asc"))
       )

@@ -1114,7 +1114,8 @@ def solve_one_asu_cpsat(
         if configure_subsolvers:
             solver.parameters.filter_subsolvers.extend([
                 "rins*",
-                #"probing",
+                "reduced_costs",
+                "default_lp",
                 #"max_lp",
                 "probing_max_lp",
                 "lb_tree_search",
@@ -1189,6 +1190,10 @@ def solve_one_asu_cpsat(
                 tie_remaining = float(time_limit) - (time.monotonic() - start_time)
                 if tie_remaining <= 0.01:
                     break
+                # Cap each tie-break stage so a quickly-solved window doesn't
+                # burn the full remaining budget on secondary objectives.
+                _TIE_CAP = 30.0
+                tie_stage_secs = min(tie_remaining, _TIE_CAP)
                 if direction == "max":
                     model.Maximize(expression)
                 else:
@@ -1196,7 +1201,7 @@ def solve_one_asu_cpsat(
 
                 tie_solver = cp_model.CpSolver()
                 tie_solver.parameters.num_search_workers = max(1, int(workers))
-                tie_solver.parameters.max_time_in_seconds = tie_remaining
+                tie_solver.parameters.max_time_in_seconds = tie_stage_secs
                 tie_solver.parameters.log_search_progress = False
                 tie_solver.parameters.cp_model_presolve = True
                 tie_solver.parameters.linearization_level = 2
@@ -1242,7 +1247,8 @@ def frontier_candidates(S: List[int], nb: List[List[int]], allowed: np.ndarray) 
 
 
 def improve_by_trades(S0: List[int], u: np.ndarray, E: np.ndarray, P: np.ndarray, nb: List[List[int]],
-                      tau: float, pop_thresh: int, allowed: np.ndarray, max_iter: int = 200) -> List[int]:
+                      tau: float, pop_thresh: int, allowed: np.ndarray, max_iter: int = 200,
+                      max_swap_checks: Optional[int] = None) -> List[int]:
     S = sorted(set(S0))
     selected = set(S)
     sum_u = int(u[S].sum())
@@ -1263,9 +1269,15 @@ def improve_by_trades(S0: List[int], u: np.ndarray, E: np.ndarray, P: np.ndarray
                 break
         if improved:
             continue
-        # Swap: drop worst u, add best neighbor
-        if len(S) > 1:
+        # Swap: drop worst u, add best neighbor.
+        # max_swap_checks=0 skips this entirely (used after CP-SAT solve where
+        # the solution is already optimal within the window).
+        if len(S) > 1 and max_swap_checks != 0:
+            n_checked = 0
             for r in sorted(S, key=lambda i: u[i]):
+                if max_swap_checks is not None and n_checked >= max_swap_checks:
+                    break
+                n_checked += 1
                 reduced_u = sum_u - int(u[r])
                 reduced_E = sum_E - int(E[r])
                 reduced_P = sum_P - int(P[r])
@@ -2828,7 +2840,8 @@ def build_many_asus_cpsat(
             own_mask = np.zeros(n, dtype=bool)
             own_mask[w["sub"]] = True
             allowed_idx = np.where(remaining & (~batch_mask | own_mask))[0]
-            S_refined = improve_by_trades(S_global, u, E, P, nb, tau, pop_thresh, allowed_idx, max_iter=200)
+            S_refined = improve_by_trades(S_global, u, E, P, nb, tau, pop_thresh, allowed_idx,
+                                           max_iter=200, max_swap_checks=0)
             if not component_ok(S_refined, u, E, P, tau, pop_thresh, nb):
                 S_refined = S_global
             candidates.append(S_refined)
@@ -2888,7 +2901,8 @@ def build_many_asus_cpsat(
         for S in final_units:
             pending_mask[S] = False
             allowed_idx = np.where(remaining & ~pending_mask)[0]
-            S_final = improve_by_trades(S, u, E, P, nb, tau, pop_thresh, allowed_idx, max_iter=200)
+            S_final = improve_by_trades(S, u, E, P, nb, tau, pop_thresh, allowed_idx,
+                                         max_iter=200, max_swap_checks=0)
             if not component_ok(S_final, u, E, P, tau, pop_thresh, nb):
                 S_final = S
 
