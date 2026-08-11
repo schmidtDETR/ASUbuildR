@@ -17,3 +17,4 @@ temp_*.R
 test folder/asu_exports/
 .positai
 .venv/
+.codex_exact_lns_patch_probe

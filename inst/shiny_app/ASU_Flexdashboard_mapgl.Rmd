@@ -1413,8 +1413,8 @@ shiny::htmlOutput("total_unemp2")
 shiny::renderUI(shiny::HTML("<hr>"))
 
 # Select an ASU — render once, update choices in-place to avoid full widget rebuild
-shiny::renderUI(shiny::selectInput("select_asunum", "Select ASU Number:",
-              choices = "None", selected = "None"))
+shiny::selectInput("select_asunum", "Select ASU Number:",
+              choices = "None", selected = "None")
 shiny::renderUI(shiny::HTML("<hr>"))
 
 # Change ASU
