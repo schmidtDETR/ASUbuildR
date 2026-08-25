@@ -1913,8 +1913,6 @@ output$summary_table <- DT::renderDataTable({
       rownames   = FALSE,
       options    = list(
         pageLength = 25,
-        scrollY    = "500px",
-        scrollCollapse = TRUE,
         scrollX    = TRUE,
         dom        = "ftp",
         columnDefs = list(list(className = "dt-right", targets = c(1, 2, 3, 4, 5)))
