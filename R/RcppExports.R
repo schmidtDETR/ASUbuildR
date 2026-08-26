@@ -13,3 +13,73 @@ choose_best_neighbor <- function(boundary_tracts, emp_vec, unemp_vec, pop_vec, a
     .Call(`_ASUbuildR_choose_best_neighbor`, boundary_tracts, emp_vec, unemp_vec, pop_vec, asu_emp, asu_unemp, asu_pop, ur_thresh)
 }
 
+#' Find articulation points in the induced subgraph on selected nodes
+#'
+#' @param nb_local R List of 0-based integer neighbor vectors
+#' @param selected logical vector (TRUE = node is selected / active)
+#' @return 0-based integer vector of cut vertices
+#' @export
+cpp_articulation_points <- function(nb_local, selected) {
+    .Call(`_ASUbuildR_cpp_articulation_points`, nb_local, selected)
+}
+
+#' Greedy-snake warm-start hint for the CP-SAT ASU solver
+#'
+#' Mirrors \code{greedy_snake_hint()} in \file{inst/python/asu_cpsat.py}.
+#' Phase 1 expands from \code{root_local} first, then exhausts remaining
+#' high-UR seeds.  Phase 2 merges adjacent groups that keep UR >= tau.
+#'
+#' @param nb_local R List of 0-based integer neighbor vectors
+#' @param u_g numeric vector of unemployed counts (same length as nb_local)
+#' @param E_g numeric vector of employed counts
+#' @param P_g numeric vector of population counts
+#' @param tau UR threshold (e.g. 0.0645)
+#' @param pop_thresh minimum population for a valid ASU
+#' @param root_local 0-based index of the root/seed tract
+#' @return sorted 0-based integer vector of selected tract indices
+#' @export
+cpp_greedy_snake_hint <- function(nb_local, u_g, E_g, P_g, tau, pop_thresh, root_local) {
+    .Call(`_ASUbuildR_cpp_greedy_snake_hint`, nb_local, u_g, E_g, P_g, tau, pop_thresh, root_local)
+}
+
+#' Reverse-prune warm-start hint for the CP-SAT ASU solver
+#'
+#' Mirrors \code{reverse_prune_hint()} in \file{inst/python/asu_cpsat.py}.
+#' Starts with all nodes selected and iteratively drops the node that
+#' buys the most UR improvement per unemployed person dropped.
+#' Never drops the root, articulation points, or nodes that break pop_thresh.
+#'
+#' @param nb_local R List of 0-based integer neighbor vectors
+#' @param u_g numeric vector of unemployed counts
+#' @param E_g numeric vector of employed counts
+#' @param P_g numeric vector of population counts
+#' @param tau UR threshold
+#' @param pop_thresh minimum population for a valid ASU
+#' @param root_local 0-based index of the root/seed tract
+#' @return sorted 0-based integer vector of selected tract indices
+#' @export
+cpp_reverse_prune_hint <- function(nb_local, u_g, E_g, P_g, tau, pop_thresh, root_local) {
+    .Call(`_ASUbuildR_cpp_reverse_prune_hint`, nb_local, u_g, E_g, P_g, tau, pop_thresh, root_local)
+}
+
+#' Compute the best warm-start hint for a CP-SAT ASU window
+#'
+#' Runs both the greedy-snake and reverse-prune algorithms and returns the
+#' one with higher total unemployment (i.e., the better objective hint).
+#'
+#' @param nb_local R List of 0-based integer neighbor vectors
+#' @param u_g numeric vector of unemployed counts
+#' @param E_g numeric vector of employed counts
+#' @param P_g numeric vector of population counts
+#' @param tau UR threshold
+#' @param pop_thresh minimum population for a valid ASU
+#' @param root_local 0-based index of the root/seed tract
+#' @return Named list: \code{hint} (0-based sorted IntegerVector),
+#'   \code{source} (character: "greedy_snake", "reverse_prune", or ""),
+#'   \code{unemp} (integer total unemployment in hint),
+#'   \code{valid} (logical: TRUE if hint meets tau and pop_thresh)
+#' @export
+cpp_compute_asu_hint <- function(nb_local, u_g, E_g, P_g, tau, pop_thresh, root_local) {
+    .Call(`_ASUbuildR_cpp_compute_asu_hint`, nb_local, u_g, E_g, P_g, tau, pop_thresh, root_local)
+}
+

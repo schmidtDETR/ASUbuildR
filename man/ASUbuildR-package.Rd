@@ -6,7 +6,15 @@
 \alias{ASUbuildR-package}
 \title{ASUbuildR: A Shiny Interface for Constructing Areas of Substantial Unemployment}
 \description{
-Provides a point-and-click GUI together with helper algorithms for building Areas of Substantial Unemployment (ASUs) from Census tract and BLS data. The package wraps a Shiny Flexdashboard interface plus utilities for optimising tract groupings and exporting results.
+Provides a point-and-click GUI together with helper algorithms for building Areas of Substantial Unemployment (ASUs) from Census tract and BLS data. The package wraps a Shiny Flexdashboard interface and utilities for optimizing tract groupings and exporting results.
+}
+\seealso{
+Useful links:
+\itemize{
+  \item \url{https://github.com/aisolori/ASUbuildR}
+  \item Report bugs at \url{https://github.com/aisolori/ASUbuildR/issues}
+}
+
 }
 \author{
 \strong{Maintainer}: David Schmidt \email{deschmidt@detr.nv.gov}
