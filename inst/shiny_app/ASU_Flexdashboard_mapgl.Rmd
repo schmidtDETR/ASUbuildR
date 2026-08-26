@@ -9,6 +9,34 @@ editor_options:
   markdown: 
     wrap: 72
 ---
+
+
+<style>
+.dataTables_wrapper {
+  width: fit-content !important;
+  max-width: 100%;
+}
+
+.dataTables_scroll {
+  width: fit-content !important;
+  max-width: 100%;
+}
+
+.dataTables_scrollBody {
+  height: auto !important;
+  max-width: 100%;
+}
+
+table.dataTable {
+  width: auto !important;
+}
+
+table.dataTable th,
+table.dataTable td {
+  white-space: nowrap;
+}
+</style>
+
 ```{r python_preamble, include=FALSE}
 library(reticulate)
 library(processx)
@@ -2140,7 +2168,9 @@ output$asu_review <- DT::renderDataTable({
     DT::datatable(
       rownames  = FALSE,
       selection = "none",
+      
       options   = list(
+        scrollX   = TRUE,
         pageLength = 25,
         dom        = "ftp",
         order      = list(list(0, "asc"))
