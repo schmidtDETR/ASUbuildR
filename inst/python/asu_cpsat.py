@@ -1119,10 +1119,10 @@ def solve_one_asu_cpsat(
         solver.parameters.max_time_in_seconds = remaining_time
         solver.parameters.log_search_progress = bool(log)
         solver.parameters.cp_model_presolve = True
-        solver.parameters.linearization_level = 1
+        solver.parameters.linearization_level = 2
         solver.parameters.cp_model_probing_level = 2
-        solver.parameters.cut_level = 1
-        solver.parameters.lns_initial_difficulty = 0.3
+        solver.parameters.cut_level = 2
+        solver.parameters.lns_initial_difficulty = 0.5
 
         if hasattr(solver.parameters, "merge_text_format"):
             lns_params_text = (
@@ -1136,6 +1136,8 @@ def solve_one_asu_cpsat(
         if configure_subsolvers:
             solver.parameters.filter_subsolvers.extend([
                 "probing",
+                "pseudo_costs",
+                "quick_restart_no_lp",
                 "rins*",
                 "probing_max_lp",
                 "lb_tree_search",
@@ -1157,7 +1159,7 @@ def solve_one_asu_cpsat(
         #     "graph_var_lns",
         #     "rnd_cst_lns",
         # ])
-        # solver.parameters.extra_subsolvers.extend(["graph_arc_lns"]) 
+        solver.parameters.extra_subsolvers.extend(["probing", "probing_max_lp", "pseudo_costs", "quick_restart_no_lp"]) 
         if rel_gap is not None:
             solver.parameters.relative_gap_limit = float(rel_gap)
         status = solver.Solve(model)
