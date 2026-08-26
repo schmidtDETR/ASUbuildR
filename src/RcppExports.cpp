@@ -58,11 +58,78 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// cpp_articulation_points
+IntegerVector cpp_articulation_points(List nb_local, LogicalVector selected);
+RcppExport SEXP _ASUbuildR_cpp_articulation_points(SEXP nb_localSEXP, SEXP selectedSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< List >::type nb_local(nb_localSEXP);
+    Rcpp::traits::input_parameter< LogicalVector >::type selected(selectedSEXP);
+    rcpp_result_gen = Rcpp::wrap(cpp_articulation_points(nb_local, selected));
+    return rcpp_result_gen;
+END_RCPP
+}
+// cpp_greedy_snake_hint
+IntegerVector cpp_greedy_snake_hint(List nb_local, NumericVector u_g, NumericVector E_g, NumericVector P_g, double tau, int pop_thresh, int root_local);
+RcppExport SEXP _ASUbuildR_cpp_greedy_snake_hint(SEXP nb_localSEXP, SEXP u_gSEXP, SEXP E_gSEXP, SEXP P_gSEXP, SEXP tauSEXP, SEXP pop_threshSEXP, SEXP root_localSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< List >::type nb_local(nb_localSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type u_g(u_gSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type E_g(E_gSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type P_g(P_gSEXP);
+    Rcpp::traits::input_parameter< double >::type tau(tauSEXP);
+    Rcpp::traits::input_parameter< int >::type pop_thresh(pop_threshSEXP);
+    Rcpp::traits::input_parameter< int >::type root_local(root_localSEXP);
+    rcpp_result_gen = Rcpp::wrap(cpp_greedy_snake_hint(nb_local, u_g, E_g, P_g, tau, pop_thresh, root_local));
+    return rcpp_result_gen;
+END_RCPP
+}
+// cpp_reverse_prune_hint
+IntegerVector cpp_reverse_prune_hint(List nb_local, NumericVector u_g, NumericVector E_g, NumericVector P_g, double tau, int pop_thresh, int root_local);
+RcppExport SEXP _ASUbuildR_cpp_reverse_prune_hint(SEXP nb_localSEXP, SEXP u_gSEXP, SEXP E_gSEXP, SEXP P_gSEXP, SEXP tauSEXP, SEXP pop_threshSEXP, SEXP root_localSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< List >::type nb_local(nb_localSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type u_g(u_gSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type E_g(E_gSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type P_g(P_gSEXP);
+    Rcpp::traits::input_parameter< double >::type tau(tauSEXP);
+    Rcpp::traits::input_parameter< int >::type pop_thresh(pop_threshSEXP);
+    Rcpp::traits::input_parameter< int >::type root_local(root_localSEXP);
+    rcpp_result_gen = Rcpp::wrap(cpp_reverse_prune_hint(nb_local, u_g, E_g, P_g, tau, pop_thresh, root_local));
+    return rcpp_result_gen;
+END_RCPP
+}
+// cpp_compute_asu_hint
+List cpp_compute_asu_hint(List nb_local, NumericVector u_g, NumericVector E_g, NumericVector P_g, double tau, int pop_thresh, int root_local);
+RcppExport SEXP _ASUbuildR_cpp_compute_asu_hint(SEXP nb_localSEXP, SEXP u_gSEXP, SEXP E_gSEXP, SEXP P_gSEXP, SEXP tauSEXP, SEXP pop_threshSEXP, SEXP root_localSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< List >::type nb_local(nb_localSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type u_g(u_gSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type E_g(E_gSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type P_g(P_gSEXP);
+    Rcpp::traits::input_parameter< double >::type tau(tauSEXP);
+    Rcpp::traits::input_parameter< int >::type pop_thresh(pop_threshSEXP);
+    Rcpp::traits::input_parameter< int >::type root_local(root_localSEXP);
+    rcpp_result_gen = Rcpp::wrap(cpp_compute_asu_hint(nb_local, u_g, E_g, P_g, tau, pop_thresh, root_local));
+    return rcpp_result_gen;
+END_RCPP
+}
 
 static const R_CallMethodDef CallEntries[] = {
     {"_ASUbuildR_build_asu_edges", (DL_FUNC) &_ASUbuildR_build_asu_edges, 2},
     {"_ASUbuildR_choose_best_drop_candidate", (DL_FUNC) &_ASUbuildR_choose_best_drop_candidate, 8},
     {"_ASUbuildR_choose_best_neighbor", (DL_FUNC) &_ASUbuildR_choose_best_neighbor, 8},
+    {"_ASUbuildR_cpp_articulation_points", (DL_FUNC) &_ASUbuildR_cpp_articulation_points, 2},
+    {"_ASUbuildR_cpp_greedy_snake_hint", (DL_FUNC) &_ASUbuildR_cpp_greedy_snake_hint, 7},
+    {"_ASUbuildR_cpp_reverse_prune_hint", (DL_FUNC) &_ASUbuildR_cpp_reverse_prune_hint, 7},
+    {"_ASUbuildR_cpp_compute_asu_hint", (DL_FUNC) &_ASUbuildR_cpp_compute_asu_hint, 7},
     {NULL, NULL, 0}
 };
 

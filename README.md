@@ -4,32 +4,58 @@
 # ASUbuildR
 
 <!-- badges: start -->
+
+[![R-CMD-check](https://github.com/aisolori/ASUbuildR/actions/workflows/R-CMD-check.yaml/badge.svg)](https://github.com/aisolori/ASUbuildR/actions/workflows/R-CMD-check.yaml)
+[![Python environment smoke
+test](https://github.com/aisolori/ASUbuildR/actions/workflows/python-setup-smoke.yaml/badge.svg)](https://github.com/aisolori/ASUbuildR/actions/workflows/python-setup-smoke.yaml)
 <!-- badges: end -->
 
-ASUbuildR provides a GUI interface to equip state to more easily
-generate Areas of Substantial Unemployment (ASU) that maximize
-unemploymnet within ASUs in a state. This package depends on receiving
-an Excel file from the U.S. Bureau of Labor Statistics which includes
-their tract-level labor force estimates reflecting the twelve months
-ending in June, with preliminary estimates for June, revised estimates
-for January-May, and benchmarked estimates for July-December in the
-prior year.
+ASUbuildR provides an interactive dashboard for constructing Areas of
+Substantial Unemployment (ASUs) from Census tract and U.S. Bureau of
+Labor Statistics data. It includes multiple tract-grouping algorithms,
+an interactive map for reviewing results, and tools for exporting
+completed ASUs.
+
+The dashboard expects the BLS Excel workbook containing tract-level
+labor force estimates for the 12 months ending in June.
 
 ## Installation
 
-You can install the development version of ASUbuildR from
-[GitHub](https://github.com/) with:
+Install the package directly from GitHub with
+[pak](https://pak.r-lib.org/):
 
 ``` r
-# install.packages("remotes")
-remotes::install_github("schmidtDETR/ASUbuildR")
+# Run this once if pak is not installed:
+install.packages("pak")
+
+pak::pak("aisolori/ASUbuildR")
 ```
+
+ASUbuildR requires R 4.1 or later and Pandoc, which is included with
+RStudio and Quarto. Tract Hunter and Simple Snake require no separate
+Python setup.
+
+The optional CP-SAT solver uses a managed Python 3.11 environment with
+OR-Tools, NumPy, pandas, NetworkX, and openpyxl. Configure it once after
+installing the R package:
+
+``` r
+ASUbuildR::setup_asu_python()
+ASUbuildR::check_asu_python()
+```
+
+The first setup can take several minutes because it installs Miniconda
+when Conda is not already available.
 
 ## Running the Application
 
-ASUbuildR launches an interactive Shiny application, which you can open
-by running this function:
+Launch the interactive dashboard with:
 
 ``` r
-#ASUbuildR::launch_ASUbuildR()
+ASUbuildR::launch_ASUbuildR()
 ```
+
+Within the dashboard, import the state BLS ASU workbook, choose Census
+tract boundaries for the matching year, build an initial solution,
+refine tract assignments on the map, and validate and export the
+completed ASUs.
