@@ -1,0 +1,3060 @@
+#!/usr/bin/env python3
+"""
+asu_cpsat.py — Build Areas of Substantial Unemployment (ASUs) with OR-Tools CP-SAT.
+
+Modified to ensure:
+1. Seeds are selected from unassigned tracts with high unemployment rate
+2. Stops when no remaining unassigned tract has UR >= tau (6.45%)
+3. Warm starts can reroute around articulation points before pruning/refilling
+4. Proven-optimal ties prefer more threshold slack, then fewer tracts
+
+Two ways to provide adjacency (contiguity):
+  A) Precomputed neighbors JSON (recommended on servers without a Geo stack)
+     - JSON format: list of lists of tract indices (0- or 1-based). E.g., [[1,4],[2],...]
+  B) Geometry file (GeoPackage/Shapefile) + libpysal Queen contiguity
+
+Input table must contain:
+  geoid, tract_ASU_unemp, tract_ASU_emp, tract_pop2024
+
+Examples:
+  # Using precomputed neighbors (fastest to deploy)
+  python asu_cpsat.py --input OR_asu26.xlsx --neighbors nb_queen.json \
+    --tau 0.0645 --pop-thresh 10000 --max-asus 30 --time-limit 1200 --workers 8 --verbose
+
+  # Compute queen contiguity from geometry (requires geopandas, libpysal)
+  python asu_cpsat.py --input OR_asu26.xlsx --geometry tracts_or_2024.gpkg \
+    --geom-col geometry --geoid-col GEOID \
+    --tau 0.0645 --pop-thresh 10000 --max-asus 30 --time-limit 1200 --workers 8 --verbose
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import heapq
+import json
+import math
+import os
+import time
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+from ortools.sat.python import cp_model
+
+# Optional (only needed if you compute contiguity on the fly)
+try:
+    import geopandas as gpd
+    from libpysal.weights import Queen
+    from shapely.validation import make_valid as shapely_make_valid
+except Exception:
+    gpd = None
+    Queen = None
+    shapely_make_valid = None
+
+
+# ---------- Helpers ----------
+def as_fraction_tau(tau: float) -> Tuple[int, int]:
+    """Represent k = tau/(1-tau) as num/den using exact integers when tau has 4 decimals."""
+    T = int(round(tau * 10000))
+    one_minus = 10000 - T
+    g = math.gcd(T, one_minus)
+    return T // g, one_minus // g  # k = num/den
+
+
+def ur_of(u_sum: int, E_sum: int) -> float:
+    """Calculate unemployment rate from counts, avoiding divide-by-zero."""
+    return 0.0 if (u_sum + E_sum) == 0 else u_sum / (u_sum + E_sum)
+
+
+def bfs_ball(nb: List[List[int]], center: int, r: int, allowed: np.ndarray) -> List[int]:
+    allowed_set = set(int(a) for a in allowed)
+    vis = {center}
+    frontier = [center]
+    layer = 0
+    while layer < r:
+        nxt = []
+        for v in frontier:
+            for w in nb[v]:
+                if (w in allowed_set) and (w not in vis):
+                    vis.add(w)
+                    nxt.append(w)
+        if not nxt:
+            break
+        frontier = list(set(nxt))
+        layer += 1
+    return sorted(vis)
+
+
+def greedy_snake_hint(
+    nb_local: List[List[int]],
+    u_g: np.ndarray, # unemployment counts per tract
+    E_g: np.ndarray, # employment counts per tract
+    P_g: np.ndarray, # population counts per tract
+    tau: float, # unemployment rate threshold for ASU selection
+    pop_thresh: int, # minimum population threshold for ASU selection
+    root_local: int,
+) -> List[int]:
+    """
+    Run Simple Snake across the full local window, then combine touching groups.
+    Phase 1: seed root_local first, then exhaust all remaining high-UR seeds.
+    Phase 2: merge any groups adjacent to root's group that keep UR >= tau.
+    Returns the resulting merged group (local indices) as the CP-SAT warm-start hint.
+    """
+    N = len(nb_local)
+    UR = u_g / np.maximum(u_g + E_g, 1e-12)
+    assigned = np.full(N, -1, dtype=int)   # group id per node, -1 = unassigned
+    remaining = np.ones(N, dtype=bool)
+
+    def _expand(seed: int) -> set:
+        sel = {seed}
+        sel_u = int(u_g[seed])
+        sel_e = int(E_g[seed])
+        sel_p = int(P_g[seed])
+        # incremental frontier: O(N·degree) total instead of O(N²·degree)
+        frontier = {w for w in nb_local[seed] if remaining[w]}
+        while frontier:
+            best, best_ur = None, -1.0
+            for cand in frontier:
+                cu = sel_u + int(u_g[cand])
+                ce = sel_e + int(E_g[cand])
+                cur = cu / (cu + ce) if cu + ce > 0 else 0.0
+                if cur > best_ur:
+                    best_ur, best = cur, cand
+            if best is None or (best_ur < tau and sel_p >= pop_thresh):
+                break
+            sel.add(best)
+            frontier.discard(best)
+            sel_u += int(u_g[best])
+            sel_e += int(E_g[best])
+            sel_p += int(P_g[best])
+            for w in nb_local[best]:
+                if w not in sel and remaining[w]:
+                    frontier.add(w)
+        return sel
+
+    # Phase 1: seed root_local first, then exhaust remaining high-UR seeds
+    groups: List[set] = []
+
+    root_set = _expand(root_local)
+    root_gid = 0
+    for v in root_set:
+        assigned[v] = root_gid
+        remaining[v] = False
+    groups.append(root_set)
+
+    while True:
+        rem = np.where(remaining & (UR >= tau))[0]
+        if rem.size == 0:
+            break
+        seed = int(rem[np.argmax(UR[rem])])
+        sel = _expand(seed)
+        gid = len(groups)
+        for v in sel:
+            assigned[v] = gid
+            remaining[v] = False
+        groups.append(sel)
+
+    # Phase 2: merge groups that touch root_gid and keep combined UR >= tau
+    pending: set = set()
+    for v in groups[root_gid]:
+        for w in nb_local[v]:
+            g = assigned[w]
+            if g not in (-1, root_gid) and len(groups[g]) > 0:
+                pending.add(g)
+
+    while pending:
+        gid = pending.pop()
+        if len(groups[gid]) == 0:
+            continue
+        combined = list(groups[root_gid] | groups[gid])
+        cu = int(u_g[combined].sum())
+        ce = int(E_g[combined].sum())
+        if cu + ce > 0 and cu / (cu + ce) >= tau:
+            new_members = groups[gid]
+            for v in new_members:
+                assigned[v] = root_gid
+            groups[root_gid] = groups[root_gid] | new_members
+            groups[gid] = set()
+            # discover neighbours newly exposed by the merged members
+            for v in new_members:
+                for w in nb_local[v]:
+                    g = assigned[w]
+                    if g not in (-1, root_gid) and len(groups[g]) > 0:
+                        pending.add(g)
+
+    return sorted(groups[root_gid])
+
+
+def _articulation_points(nb_local: List[List[int]], selected: np.ndarray) -> set:
+    """
+    Iterative Tarjan articulation-point finder restricted to the induced subgraph
+    on `selected` nodes. A cut vertex's removal disconnects the remainder of its
+    connected component, so these are never valid drop candidates for
+    reverse_prune_hint. Mirrors the iterative low-link style of
+    _bridge_edge_bounds but for vertices instead of edges.
+    Returns a set of local node indices that are cut vertices.
+    """
+    N = len(nb_local)
+    disc = [-1] * N
+    low = [0] * N
+    parent = [-1] * N
+    skipped_parent = [False] * N
+    root_children = [0] * N
+    is_art: set = set()
+    timer = 0
+
+    for start in range(N):
+        if not selected[start] or disc[start] != -1:
+            continue
+        stack = [(start, iter(nb_local[start]))]
+        disc[start] = low[start] = timer
+        timer += 1
+        while stack:
+            u, it = stack[-1]
+            recursed = False
+            for w in it:
+                if not selected[w]:
+                    continue
+                if w == parent[u] and not skipped_parent[u]:
+                    skipped_parent[u] = True
+                    continue
+                if disc[w] == -1:
+                    parent[w] = u
+                    if parent[u] == -1:
+                        root_children[start] += 1
+                    disc[w] = low[w] = timer
+                    timer += 1
+                    stack.append((w, iter(nb_local[w])))
+                    recursed = True
+                    break
+                else:
+                    low[u] = min(low[u], disc[w])
+            if not recursed:
+                stack.pop()
+                if stack:
+                    p = stack[-1][0]
+                    low[p] = min(low[p], low[u])
+                    if parent[p] != -1 and low[u] >= disc[p]:
+                        is_art.add(p)
+        if root_children[start] > 1:
+            is_art.add(start)
+    return is_art
+
+
+def _root_articulation_implications(
+    nb_local: List[List[int]], root_local: int,
+) -> List[Tuple[int, int]]:
+    """Return (node, cut_vertex) pairs where selecting node requires cut_vertex."""
+    selected = np.ones(len(nb_local), dtype=bool)
+    cut_vertices = _articulation_points(nb_local, selected)
+
+    root_component = {root_local}
+    stack = [root_local]
+    while stack:
+        node = stack.pop()
+        for neighbor in nb_local[node]:
+            if neighbor not in root_component:
+                root_component.add(neighbor)
+                stack.append(neighbor)
+
+    implications: List[Tuple[int, int]] = []
+    for cut_vertex in sorted(cut_vertices - {root_local}):
+        reachable = {root_local}
+        stack = [root_local]
+        while stack:
+            node = stack.pop()
+            for neighbor in nb_local[node]:
+                if neighbor != cut_vertex and neighbor not in reachable:
+                    reachable.add(neighbor)
+                    stack.append(neighbor)
+        implications.extend(
+            (node, cut_vertex)
+            for node in sorted(root_component - reachable - {cut_vertex})
+        )
+    return implications
+
+
+def reverse_prune_hint(
+    nb_local: List[List[int]],
+    u_g: np.ndarray,  # tract unemployment counts
+    E_g: np.ndarray,  # tract employment counts
+    P_g: np.ndarray,  # tract population counts
+    tau: float,
+    pop_thresh: int,
+    root_local: int,
+) -> List[int]:
+    """
+    Warm start via reverse pruning.
+
+    Start with every tract selected, then repeatedly remove the valid tract
+    with the lowest economic efficiency:
+
+        efficiency = unemployed / rate-capacity cost
+
+        rate-capacity cost =
+            tau * employed - (1 - tau) * unemployed
+
+    A positive capacity cost means the tract's unemployment rate is below
+    tau and therefore consumes unemployment-rate slack.
+
+    The root, articulation points, and removals that violate the population
+    threshold are excluded. Stops when aggregate UR reaches tau or no valid
+    removal remains.
+    """
+    N = len(nb_local)
+    selected = np.ones(N, dtype=bool)
+
+    U_sum = int(u_g.sum())
+    E_sum = int(E_g.sum())
+    P_sum = int(P_g.sum())
+
+    # Amount of threshold capacity consumed by each tract.
+    capacity_cost = tau * E_g - (1.0 - tau) * u_g
+
+    while ur_of(U_sum, E_sum) < tau:
+        cut_vertices = _articulation_points(nb_local, selected)
+
+        droppable = selected.copy()
+        droppable[root_local] = False
+
+        for v in cut_vertices:
+            droppable[v] = False
+
+        # Removing a tract must preserve the population requirement.
+        droppable &= (P_sum - P_g) >= pop_thresh
+
+        # Only below-threshold tracts consume rate capacity.
+        # Removing one of these necessarily improves aggregate threshold slack.
+        droppable &= capacity_cost > 0
+
+        cand_idx = np.flatnonzero(droppable)
+
+        if cand_idx.size == 0:
+            break
+
+        candidate_cost = capacity_cost[cand_idx]
+
+        # Lower efficiency means fewer unemployed are sacrificed for each
+        # unit of rate capacity recovered.
+        efficiency = np.divide(
+            u_g[cand_idx].astype(float),
+            candidate_cost,
+            out=np.full(cand_idx.size, np.inf, dtype=float),
+            where=candidate_cost > 0,
+        )
+
+        best = int(cand_idx[np.argmin(efficiency)])
+
+        selected[best] = False
+        U_sum -= int(u_g[best])
+        E_sum -= int(E_g[best])
+        P_sum -= int(P_g[best])
+
+    return np.flatnonzero(selected).astype(int).tolist()
+
+def _spanning_tree_flows(hint: List[int], nb_local: List[List[int]], root_local: int) -> Dict[Tuple[int, int], int]:
+    """
+    Compute single-commodity flow values for the BFS spanning tree of hint.
+    Each tree edge (parent→child) carries flow = subtree size at child.
+    Returns a dict of (i, j) -> flow for non-zero entries only.
+    """
+    if not hint:
+        return {}
+    hint_set = set(hint)
+    parent: Dict[int, Optional[int]] = {root_local: None}
+    children: Dict[int, List[int]] = {v: [] for v in hint}
+    queue = [root_local]
+    order: List[int] = []
+    while queue:
+        v = queue.pop(0)
+        order.append(v)
+        for w in nb_local[v]:
+            if w in hint_set and w not in parent:
+                parent[w] = v
+                children[v].append(w)
+                queue.append(w)
+    size: Dict[int, int] = {v: 1 for v in hint}
+    for v in reversed(order):
+        for c in children[v]:
+            size[v] += size[c]
+    flows: Dict[Tuple[int, int], int] = {}
+    for v in hint:
+        p = parent[v]
+        if p is not None:
+            flows[(p, v)] = size[v]
+    return flows
+
+
+def component_ok(S: List[int], u: np.ndarray, E: np.ndarray, P: np.ndarray,
+                 tau: float, pop_thresh: int, nb: List[List[int]]) -> bool:
+    if not S:
+        return False
+    Sset = set(S)
+    # connectivity (BFS)
+    seen = {S[0]}
+    Q = [S[0]]
+    while Q:
+        v = Q.pop()
+        for w in nb[v]:
+            if (w in Sset) and (w not in seen):
+                seen.add(w)
+                Q.append(w)
+    if len(seen) != len(S):
+        return False
+    su, sE, sP = int(u[S].sum()), int(E[S].sum()), int(P[S].sum())
+    return (sP >= pop_thresh) and (ur_of(su, sE) >= tau)
+
+
+def can_hit_tau(u: np.ndarray, E: np.ndarray, P: np.ndarray,
+                nb_local: List[List[int]], tau: float, pop_thresh: int) -> bool:
+    """Quick optimistic screen: if no component can meet UR/pop, skip solving."""
+    if len(u) == 0:
+        return False
+    UR = u / np.maximum(u + E, 1e-12)
+    if UR.max(initial=0.0) < tau:
+        return False
+    # BFS-ball windows are always connected; single-component knapsack is sufficient
+    num, den = as_fraction_tau(tau)
+    D = den * u - num * E
+    rho = D / np.maximum(P, 1e-12)
+    ord_idx = np.argsort(-rho)
+    need = pop_thresh
+    cumD = 0.0
+    for j in ord_idx:
+        pj, dj = int(P[j]), float(D[j])
+        if pj <= 0:
+            continue
+        take = min(pj, need)
+        cumD += dj * (take / pj)
+        need -= take
+        if need <= 0:
+            break
+    return need <= 0 and cumD >= 0
+
+
+def queen_neighbors_from_geometries(gdf: "gpd.GeoDataFrame", geom_col: str = "geometry") -> List[List[int]]:
+    if gpd is None or Queen is None:
+        raise RuntimeError("geopandas + libpysal required to compute contiguity from geometry.")
+    if geom_col not in gdf.columns:
+        raise ValueError(f"Geometry column '{geom_col}' not found.")
+
+    gdf = gdf.reset_index(drop=True)
+    # basic validity repair
+    if hasattr(gdf.geometry, "is_valid"):
+        invalid = ~gdf.geometry.is_valid
+        if invalid.any():
+            gdf.loc[invalid, geom_col] = gdf.loc[invalid, geom_col].buffer(0)
+            invalid = ~gdf.geometry.is_valid
+            if invalid.any() and shapely_make_valid is not None:
+                gdf.loc[invalid, geom_col] = gdf.loc[invalid, geom_col].apply(shapely_make_valid)
+
+    W = Queen.from_dataframe(gdf, ids=list(range(len(gdf))))
+    nb = [[] for _ in range(len(gdf))]
+    for i, neigh in W.neighbors.items():
+        nb[i] = sorted(neigh)
+    return nb
+
+
+def contract_high_ur_nodes(
+    nb_local: List[List[int]],
+    u_g: np.ndarray,
+    E_g: np.ndarray,
+    P_g: np.ndarray,
+    tau: float,
+) -> Tuple[List[List[int]], np.ndarray, np.ndarray, np.ndarray, List[List[int]], np.ndarray]:
+    """
+    Fuse each connected cluster of UR>=tau tracts into one super-node (exact, lossless).
+    Mediant inequality: mixing two UR>=tau distributions keeps combined UR>=tau, so
+    every cluster member co-occurs in every optimal solution — no branching needed.
+    Returns: nb_r, u_r, E_r, P_r, expand, node_map
+      expand[ri]  = sorted list of original local indices for reduced node ri
+      node_map[v] = reduced index for original local node v
+    """
+    N = len(nb_local)
+    num, den = as_fraction_tau(tau)
+    high_set = {
+        i for i in range(N)
+        if int(den) * int(u_g[i]) - int(num) * int(E_g[i]) >= 0
+    }
+
+    # BFS over induced high-UR subgraph to label connected components
+    comp = np.full(N, -1, dtype=int)
+    c = 0
+    for v in sorted(high_set):
+        if comp[v] >= 0:
+            continue
+        stk = [v]
+        comp[v] = c
+        while stk:
+            cur = stk.pop()
+            for w in nb_local[cur]:
+                if w in high_set and comp[w] < 0:
+                    comp[w] = c
+                    stk.append(w)
+        c += 1
+    n_super = c
+
+    # Reduced indices: super-nodes 0..n_super-1, then one index per low-UR node
+    node_map = np.empty(N, dtype=int)
+    next_low = n_super
+    for v in range(N):
+        if v in high_set:
+            node_map[v] = comp[v]
+        else:
+            node_map[v] = next_low
+            next_low += 1
+    N_r = next_low
+
+    expand: List[List[int]] = [[] for _ in range(N_r)]
+    for v in range(N):
+        expand[node_map[v]].append(v)
+
+    u_r = np.array([int(u_g[expand[ri]].sum()) for ri in range(N_r)], dtype=np.int64)
+    E_r = np.array([int(E_g[expand[ri]].sum()) for ri in range(N_r)], dtype=np.int64)
+    P_r = np.array([int(P_g[expand[ri]].sum()) for ri in range(N_r)], dtype=np.int64)
+
+    adj_sets: List[set] = [set() for _ in range(N_r)]
+    for v in range(N):
+        rv = int(node_map[v])
+        for w in nb_local[v]:
+            rw = int(node_map[w])
+            if rv != rw:
+                adj_sets[rv].add(rw)
+                adj_sets[rw].add(rv)
+    nb_r = [sorted(s) for s in adj_sets]
+
+    return nb_r, u_r, E_r, P_r, expand, node_map
+
+
+# ---------- CP-SAT core: solve one ASU within a window ----------
+def _bridge_edge_bounds(nb_local: List[List[int]]) -> Dict[Tuple[int, int], int]:
+    """
+    Find bridges (cut edges) of the FIXED underlying graph and, for each, the size
+    of each side's component when that bridge is removed. Sound (unlike a
+    reference-spanning-tree bound of the *selected* subgraph, which depends on
+    the unknown selection and was proven unsound this session): a bridge splits
+    the known, fixed graph into exactly two components regardless of what ends up
+    selected, so the flow crossing it in either direction can never exceed that
+    side's node count. Non-bridge edges (on any cycle) get no tightening here --
+    flow could route around the cycle, so no valid per-edge bound below N-1 can
+    be derived from local structure alone.
+    Returns {(u, v): bound} for every directed bridge edge in both directions.
+    """
+    N = len(nb_local)
+    disc = [-1] * N
+    low = [0] * N
+    subtree_size = [1] * N
+    parent = [-1] * N
+    skipped_parent = [False] * N
+    bounds: Dict[Tuple[int, int], int] = {}
+    timer = 0
+
+    for start in range(N):
+        if disc[start] != -1:
+            continue
+        comp_nodes = 0
+        comp_bridges: List[Tuple[int, int]] = []
+        stack = [(start, iter(nb_local[start]))]
+        disc[start] = low[start] = timer
+        timer += 1
+        while stack:
+            u, it = stack[-1]
+            recursed = False
+            for w in it:
+                if w == parent[u] and not skipped_parent[u]:
+                    skipped_parent[u] = True
+                    continue
+                if disc[w] == -1:
+                    parent[w] = u
+                    disc[w] = low[w] = timer
+                    timer += 1
+                    stack.append((w, iter(nb_local[w])))
+                    recursed = True
+                    break
+                else:
+                    low[u] = min(low[u], disc[w])
+            if not recursed:
+                stack.pop()
+                comp_nodes += 1
+                if stack:
+                    p = stack[-1][0]
+                    low[p] = min(low[p], low[u])
+                    subtree_size[p] += subtree_size[u]
+                    if low[u] > disc[p]:
+                        # (p, u) is a bridge -- removing it isolates u's DFS
+                        # subtree from the rest of this connected component.
+                        # subtree_size[u] is already final (u's own subtree is
+                        # fully explored before u is popped), but the *other*
+                        # side's size needs the component's final total node
+                        # count, which isn't known until this whole DFS
+                        # finishes -- so defer and fill in below.
+                        bounds[(p, u)] = subtree_size[u]
+                        comp_bridges.append((u, p))
+        for (u, p) in comp_bridges:
+            bounds[(u, p)] = comp_nodes - subtree_size[u]
+    return bounds
+
+
+class CpsatResult:
+    def __init__(self, sel_idx_local: List[int], root_local: int, obj: int, status: str):
+        self.sel_idx_local = sel_idx_local
+        self.root_local = root_local
+        self.obj = obj
+        self.status = status
+
+
+def solve_one_asu_cpsat(
+    nb_local: List[List[int]],
+    u_g: np.ndarray,
+    E_g: np.ndarray,
+    P_g: np.ndarray,
+    tau: float,
+    pop_thresh: int,
+    root_local: int,
+    time_limit: int = 1200,
+    workers: int = 8,
+    log: bool = True,
+    rel_gap: Optional[float] = None,
+    hint: Optional[List[int]] = None,
+    hint_obj: Optional[int] = None,
+    forced_selected: Optional[List[int]] = None,
+    cluster_groups: Optional[List[List[int]]] = None,
+    deterministic_ties: bool = True,
+    tie_break_rank: Optional[List[int]] = None,
+    objective_shaving: bool = False,
+    use_root_articulation_implications: bool = False,
+    use_signed_flow: bool = True,
+    use_arborescence: bool = False,
+    configure_subsolvers: bool = True,
+) -> Optional[CpsatResult]:
+    """
+        Connectivity via iterative vertex-separator cuts. Each disconnected incumbent
+        adds valid constraints requiring a selected path from its components to the root.
+    Objective: maximize Σ u_i x_i. If the primary objective is proven optimal,
+    remaining time is used to maximize exact threshold slack, minimize tract
+    count, and finally minimize a stable GEOID/local-index rank sum.
+    """
+    N = len(nb_local)
+    if N == 0:
+        return None
+
+    # Contract UR>=tau clusters so the model has fewer variables; expand at every
+    # return point. All cluster members co-occur in any feasible solution (mediant
+    # inequality), so this is exact — not an approximation.
+    nb_c, u_c, E_c, P_c, expand_c, node_map_c = contract_high_ur_nodes(nb_local, u_g, E_g, P_g, tau)
+    nb_local_orig, u_g_orig, root_local_orig = nb_local, u_g, root_local
+    nb_local, u_g, E_g, P_g = nb_c, u_c, E_c, P_c
+    N = len(nb_local)
+    root_local = int(node_map_c[root_local_orig])
+    if hint is not None:
+        hint = sorted({int(node_map_c[v]) for v in hint})
+
+    def _to_orig(sel: Optional[List[int]], status: str) -> "CpsatResult":
+        orig = sorted({v for ri in sel for v in expand_c[ri]}) if sel else []
+        return CpsatResult(orig, root_local_orig, int(u_g_orig[orig].sum()) if orig else 0, status)
+
+    model = cp_model.CpModel()
+
+    # Decision variables
+    x = [model.NewBoolVar(f"x_{i}") for i in range(N)]
+
+    # Selecting the root permits its entire connected high-UR component at no cost.
+    forced_set = {int(node_map_c[v]) for v in (forced_selected or [])}
+    forced_set.add(root_local)
+    for i in forced_set:
+        model.Add(x[i] == 1)
+
+    # Valid for ANY connected subgraph: every selected non-root node must have at
+    # least one selected neighbor (it can't be reached from root otherwise). Free
+    # to add upfront (no separation needed) and tightens both the cut phase and the
+    # flow phase since they share this same model.
+    for v in range(N):
+        if v == root_local:
+            continue
+        if nb_local[v]:
+            model.Add(x[v] <= sum(x[w] for w in nb_local[v]))
+        else:
+            model.Add(x[v] == 0)
+
+    if use_root_articulation_implications:
+        for node, cut_vertex in _root_articulation_implications(nb_local, root_local):
+            model.Add(x[node] <= x[cut_vertex])
+
+    # Population threshold
+    pop_expr = sum(int(P_g[i]) * x[i] for i in range(N))
+    model.Add(pop_expr >= int(pop_thresh))
+
+    # UR >= tau as exact integer linear inequality
+    num, den = as_fraction_tau(tau)
+    lhs = sum(int(den) * int(u_g[i]) * x[i] for i in range(N)) \
+        - sum(int(num) * int(E_g[i]) * x[i] for i in range(N))
+    model.Add(lhs >= 0)
+
+    # Objective: maximize unemployment captured
+    obj_expr = sum(int(u_g[i]) * x[i] for i in range(N))
+    model.Maximize(obj_expr)
+
+    # Warm-start with the connected reverse-prune solution.
+    if hint is not None:
+        hint_set = set(hint)
+        for i in range(N):
+            model.AddHint(x[i], 1 if i in hint_set else 0)
+
+    # Lower bound: reject solutions worse than the reverse-prune warm start.
+    if hint_obj is not None and hint_obj > 0:
+        model.Add(obj_expr >= hint_obj)
+
+    # Solver params
+    best_connected = sorted(hint) if hint and component_ok(
+        hint, u_g, E_g, P_g, tau, pop_thresh, nb_local
+    ) else None
+    best_obj = int(u_g[best_connected].sum()) if best_connected else -1
+    lower_bound = hint_obj if (hint_obj is not None and hint_obj > 0) else -1
+    start_time = time.monotonic()
+    cut_round = 0
+    # NOTE: a tight objective/bound in the cut-only (disconnected) relaxation does
+    # NOT imply cuts are close to finding a *connected* solution -- the "price of
+    # connectivity" gap can be large and take many more rounds to close than the
+    # relaxation's bound suggests (measured: 15 rounds over ~30s shrank components
+    # from 18->8 without ever reaching a single connected component). The exact
+    # flow-based phase is what actually *guarantees* progress toward a connected
+    # answer, so it must keep the majority of the time budget; cuts are only a
+    # cheap pre-pass to prune obviously-disconnected structure.
+    #
+    # NOTE: tried removing this cut pre-pass entirely (going straight to the
+    # exact flow model) and A/B tested it on real Colorado data -- it was a
+    # clear regression (0.35%->0.79% gap, 75,357->75,204 unemp @300s) with no
+    # wall-time savings (still used the full 300s budget either way). The
+    # boundary constraints these cuts add evidently still prune the flow
+    # phase's search space usefully even when they never converge to a single
+    # connected component. See SKILL.md.
+    cut_time_budget = 0.0  # cut pre-pass disabled
+    stall_rounds = 0
+    prev_num_components: Optional[int] = None
+    first_components: Optional[int] = None
+
+    while cut_round < 15:
+        elapsed = time.monotonic() - start_time
+        remaining_for_cuts = cut_time_budget - elapsed
+        if remaining_for_cuts <= 0:
+            break
+
+        solver = cp_model.CpSolver()
+        solver.parameters.num_search_workers = max(1, int(workers))
+        solver.parameters.max_time_in_seconds = remaining_for_cuts
+        solver.parameters.log_search_progress = False  # silent; summary logged after loop
+        solver.parameters.cp_model_presolve = True
+        solver.parameters.linearization_level = 2
+
+        status = solver.Solve(model)
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            break
+
+        selected = [i for i in range(N) if solver.BooleanValue(x[i])]
+        selected_set = set(selected)
+        root_component = {root_local}
+        stack = [root_local]
+        while stack:
+            v = stack.pop()
+            for w in nb_local[v]:
+                if w in selected_set and w not in root_component:
+                    root_component.add(w)
+                    stack.append(w)
+
+        if len(root_component) == len(selected):
+            objective = int(round(solver.ObjectiveValue()))
+            if objective > best_obj:
+                best_connected, best_obj = selected, objective
+                if best_obj > lower_bound:
+                    model.Add(obj_expr >= best_obj)
+                    lower_bound = best_obj
+            if status == cp_model.OPTIMAL and not deterministic_ties:
+                return _to_orig(selected, "OPTIMAL")
+            break
+
+        unseen = selected_set - root_component
+        components: List[set] = []
+        while unseen:
+            seed = unseen.pop()
+            component = {seed}
+            stack = [seed]
+            while stack:
+                v = stack.pop()
+                for w in nb_local[v]:
+                    if w in unseen:
+                        unseen.remove(w)
+                        component.add(w)
+                        stack.append(w)
+            components.append(component)
+
+        if first_components is None:
+            first_components = len(components)
+        if prev_num_components is not None and len(components) >= prev_num_components:
+            stall_rounds += 1
+        else:
+            stall_rounds = 0
+        prev_num_components = len(components)
+
+        for component in components:
+            boundary = sorted({
+                w for v in component for w in nb_local[v]
+                if w not in component
+            })
+            if boundary:
+                # BoolOr lives in the SAT core (unit propagation) and is also
+                # auto-linearized into the LP at linearization_level=2.
+                for v in component:
+                    model.AddBoolOr([x[v].Not()] + [x[w] for w in boundary])
+            else:
+                for v in component:
+                    model.Add(x[v] == 0)
+        cut_round += 1
+        if stall_rounds >= 3:
+            break
+
+    # Finish with exact connectivity, strengthened by the cuts.
+    flow_source = best_connected if best_connected is not None else hint
+    flow_hints = (
+        _spanning_tree_flows(flow_source, nb_local, root_local)
+        if flow_source is not None else {}
+    )
+
+    if use_arborescence:
+        # Boolean arborescence formulation.
+        # par_vars[(i,j)] = 1  ↔  j is the parent of i in the rooted spanning tree.
+        # For each selected non-root node exactly one parent is assigned; acyclicity
+        # is enforced by strictly increasing depth along parent edges (big-M
+        # linearisation).  Advantages vs. integer flow:
+        #   - ~8 k BoolVars replace ~4 k large-domain IntVars → CP-SAT can apply
+        #     clause learning and unit propagation far more aggressively.
+        #   - Only N depth IntVars (domain [0, N-1]) replace 4 k flow IntVars with
+        #     the same domain, cutting total integer domain size ~6×.
+        par_vars = {}   # (i, j) -> BoolVar: j is the parent of i
+        for i, nb_i in enumerate(nb_local):
+            for j in nb_i:
+                if i != j:
+                    par_vars[(i, j)] = model.NewBoolVar(f"par_{i}_{j}")
+
+        depth_vars = [model.NewIntVar(0, N - 1, f"d_{i}") for i in range(N)]
+        model.Add(depth_vars[root_local] == 0)
+
+        for i in range(N):
+            if i == root_local:
+                continue
+            parent_choices = [par_vars[(i, j)] for j in nb_local[i]]
+            # exactly one parent when selected, zero when unselected
+            model.Add(sum(parent_choices) == x[i])
+            for j in nb_local[i]:
+                model.Add(par_vars[(i, j)] <= x[j])   # parent must be selected
+                # Acyclicity: if j is parent of i then depth[i] > depth[j]
+                # depth[i] >= depth[j] + 1 - (N-1)*(1 - par_vars[(i,j)])
+                model.Add(
+                    depth_vars[i] - depth_vars[j]
+                    >= 1 - (N - 1) * (1 - par_vars[(i, j)])
+                )
+
+        # Warm-start: derive parent assignments and depths from spanning tree.
+        # flow_hints has {(p, v): subtree_size} where p is the parent of v.
+        tree_parent = {v: p for (p, v) in flow_hints}   # child -> parent
+        ch_map = {v: [] for v in range(N)}
+        for v, p in tree_parent.items():
+            if 0 <= p < N:
+                ch_map[p].append(v)
+        depth_hint = {root_local: 0}
+        bfs_q = [root_local]
+        while bfs_q:
+            node = bfs_q.pop(0)
+            for child in ch_map[node]:
+                if child not in depth_hint:
+                    depth_hint[child] = depth_hint[node] + 1
+                    bfs_q.append(child)
+        for (i, j), pvar in par_vars.items():
+            model.AddHint(pvar, 1 if tree_parent.get(i) == j else 0)
+        for i in range(N):
+            model.AddHint(depth_vars[i], depth_hint.get(i, 0))
+
+        if log:
+            print(
+                f"  flow formulation: arborescence "
+                f"({len(par_vars)} parent vars + {N} depth vars)",
+                flush=True,
+            )
+    else:
+        # Single-commodity integer flow connectivity
+        if use_signed_flow:
+            edges = sorted({
+                (min(i, j), max(i, j))
+                for i, neighbors in enumerate(nb_local) for j in neighbors if i != j
+            })
+        else:
+            edges = list(dict.fromkeys(
+                (i, j) for i, neighbors in enumerate(nb_local) for j in neighbors if i != j
+            ))
+
+        # NOTE: a per-edge bound derived from a single fixed reference spanning tree
+        # (e.g. subtree size) is UNSOUND on graphs with cycles -- the actual flow can
+        # legitimately need to route around a different topology than any one fixed
+        # tree, and a fixed-tree bound can wrongly reject genuinely feasible connected
+        # selections. Verified empirically: a 5-cycle counterexample where excluding
+        # one low-value node forces routing 3 units through what a BFS tree treats as
+        # a capacity-2 edge. The uniform bound below is the correct, universally valid
+        # one (flow on any edge can never exceed total selected nodes - 1).
+        # Tighten M via a fast connectivity-free solve: max tracts s.t. UR/pop only.
+        _mM = cp_model.CpModel()
+        _mx = [_mM.NewBoolVar(f"mx_{i}") for i in range(N)]
+        for _fi in forced_set:
+            _mM.Add(_mx[_fi] == 1)
+        _mM.Add(sum(int(P_g[i]) * _mx[i] for i in range(N)) >= int(pop_thresh))
+        _mM.Add(
+            sum(int(den) * int(u_g[i]) * _mx[i] for i in range(N))
+            - sum(int(num) * int(E_g[i]) * _mx[i] for i in range(N))
+            >= 0
+        )
+        _mM.Maximize(sum(_mx))
+        _ms = cp_model.CpSolver()
+        _ms.parameters.num_search_workers = max(1, int(workers))
+        _ms.parameters.max_time_in_seconds = 10.0
+        _ms.parameters.cp_model_presolve = True
+        _ms.parameters.linearization_level = 2
+        _ms.parameters.log_search_progress = False
+        _ms_status = _ms.Solve(_mM)
+        if _ms_status == cp_model.OPTIMAL:
+            M = max(1, int(round(_ms.ObjectiveValue())) - 1)
+        else:
+            M = max(1, N - 1)
+        # NOTE: _bridge_edge_bounds() gives a provably sound tighter per-edge cap
+        # (validated against 400 brute-force instances + explicit counterexamples)
+        # but was A/B tested on real Colorado data and was a clear regression
+        # (0.52%->2.62% gap, 75,214->74,160 unemp @300s) -- see SKILL.md. Kept
+        # available but NOT wired in by default.
+        edge_bounds = [M] * len(edges)
+
+        selected_count = sum(x)
+
+        if use_signed_flow:
+            f = [
+                model.NewIntVar(-edge_bounds[idx], edge_bounds[idx], f"f_{i}_{j}")
+                for idx, (i, j) in enumerate(edges)
+            ]
+            net_out_for = [[] for _ in range(N)]
+            for edge_index, (i, j) in enumerate(edges):
+              model.Add(f[edge_index] == 0).OnlyEnforceIf(x[i].Not())
+              model.Add(f[edge_index] == 0).OnlyEnforceIf(x[j].Not())
+          
+              net_out_for[i].append(f[edge_index])
+              net_out_for[j].append(-f[edge_index])
+          
+              model.AddHint(
+                  f[edge_index],
+                  flow_hints.get((i, j), 0) - flow_hints.get((j, i), 0),
+              )
+            for i in range(N):
+                net_outflow = sum(net_out_for[i]) if net_out_for[i] else 0
+                model.Add(net_outflow == (selected_count - 1 if i == root_local else -x[i]))
+        else:
+            f = [model.NewIntVar(0, edge_bounds[idx], f"f_{i}_{j}") for idx, (i, j) in enumerate(edges)]
+            in_edges_for = [[] for _ in range(N)]
+            out_edges_for = [[] for _ in range(N)]
+            for edge_index, (i, j) in enumerate(edges):
+                out_edges_for[i].append(edge_index)
+                in_edges_for[j].append(edge_index)
+                model.Add(f[edge_index] <= edge_bounds[edge_index] * x[i])
+                model.Add(f[edge_index] <= edge_bounds[edge_index] * x[j])
+                model.AddHint(f[edge_index], flow_hints.get((i, j), 0))
+            for i in range(N):
+                inflow = sum(f[e] for e in in_edges_for[i]) if in_edges_for[i] else 0
+                outflow = sum(f[e] for e in out_edges_for[i]) if out_edges_for[i] else 0
+                if i == root_local:
+                    model.Add(outflow - inflow == selected_count - 1)
+                else:
+                    model.Add(inflow - outflow == x[i])
+
+        if log:
+            print(f"  flow formulation: {'signed' if use_signed_flow else 'directed'} "
+                  f"({len(edges)} edge variables)", flush=True)
+
+    remaining_time = float(time_limit) - (time.monotonic() - start_time)
+    if log and cut_round > 0:
+        _fc = first_components or "?"
+        _lc = prev_num_components if prev_num_components is not None else "?"
+        print(f"  cut phase: {cut_round} round(s), components {_fc}->{_lc}, "
+              f"{time_limit - remaining_time:.1f}s used; {remaining_time:.1f}s for flow phase", flush=True)
+    if remaining_time <= 0:
+        return _to_orig(best_connected, "FEASIBLE") if best_connected else None
+
+    # Scout: 10 s LNS-only pass on the full flow model to lift the warm-start
+    # incumbent before the lbts-heavy main solve. lbts proves bounds but is slow
+    # to improve the primal; the LNS subsolvers do the opposite -- suppress lbts
+    # here so all 18 workers focus on finding better connected incumbents fast.
+    _SCOUT_SECS = 10.0
+    if remaining_time > _SCOUT_SECS + 30.0:
+        _scout = cp_model.CpSolver()
+        _scout.parameters.num_search_workers = max(1, int(workers))
+        _scout.parameters.max_time_in_seconds = _SCOUT_SECS
+        _scout.parameters.log_search_progress = False
+        _scout.parameters.cp_model_presolve = True
+        _scout.parameters.linearization_level = 2
+        _scout.parameters.cp_model_probing_level = 2
+        _scout.parameters.cut_level = 1
+        if configure_subsolvers:
+            _scout.parameters.ignore_subsolvers.extend([
+                "lb_tree_search",
+                "probing",
+                "objective_shaving_max_lp", "objective_shaving_no_lp",
+                "objective_lb_search_max_lp",
+                "feasibility_pump",
+            ])
+        _scout_status = _scout.Solve(model)
+        if _scout_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            _scout_sel = [i for i in range(N) if _scout.BooleanValue(x[i])]
+            _scout_obj = int(u_g[_scout_sel].sum())
+            if _scout_obj > best_obj:
+                best_connected, best_obj = _scout_sel, _scout_obj
+                model.Add(obj_expr >= _scout_obj)
+                lower_bound = _scout_obj
+                _scout_set = set(_scout_sel)
+                if not use_arborescence:
+                    _sf = _spanning_tree_flows(_scout_sel, nb_local, root_local)
+                    model.ClearHints()
+                    for _i in range(N):
+                        model.AddHint(x[_i], 1 if _i in _scout_set else 0)
+                    if use_signed_flow:
+                        for _ei, (_eu, _ev) in enumerate(edges):
+                            model.AddHint(f[_ei], _sf.get((_eu, _ev), 0) - _sf.get((_ev, _eu), 0))
+                    else:
+                        for _ei, (_eu, _ev) in enumerate(edges):
+                            model.AddHint(f[_ei], _sf.get((_eu, _ev), 0))
+                else:
+                    # Rebuild arborescence hints from the scout's BFS spanning tree.
+                    # The scout added obj_expr >= _scout_obj to the model; the old
+                    # hint (pre-scout objective) would violate that hard constraint.
+                    _sf_arb = _spanning_tree_flows(_scout_sel, nb_local, root_local)
+                    _tp = {v: p for (p, v) in _sf_arb}
+                    _ch: Dict[int, List[int]] = {v: [] for v in range(N)}
+                    for _v, _p in _tp.items():
+                        if 0 <= _p < N:
+                            _ch[_p].append(_v)
+                    _dh: Dict[int, int] = {root_local: 0}
+                    _bfsq = [root_local]
+                    while _bfsq:
+                        _nd = _bfsq.pop(0)
+                        for _child in _ch[_nd]:
+                            if _child not in _dh:
+                                _dh[_child] = _dh[_nd] + 1
+                                _bfsq.append(_child)
+                    model.ClearHints()
+                    for _i in range(N):
+                        model.AddHint(x[_i], 1 if _i in _scout_set else 0)
+                    for (_ai, _aj), _pvar in par_vars.items():
+                        model.AddHint(_pvar, 1 if _tp.get(_ai) == _aj else 0)
+                    for _i in range(N):
+                        model.AddHint(depth_vars[_i], _dh.get(_i, 0))
+                if log:
+                    print(f"  scout: improved incumbent to {_scout_obj} "
+                          f"(+{_scout_obj - (hint_obj or 0)} vs hint)", flush=True)
+
+    status = cp_model.UNKNOWN
+    status_name = "UNKNOWN"
+    selected: List[int] = []
+    objective = -1
+
+    if objective_shaving and best_connected is not None and rel_gap is None:
+        proof_model = model.clone()
+        proof_model.ClearObjective()
+        proof_model.ClearHints()
+        proof_iterations = 0
+
+        while True:
+            proof_remaining = float(time_limit) - (time.monotonic() - start_time)
+            if proof_remaining <= 0.01:
+                break
+            target = best_obj + 1
+            proof_model.Add(obj_expr >= target)
+            if log:
+                print(f"  objective shaving: testing objective >= {target} "
+                      f"with {proof_remaining:.1f}s remaining", flush=True)
+
+            proof_solver = cp_model.CpSolver()
+            proof_solver.parameters.num_search_workers = max(1, int(workers))
+            proof_solver.parameters.max_time_in_seconds = proof_remaining
+            proof_solver.parameters.log_search_progress = bool(log)
+            proof_solver.parameters.cp_model_presolve = True
+            proof_solver.parameters.linearization_level = 2
+            proof_iterations += 1
+            proof_status = proof_solver.Solve(proof_model)
+
+            if proof_status == cp_model.INFEASIBLE:
+                status = cp_model.OPTIMAL
+                status_name = "OPTIMAL"
+                selected = best_connected
+                objective = best_obj
+                if log:
+                    print(f"  objective shaving: proved optimal at {best_obj} "
+                          f"after {proof_iterations} feasibility test(s)", flush=True)
+                break
+            if proof_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                if log:
+                    print(f"  objective shaving: no proof after {proof_iterations} "
+                          f"test(s); retaining incumbent {best_obj}", flush=True)
+                break
+
+            candidate = [i for i in range(N) if proof_solver.BooleanValue(x[i])]
+            candidate_obj = int(u_g[candidate].sum())
+            if candidate_obj <= best_obj:
+                break
+            best_connected, best_obj = candidate, candidate_obj
+            if log:
+                print(f"  objective shaving: improved incumbent to {best_obj}; "
+                      f"testing {best_obj + 1}", flush=True)
+
+    if status != cp_model.OPTIMAL:
+        remaining_time = float(time_limit) - (time.monotonic() - start_time)
+        if remaining_time <= 0.01:
+            return _to_orig(best_connected, "FEASIBLE") if best_connected else None
+
+        solver = cp_model.CpSolver()
+        solver.parameters.num_search_workers = max(1, int(workers))
+        solver.parameters.max_time_in_seconds = remaining_time
+        solver.parameters.log_search_progress = bool(log)
+        solver.parameters.cp_model_presolve = True
+        solver.parameters.linearization_level = 2
+        solver.parameters.cp_model_probing_level = 2
+        solver.parameters.cut_level = 2
+        solver.parameters.lns_initial_difficulty = 0.5
+
+        if hasattr(solver.parameters, "merge_text_format"):
+            lns_params_text = (
+                'subsolver_params { name: "lns_base" linearization_level: 1 }'
+            )
+            solver.parameters.merge_text_format(lns_params_text)
+        else:
+            lns_params = solver.parameters.subsolver_params.add()
+            lns_params.name = "lns_base"
+            lns_params.linearization_level = 1
+        if configure_subsolvers:
+            solver.parameters.filter_subsolvers.extend([
+                "probing",
+                "pseudo_costs",
+                "quick_restart_no_lp",
+                "rins*",
+                "probing_max_lp",
+                "lb_tree_search",
+                "graph_arc_lns",
+                "graph_var*",
+                "ls*"
+            ])
+        # solver.parameters.ignore_subsolvers.extend([
+        #     "pseudo_costs",
+        #     "reduced_costs",
+        #     "default_lp",
+        #     "quick_restart",
+        #     # Keep quick_restart_no_lp enabled.
+        #     "objective_shaving_max_lp",f
+        #     "objective_shaving_no_lp",
+        #     "objective_lb_search_max_lp",
+        #     "feasibility_pump",
+        #     "graph_cst_lns",
+        #     "graph_var_lns",
+        #     "rnd_cst_lns",
+        # ])
+        solver.parameters.extra_subsolvers.extend(["probing", "probing_max_lp", "pseudo_costs", "quick_restart_no_lp"]) 
+        if rel_gap is not None:
+            solver.parameters.relative_gap_limit = float(rel_gap)
+        status = solver.Solve(model)
+        status_name = solver.StatusName(status)
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            selected = [i for i in range(N) if solver.BooleanValue(x[i])]
+            objective = int(u_g[selected].sum())
+
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        # A secondary objective must never trade away even one unemployed
+        # person, so tie-breaking is staged only after primary optimality is
+        # proven and obj_expr is fixed exactly. Each stage uses only time left
+        # from the original per-window budget.
+        if status == cp_model.OPTIMAL and deterministic_ties and rel_gap is None:
+            model.Add(obj_expr == objective)
+            incumbent = selected
+
+            N_orig = len(nb_local_orig)
+            if tie_break_rank is None:
+                stable_rank = list(range(N))
+            else:
+                if len(tie_break_rank) != N_orig:
+                    raise ValueError("tie_break_rank must have one entry per local node")
+                # Aggregate original per-tract ranks to contracted-node ranks.
+                stable_rank = [
+                    sum(int(tie_break_rank[v]) + 1 for v in expand_c[ri]) - 1
+                    for ri in range(N)
+                ]
+
+            rank_expr = sum((stable_rank[i] + 1) * x[i] for i in range(N))
+            # Count original tracts, not contracted nodes.
+            tract_count = sum(len(expand_c[ri]) * x[ri] for ri in range(N))
+            tie_stages = [
+                ("slack", "max", lhs),
+                ("count", "min", tract_count),
+                ("rank", "min", rank_expr),
+            ]
+
+            def tie_value(stage_name: str, nodes: List[int]) -> int:
+                if stage_name == "slack":
+                    return sum(
+                        int(den) * int(u_g[i]) - int(num) * int(E_g[i])
+                        for i in nodes
+                    )
+                if stage_name == "count":
+                    return sum(len(expand_c[ri]) for ri in nodes)
+                return sum(stable_rank[i] + 1 for i in nodes)
+
+            for stage_name, direction, expression in tie_stages:
+                tie_remaining = float(time_limit) - (time.monotonic() - start_time)
+                if tie_remaining <= 0.01:
+                    break
+                # Cap each tie-break stage so a quickly-solved window doesn't
+                # burn the full remaining budget on secondary objectives.
+                _TIE_CAP = 30.0
+                tie_stage_secs = min(tie_remaining, _TIE_CAP)
+                if direction == "max":
+                    model.Maximize(expression)
+                else:
+                    model.Minimize(expression)
+
+                tie_solver = cp_model.CpSolver()
+                tie_solver.parameters.num_search_workers = max(1, int(workers))
+                tie_solver.parameters.max_time_in_seconds = tie_stage_secs
+                tie_solver.parameters.log_search_progress = False
+                tie_solver.parameters.cp_model_presolve = True
+                tie_solver.parameters.linearization_level = 2
+                if configure_subsolvers:
+                    tie_solver.parameters.ignore_subsolvers.extend([
+                        "pseudo_costs", "reduced_costs", "default_lp", "quick_restart",
+                    ])
+                tie_status = tie_solver.Solve(model)
+                if tie_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                    break
+
+                candidate = [i for i in range(N) if tie_solver.BooleanValue(x[i])]
+                candidate_value = tie_value(stage_name, candidate)
+                incumbent_value = tie_value(stage_name, incumbent)
+                if (
+                    (direction == "max" and candidate_value >= incumbent_value)
+                    or (direction == "min" and candidate_value <= incumbent_value)
+                ):
+                    incumbent = candidate
+                if tie_status != cp_model.OPTIMAL:
+                    break
+
+                model.Add(expression == candidate_value)
+
+            selected = incumbent
+
+        return _to_orig(selected, status_name)
+    if best_connected is not None:
+        return _to_orig(best_connected, "FEASIBLE")
+    return None
+
+
+# ---------- Simple improver (local trades) ----------
+def frontier_candidates(S: List[int], nb: List[List[int]], allowed: np.ndarray) -> List[int]:
+    Sset = set(S)
+    allowed_set = set(int(a) for a in allowed)
+    cand = set()
+    for v in S:
+        for w in nb[v]:
+            if (w not in Sset) and (w in allowed_set):
+                cand.add(w)
+    return sorted(cand)
+
+
+def improve_by_trades(S0: List[int], u: np.ndarray, E: np.ndarray, P: np.ndarray, nb: List[List[int]],
+                      tau: float, pop_thresh: int, allowed: np.ndarray, max_iter: int = 200,
+                      max_swap_checks: Optional[int] = None) -> List[int]:
+    S = sorted(set(S0))
+    selected = set(S)
+    sum_u = int(u[S].sum())
+    sum_E = int(E[S].sum())
+    sum_P = int(P[S].sum())
+    for _ in range(max_iter):
+        improved = False
+        # Greedy adds: frontier nodes are adjacent to S so S∪{t} is always connected
+        for t in sorted(frontier_candidates(S, nb, allowed), key=lambda i: u[i], reverse=True):
+            next_u = sum_u + int(u[t])
+            next_E = sum_E + int(E[t])
+            next_P = sum_P + int(P[t])
+            if next_P >= pop_thresh and ur_of(next_u, next_E) >= tau:
+                selected.add(t)
+                S = sorted(selected)
+                sum_u, sum_E, sum_P = next_u, next_E, next_P
+                improved = True
+                break
+        if improved:
+            continue
+        # Swap: drop worst u, add best neighbor.
+        # max_swap_checks=0 skips this entirely (used after CP-SAT solve where
+        # the solution is already optimal within the window).
+        if len(S) > 1 and max_swap_checks != 0:
+            n_checked = 0
+            for r in sorted(S, key=lambda i: u[i]):
+                if max_swap_checks is not None and n_checked >= max_swap_checks:
+                    break
+                n_checked += 1
+                reduced_u = sum_u - int(u[r])
+                reduced_E = sum_E - int(E[r])
+                reduced_P = sum_P - int(P[r])
+                if reduced_P < pop_thresh or ur_of(reduced_u, reduced_E) < tau:
+                    continue
+                S2 = sorted(selected - {r})
+                if not component_ok(S2, u, E, P, tau, pop_thresh, nb):
+                    continue
+                for a in sorted(frontier_candidates(S2, nb, allowed), key=lambda i: u[i], reverse=True):
+                    next_u = reduced_u + int(u[a])
+                    next_E = reduced_E + int(E[a])
+                    next_P = reduced_P + int(P[a])
+                    if (next_u > sum_u and next_P >= pop_thresh
+                            and ur_of(next_u, next_E) >= tau):
+                        selected = set(S2)
+                        selected.add(a)
+                        S = sorted(selected)
+                        sum_u, sum_E, sum_P = next_u, next_E, next_P
+                        improved = True
+                        break
+                if improved:
+                    break
+        if not improved:
+            break
+    return S
+
+
+def _selection_key(S: set, u: np.ndarray, slack: np.ndarray) -> Tuple:
+    """Lexicographic warm-start score matching the CP-SAT tie-break policy."""
+    idx = sorted(S)
+    return (
+        int(u[idx].sum()),
+        int(slack[idx].sum()),
+        -len(idx),
+        tuple(-i for i in idx),
+    )
+
+
+def _repair_rate_after_augmentation(
+    selected: set,
+    protected: set,
+    nb: List[List[int]],
+    u: np.ndarray,
+    P: np.ndarray,
+    slack: np.ndarray,
+    pop_thresh: int,
+) -> Optional[set]:
+    """
+    Restore rate feasibility after temporarily adding a connector/path.
+
+    Only non-articulation, below-threshold nodes may be removed. The removal
+    score is unemployment sacrificed per unit of exact rate slack recovered.
+    Augmentation nodes and the root's forced high-UR component are protected so
+    a proposed reroute cannot simply undo itself during repair.
+    """
+    S = set(selected)
+    slack_sum = int(slack[list(S)].sum())
+    pop_sum = int(P[list(S)].sum())
+
+    while slack_sum < 0:
+        selected_mask = np.zeros(len(nb), dtype=bool)
+        selected_mask[list(S)] = True
+        cut_vertices = _articulation_points(nb, selected_mask)
+        candidates = [
+            i for i in S - protected - cut_vertices
+            if int(slack[i]) < 0 and pop_sum - int(P[i]) >= pop_thresh
+        ]
+        if not candidates:
+            return None
+
+        def drop_key(i: int) -> Tuple:
+            recovered = -int(slack[i])
+            return (
+                int(u[i]) / recovered,
+                int(u[i]),
+                -recovered,
+                i,
+            )
+
+        dropped = min(candidates, key=drop_key)
+        S.remove(dropped)
+        slack_sum -= int(slack[dropped])
+        pop_sum -= int(P[dropped])
+
+    return S
+
+
+def _small_leaf_bundles(
+    selected: set,
+    protected: set,
+    root_local: int,
+    nb: List[List[int]],
+    u: np.ndarray,
+    P: np.ndarray,
+    slack: np.ndarray,
+    pop_thresh: int,
+    max_bundle_nodes: int,
+    max_candidates: int,
+) -> List[frozenset]:
+    """
+    Return cheap connectivity-safe ejections.
+
+    Besides ordinary non-articulation singletons, this identifies a pendant
+    branch as an articulation point plus every component it separates from the
+    root. Removing the whole bundle leaves exactly the root-side component, so
+    a poor branch can be traded even when none of its nodes is initially
+    removable on its own.
+    """
+    S = set(selected)
+    selected_mask = np.zeros(len(nb), dtype=bool)
+    selected_mask[list(S)] = True
+    cut_vertices = _articulation_points(nb, selected_mask)
+    pop_sum = int(P[list(S)].sum())
+    bundles: set = set()
+
+    for i in S - protected - cut_vertices:
+        if int(slack[i]) < 0 and pop_sum - int(P[i]) >= pop_thresh:
+            bundles.add(frozenset((i,)))
+
+    for articulation in sorted(cut_vertices - protected):
+        reached = {root_local}
+        stack = [root_local]
+        while stack:
+            v = stack.pop()
+            for w in nb[v]:
+                if w in S and w != articulation and w not in reached:
+                    reached.add(w)
+                    stack.append(w)
+
+        branch = frozenset(S - reached)
+        if (
+            1 < len(branch) <= max_bundle_nodes
+            and not (branch & protected)
+            and int(slack[list(branch)].sum()) < 0
+            and pop_sum - int(P[list(branch)].sum()) >= pop_thresh
+        ):
+            bundles.add(branch)
+
+    def bundle_key(bundle: frozenset) -> Tuple:
+        idx = list(bundle)
+        recovered = -int(slack[idx].sum())
+        lost_u = int(u[idx].sum())
+        return (lost_u / recovered, lost_u, len(bundle), tuple(sorted(bundle)))
+
+    return sorted(bundles, key=bundle_key)[:max_candidates]
+
+
+def _fractional_refill_bound(
+    candidates: List[int],
+    start: int,
+    capacity: int,
+    gain: int,
+    u: np.ndarray,
+    slack: np.ndarray,
+) -> float:
+    """Optimistic fractional-knapsack bound used only to rank beam states."""
+    bound = float(gain)
+    remaining = max(0, int(capacity))
+    for i in candidates[start:]:
+        d_i = int(slack[i])
+        u_i = int(u[i])
+        if d_i >= 0:
+            bound += u_i
+            remaining += d_i
+            continue
+        cost = -d_i
+        if remaining <= 0:
+            break
+        fraction = min(1.0, remaining / cost)
+        bound += fraction * u_i
+        remaining -= min(remaining, cost)
+    return bound
+
+
+def _beam_refill(
+    selected: set,
+    forbidden: set,
+    nb: List[List[int]],
+    u: np.ndarray,
+    slack: np.ndarray,
+    max_candidates: int,
+    beam_width: int,
+) -> set:
+    """
+    Refill available exact rate slack with a bounded connected knapsack search.
+
+    Candidates come from the current one-hop frontier, so every subset tested by
+    the beam remains connected to the base selection. The economic ordering is
+    unemployment per unit of rate deficit; the fractional upper bound preserves
+    capacity-rich states that a simple ratio-greedy pass would discard.
+    """
+    S = set(selected)
+    frontier = {
+        w for v in S for w in nb[v]
+        if w not in S and w not in forbidden and int(u[w]) > 0
+    }
+
+    def add_key(i: int) -> Tuple:
+        d_i = int(slack[i])
+        efficiency = math.inf if d_i >= 0 else int(u[i]) / -d_i
+        return (-efficiency, -int(u[i]), i)
+
+    candidates = sorted(frontier, key=add_key)[:max_candidates]
+    if not candidates:
+        return S
+
+    # (unemployment gain, remaining exact slack, selected-candidate bit mask)
+    states: List[Tuple[int, int, int]] = [
+        (0, int(slack[list(S)].sum()), 0)
+    ]
+
+    for pos, node in enumerate(candidates):
+        node_slack = int(slack[node])
+        node_u = int(u[node])
+        bit = 1 << pos
+        expanded = list(states)
+        for gain, capacity, mask in states:
+            if capacity + node_slack >= 0:
+                expanded.append((gain + node_u, capacity + node_slack, mask | bit))
+
+        # Pareto dominance: with no less slack and no less gain, a state can do
+        # everything a dominated state can do on the remaining candidates.
+        expanded.sort(key=lambda state: (-state[1], -state[0], state[2]))
+        pareto: List[Tuple[int, int, int]] = []
+        best_gain = -1
+        for state in expanded:
+            if state[0] > best_gain:
+                pareto.append(state)
+                best_gain = state[0]
+
+        if len(pareto) > beam_width:
+            pareto.sort(
+                key=lambda state: (
+                    _fractional_refill_bound(
+                        candidates, pos + 1, state[1], state[0], u, slack
+                    ),
+                    state[0],
+                    state[1],
+                    -state[2].bit_count(),
+                ),
+                reverse=True,
+            )
+            pareto = pareto[:beam_width]
+        states = pareto
+
+    best = max(
+        states,
+        key=lambda state: (state[0], state[1], -state[2].bit_count(), -state[2]),
+    )
+    for pos, node in enumerate(candidates):
+        if best[2] & (1 << pos):
+            S.add(node)
+    return S
+
+
+def _drop_redundant_zero_tracts(
+    selected: set,
+    protected: set,
+    root_local: int,
+    nb: List[List[int]],
+    u: np.ndarray,
+    E: np.ndarray,
+    P: np.ndarray,
+    pop_thresh: int,
+) -> set:
+    """Apply the tract-count tie-break without changing unemployment or slack."""
+    S = set(selected)
+    protected = set(protected) | {root_local}
+    while True:
+        selected_mask = np.zeros(len(nb), dtype=bool)
+        selected_mask[list(S)] = True
+        cut_vertices = _articulation_points(nb, selected_mask)
+        pop_sum = int(P[list(S)].sum())
+        removable = sorted(
+            (
+                i for i in S - protected - cut_vertices
+                if int(u[i]) == 0 and int(E[i]) == 0
+                and pop_sum - int(P[i]) >= pop_thresh
+            ),
+            reverse=True,
+        )
+        if not removable:
+            return S
+        S.remove(removable[0])
+
+
+def articulation_reroute(
+    S0: List[int],
+    u: np.ndarray,
+    E: np.ndarray,
+    P: np.ndarray,
+    nb: List[List[int]],
+    tau: float,
+    pop_thresh: int,
+    root_local: int,
+    lambda_value: float = 2.2,
+    max_removed_bundle: int = 5,
+    max_reroute_candidates: int = 20,
+    protected: Optional[List[int]] = None,
+    refill_candidates: int = 32,
+    beam_width: int = 512,
+    time_limit_s: float = 30.0,
+) -> List[int]:
+    """
+    Articulation-point rerouting heuristic.
+
+    Identifies low-value connector bundles in the current selection and replaces
+    them with alternative paths through more economically productive tracts.
+
+    For each candidate bundle (articulation point + pendant branch, up to
+    max_removed_bundle nodes):
+    1. Remove the bundle from the selection.
+    2. Find cheapest reconnecting paths via multi-source Dijkstra, where each
+       unselected node v has path_cost = max(epsilon, -economic_value[v]) and
+       already-selected nodes in S_remaining are traversed for free.
+    3. Accept if delta_unemployment > 0 and all constraints are met.
+    4. Refill released rate slack with beam search and drop redundant zero tracts.
+
+    Economic score:
+        cap_cost[i]      = tau * emp[i] - (1 - tau) * unemp[i]  (> 0 iff UR < tau)
+        economic_value[i]= unemp[i] - lambda_value * cap_cost[i]
+        path_cost[i]     = max(epsilon, -economic_value[i])
+
+    Articulation keep score (low = candidate for replacement):
+        keep_score[i] = economic_value[i]
+                        + 5 * selected_neighbor_count
+                        - 10 * unselected_neighbor_count
+    """
+    if not S0:
+        return []
+
+    N = len(nb)
+    S = set(int(i) for i in S0)
+    protected_base = set(int(i) for i in (protected or [])) | {root_local}
+
+    if not component_ok(sorted(S), u, E, P, tau, pop_thresh, nb):
+        return sorted(S)
+
+    num, den = as_fraction_tau(tau)
+    slack = den * u.astype(np.int64) - num * E.astype(np.int64)
+    cap_cost_arr = tau * E.astype(float) - (1.0 - tau) * u.astype(float)
+    economic_val = u.astype(float) - lambda_value * cap_cost_arr
+    _eps = 0.01
+    path_cost_arr = np.maximum(_eps, -economic_val)
+
+    t_start = time.monotonic()
+    best = set(S)
+
+    def _comps_of(sel: set) -> List[set]:
+        seen: set = set()
+        result: List[set] = []
+        for v in sel:
+            if v not in seen:
+                comp: set = {v}
+                stk = [v]
+                seen.add(v)
+                while stk:
+                    cur = stk.pop()
+                    for w in nb[cur]:
+                        if w in sel and w not in seen:
+                            seen.add(w)
+                            comp.add(w)
+                            stk.append(w)
+                result.append(comp)
+        return result
+
+    def _reconnect(S_rem: set, removed: set) -> Optional[frozenset]:
+        """
+        Dijkstra from root's component only.
+        S_rem nodes (already selected) cost 0 to traverse; unselected nodes cost
+        path_cost_arr[v]. Removed bundle nodes are excluded.
+        Returns frozenset of unselected bridge nodes, or None if unreachable.
+        """
+        root_comp: set = set()
+        stk = [root_local]
+        root_comp.add(root_local)
+        while stk:
+            v = stk.pop()
+            for w in nb[v]:
+                if w in S_rem and w not in root_comp:
+                    root_comp.add(w)
+                    stk.append(w)
+
+        non_root = [c for c in _comps_of(S_rem) if root_local not in c]
+        if not non_root:
+            return frozenset()  # already connected
+
+        INF = float("inf")
+        dist: Dict[int, float] = {}
+        prev: Dict[int, int] = {}
+        heap_q: List[Tuple[float, int]] = []
+
+        for v in root_comp:
+            dist[v] = 0.0
+            prev[v] = -1  # sentinel: this is a root-comp source node
+            heapq.heappush(heap_q, (0.0, v))
+
+        while heap_q:
+            d, v = heapq.heappop(heap_q)
+            if d > dist.get(v, INF):
+                continue
+            for w in nb[v]:
+                if w in removed:
+                    continue
+                nd = d if w in S_rem else d + float(path_cost_arr[w])
+                if nd < dist.get(w, INF):
+                    dist[w] = nd
+                    prev[w] = v
+                    heapq.heappush(heap_q, (nd, w))
+
+        added: set = set()
+        for comp in non_root:
+            best_v = min(comp, key=lambda v: dist.get(v, INF))
+            if dist.get(best_v, INF) == INF:
+                return None  # component unreachable
+            # Trace path back to root_comp, collecting unselected bridge nodes
+            cur = best_v
+            while True:
+                p = prev.get(cur, -1)
+                if p == -1:
+                    break  # reached a root_comp source
+                if cur not in S_rem and cur not in removed:
+                    added.add(cur)
+                cur = p
+                if cur in root_comp:
+                    break
+        return frozenset(added)
+
+    any_improved = True
+    while any_improved and (time.monotonic() - t_start < time_limit_s):
+        any_improved = False
+
+        sel_mask = np.zeros(N, dtype=bool)
+        sel_mask[list(best)] = True
+        cut_verts = _articulation_points(nb, sel_mask)
+        pop_sum = int(P[sorted(best)].sum())
+
+        bundles_scored: List[Tuple[float, frozenset]] = []
+        seen_bundles: set = set()
+
+        for art in sorted(cut_verts - protected_base):
+            n_sel = sum(1 for w in nb[art] if w in best)
+            n_ext = sum(1 for w in nb[art] if w not in best)
+            score = float(economic_val[art]) + 5.0 * n_sel - 10.0 * n_ext
+
+            singleton = frozenset({art})
+            if singleton not in seen_bundles:
+                seen_bundles.add(singleton)
+                bundles_scored.append((score, singleton))
+
+            # Bundle: articulation point + its pendant branch disconnected from root
+            reachable: set = {root_local}
+            stk = [root_local]
+            while stk:
+                v = stk.pop()
+                for w in nb[v]:
+                    if w in best and w != art and w not in reachable:
+                        reachable.add(w)
+                        stk.append(w)
+            branch = frozenset((best - reachable) - {art})
+
+            if 1 <= len(branch) <= max_removed_bundle - 1 and not (branch & protected_base):
+                full_bundle = frozenset({art} | branch)
+                if full_bundle not in seen_bundles:
+                    seen_bundles.add(full_bundle)
+                    avg_ev = sum(float(economic_val[v]) for v in full_bundle) / len(full_bundle)
+                    avg_ns = sum(
+                        sum(1 for w in nb[v] if w in best) for v in full_bundle
+                    ) / len(full_bundle)
+                    avg_nx = sum(
+                        sum(1 for w in nb[v] if w not in best) for v in full_bundle
+                    ) / len(full_bundle)
+                    bundles_scored.append((avg_ev + 5.0 * avg_ns - 10.0 * avg_nx, full_bundle))
+
+        # Weakest connectors (lowest keep_score) first
+        bundles_scored.sort(key=lambda x: x[0])
+
+        for _, bundle in bundles_scored[:max_reroute_candidates]:
+            if time.monotonic() - t_start >= time_limit_s:
+                break
+
+            bundle_list = sorted(bundle)
+            if pop_sum - int(P[bundle_list].sum()) < pop_thresh:
+                continue
+
+            S_rem = best - set(bundle)
+            if root_local not in S_rem:
+                continue
+
+            path_nodes = _reconnect(S_rem, set(bundle))
+            if path_nodes is None:
+                continue  # some non-root component unreachable
+
+            S_new = S_rem | set(path_nodes)
+            removed_u = int(u[bundle_list].sum())
+            added_u = int(u[sorted(path_nodes)].sum()) if path_nodes else 0
+            if added_u - removed_u <= 0:
+                continue  # no unemployment gain
+
+            # Restore rate feasibility if violated after the exchange
+            if int(slack[sorted(S_new)].sum()) < 0:
+                S_repaired = _repair_rate_after_augmentation(
+                    S_new, protected_base, nb, u, P, slack, pop_thresh
+                )
+                if S_repaired is None:
+                    continue
+                S_new = S_repaired
+                if int(u[sorted(S_new)].sum()) <= int(u[sorted(best)].sum()):
+                    continue
+
+            if int(P[sorted(S_new)].sum()) < pop_thresh:
+                continue
+            if not component_ok(sorted(S_new), u, E, P, tau, pop_thresh, nb):
+                continue
+
+            # Accept: refill released slack, drop redundant zero-employment tracts
+            S_refilled = _beam_refill(
+                S_new, set(bundle), nb, u, slack, refill_candidates, beam_width
+            )
+            if component_ok(sorted(S_refilled), u, E, P, tau, pop_thresh, nb):
+                S_new = S_refilled
+
+            S_new = _drop_redundant_zero_tracts(
+                S_new, protected_base, root_local, nb, u, E, P, pop_thresh
+            )
+
+            if _selection_key(S_new, u, slack) > _selection_key(best, u, slack):
+                best = S_new
+                any_improved = True
+                break  # restart outer loop with updated selection
+
+    return sorted(best)
+
+
+def augment_prune_hint(
+    S0: List[int],
+    u: np.ndarray,
+    E: np.ndarray,
+    P: np.ndarray,
+    nb: List[List[int]],
+    tau: float,
+    pop_thresh: int,
+    root_local: int,
+    protected: Optional[List[int]] = None,
+    max_augmentation_candidates: int = 96,
+    max_anchor_candidates: int = 12,
+    max_topology_states: int = 48,
+    max_bundle_nodes: int = 12,
+    max_ejection_candidates: int = 24,
+    refill_candidates: int = 32,
+    beam_width: int = 512,
+    max_ejection_rounds: int = 4,
+    time_limit_s: float = 5.0,
+) -> List[int]:
+    """
+    Connectivity-aware augment-prune-refill warm-start improvement.
+
+    The search may temporarily add one or two frontier nodes below the rate
+    threshold, then remove old connectors that the new path makes redundant.
+    It subsequently tests small pendant-branch ejections and refills their rate
+    slack with a bounded beam search. Only completed connected, population- and
+    rate-feasible states compete with the original hint.
+    """
+    if not S0:
+        return []
+
+    N = len(nb)
+    S_base = set(int(i) for i in S0)
+    protected_base = set(int(i) for i in (protected or [])) | {root_local}
+    num, den = as_fraction_tau(tau)
+    slack = den * u.astype(np.int64) - num * E.astype(np.int64)
+
+    if not component_ok(sorted(S_base), u, E, P, tau, pop_thresh, nb):
+        return sorted(S_base)
+
+    selected_mask = np.zeros(N, dtype=bool)
+    selected_mask[list(S_base)] = True
+    base_articulations = _articulation_points(nb, selected_mask)
+    frontier = {w for v in S_base for w in nb[v] if w not in S_base}
+
+    def economic_key(i: int) -> Tuple:
+        d_i = int(slack[i])
+        efficiency = math.inf if d_i >= 0 else int(u[i]) / -d_i
+        return (-efficiency, -int(u[i]), i)
+
+    structural_count = max(1, max_augmentation_candidates // 2)
+    structural = sorted(
+        frontier,
+        key=lambda i: (
+            -sum(1 for w in nb[i] if w in S_base),
+            int(slack[i]),
+            -int(u[i]),
+            i,
+        ),
+    )[:structural_count]
+    economic = sorted(frontier, key=economic_key)[:structural_count]
+    augmentation_pool = list(dict.fromkeys(structural + economic))
+    augmentation_pool = augmentation_pool[:max_augmentation_candidates]
+
+    # Each entry is (repaired state, augmentation, number of bypassed cuts).
+    topology_states: List[Tuple[set, frozenset, int]] = [
+        (set(S_base), frozenset(), 0)
+    ]
+    single_states: List[Tuple[set, frozenset, int]] = []
+
+    for node in augmentation_pool:
+        augmentation = frozenset((node,))
+        trial = S_base | set(augmentation)
+        trial_mask = np.zeros(N, dtype=bool)
+        trial_mask[list(trial)] = True
+        freed = base_articulations - _articulation_points(nb, trial_mask)
+        if not freed:
+            continue
+        repaired = _repair_rate_after_augmentation(
+            trial, protected_base | set(augmentation), nb, u, P, slack, pop_thresh
+        )
+        if repaired is not None:
+            single_states.append((repaired, augmentation, len(freed)))
+
+    def topology_state_key(item: Tuple[set, frozenset, int]) -> Tuple:
+        state, augmentation, freed_count = item
+        score = _selection_key(state, u, slack)
+        return (
+            score[0],
+            score[1],
+            score[2],
+            freed_count,
+            -len(augmentation),
+            score[3],
+        )
+
+    anchors = sorted(single_states, key=topology_state_key, reverse=True)[
+        :max_anchor_candidates
+    ]
+    topology_states.extend(single_states)
+
+    seen_pairs: set = set()
+    for _, anchor_augmentation, _ in anchors:
+        anchor = next(iter(anchor_augmentation))
+        # In addition to two direct-frontier nodes, allow a genuine two-node
+        # path whose second node touches the anchor but not the base selection.
+        path_extensions = sorted(
+            (w for w in nb[anchor] if w not in S_base and w != anchor),
+            key=economic_key,
+        )
+        pair_pool = list(dict.fromkeys(augmentation_pool + path_extensions))[
+            :max_augmentation_candidates
+        ]
+        for other in pair_pool:
+            if other == anchor:
+                continue
+            augmentation = frozenset((anchor, other))
+            if augmentation in seen_pairs:
+                continue
+            seen_pairs.add(augmentation)
+            trial = S_base | set(augmentation)
+            trial_mask = np.zeros(N, dtype=bool)
+            trial_mask[list(trial)] = True
+            freed = base_articulations - _articulation_points(nb, trial_mask)
+            if not freed:
+                continue
+            repaired = _repair_rate_after_augmentation(
+                trial, protected_base | set(augmentation), nb, u, P, slack, pop_thresh
+            )
+            if repaired is not None:
+                topology_states.append((repaired, augmentation, len(freed)))
+
+    # Deduplicate repaired selections, then retain the strongest bounded set.
+    unique_states: Dict[frozenset, Tuple[set, frozenset, int]] = {}
+    for item in topology_states:
+        state_key = frozenset(item[0])
+        old = unique_states.get(state_key)
+        if old is None or topology_state_key(item) > topology_state_key(old):
+            unique_states[state_key] = item
+    ranked_states = sorted(
+        unique_states.values(), key=topology_state_key, reverse=True
+    )[:max_topology_states]
+    if frozenset(S_base) not in {frozenset(item[0]) for item in ranked_states}:
+        ranked_states.append((set(S_base), frozenset(), 0))
+
+    augment_start = time.monotonic()
+    best = set(S_base)
+    for repaired, augmentation, _ in ranked_states:
+        if time.monotonic() - augment_start >= time_limit_s:
+            break
+        current = set(repaired)
+        permanently_forbidden = (S_base | set(augmentation)) - current
+        protected_state = protected_base | set(augmentation)
+
+        for _ in range(max_ejection_rounds):
+            options: List[Tuple[set, frozenset]] = [
+                (
+                    _beam_refill(
+                        current, permanently_forbidden, nb, u, slack,
+                        refill_candidates, beam_width,
+                    ),
+                    frozenset(),
+                )
+            ]
+            for bundle in _small_leaf_bundles(
+                current, protected_state, root_local, nb, u, P, slack,
+                pop_thresh, max_bundle_nodes, max_ejection_candidates,
+            ):
+                pruned = current - set(bundle)
+                refilled = _beam_refill(
+                    pruned, permanently_forbidden | set(bundle), nb, u, slack,
+                    refill_candidates, beam_width,
+                )
+                options.append((refilled, bundle))
+
+            candidate, ejected = max(
+                options, key=lambda item: _selection_key(item[0], u, slack)
+            )
+            if _selection_key(candidate, u, slack) <= _selection_key(current, u, slack):
+                break
+            current = candidate
+            permanently_forbidden.update(ejected)
+
+        current = _drop_redundant_zero_tracts(
+            current, protected_state, root_local, nb, u, E, P, pop_thresh
+        )
+        if (
+            component_ok(sorted(current), u, E, P, tau, pop_thresh, nb)
+            and _selection_key(current, u, slack) > _selection_key(best, u, slack)
+        ):
+            best = current
+
+    return sorted(best)
+
+
+# ---------- Local CP-SAT repair heuristic ----------
+
+@dataclass
+class RepairResult:
+    selected: List[int]
+    old_unemployed: int
+    new_unemployed: int
+    improvement: int
+    status: str
+    best_bound: Optional[float]
+    free_nodes: List[int]
+    solve_seconds: float
+
+
+def build_repair_neighborhood(
+    selected: "Sequence[int]",
+    nb_local: List[List[int]],
+    u_g: np.ndarray,
+    E_g: np.ndarray,
+    tau: float,
+    root_local: int,
+    max_free_nodes: int = 500,
+    hops: int = 2,
+) -> List[int]:
+    """
+    Build a free-node pool for local repair.
+
+        Uses an explicit two-pool budget:
+      - Up to 40% of max_free_nodes for interior weak selected nodes: non-root,
+        non-articulation selected nodes sorted by cap = tau*E-(1-tau)*u descending
+        (high cap = low UR = most worth dropping), regardless of BFS distance.
+            - Remaining boundary budget reserves one third for selected structural nodes
+                and uses the rest for unselected alternatives ranked by unemployment per
+                rate-capacity cost.
+        Root is always fixed.
+    Returns a deterministic sorted list trimmed to max_free_nodes.
+    """
+    N = len(nb_local)
+    sel_set = set(int(i) for i in selected)
+
+    # Articulation points must stay fixed (removing them disconnects the selection)
+    sel_mask = np.zeros(N, dtype=bool)
+    for i in sel_set:
+        sel_mask[i] = True
+    art_pts = _articulation_points(nb_local, sel_mask) if sel_set else set()
+
+    # --- BFS pool: boundary + frontier + hops expansion ---
+    boundary_sel = {i for i in sel_set if any(w not in sel_set for w in nb_local[i])}
+    frontier_unsel = {w for i in sel_set for w in nb_local[i] if w not in sel_set}
+
+    bfs_dist: Dict[int, int] = {}
+    current_front = boundary_sel | frontier_unsel
+    for v in current_front:
+        bfs_dist[v] = 0
+    for h in range(1, hops + 1):
+        next_front: set = set()
+        for v in current_front:
+            for w in nb_local[v]:
+                if w not in bfs_dist:
+                    bfs_dist[w] = h
+                    next_front.add(w)
+        current_front = next_front
+
+    bfs_pool = set(bfs_dist.keys())
+
+    # Articulation points adjacent to boundary but outside BFS
+    extra_art = {
+        w for v in (boundary_sel | frontier_unsel)
+        for w in nb_local[v]
+        if w in art_pts and w not in bfs_pool
+    }
+    for w in extra_art:
+        bfs_dist[w] = hops
+    bfs_pool |= extra_art
+
+    # Pendant branches hanging off in-pool articulation points (size limit 30)
+    pendant_members: set = set()
+    for art in art_pts & sel_set & bfs_pool:
+        reachable = {root_local}
+        stk = [root_local]
+        while stk:
+            v = stk.pop()
+            for w in nb_local[v]:
+                if w in sel_set and w != art and w not in reachable:
+                    reachable.add(w)
+                    stk.append(w)
+        branch = sel_set - reachable - {art}
+        if 1 <= len(branch) <= 30:
+            pendant_members |= branch
+    for w in pendant_members:
+        if w not in bfs_dist:
+            bfs_dist[w] = hops + 1
+    bfs_pool |= pendant_members
+
+    # Unselected nodes with >=2 selected neighbors outside current pool
+    multi_conn = {
+        w for i in sel_set for w in nb_local[i]
+        if w not in sel_set and w not in bfs_pool
+        and sum(1 for v in nb_local[w] if v in sel_set) >= 2
+    }
+    for w in multi_conn:
+        bfs_dist[w] = hops + 1
+    bfs_pool |= multi_conn
+
+    bfs_pool.discard(root_local)
+    bfs_dist.pop(root_local, None)
+
+    # --- Weak interior selected pool ---
+    # Non-root, non-articulation selected nodes NOT already in bfs_pool.
+    # Sorted by cap descending: high cap = low individual UR = most worth dropping.
+    weak_budget = int(max_free_nodes * 0.4)
+    interior_candidates = [
+        i for i in sel_set
+        if i != root_local and i not in art_pts and i not in bfs_pool
+    ]
+    interior_candidates.sort(
+        key=lambda i: tau * float(E_g[i]) - (1.0 - tau) * float(u_g[i]),
+        reverse=True,
+    )
+    weak_interior = set(interior_candidates[:weak_budget])
+
+    # --- Explicit budget allocation: weak interior, structural, alternatives ---
+    remaining = max_free_nodes - len(weak_interior)
+
+    if len(bfs_pool) <= remaining:
+        bfs_chosen = bfs_pool
+    else:
+        selected_bfs = bfs_pool & sel_set
+        unselected_bfs = bfs_pool - sel_set
+
+        def _score_selected(i: int) -> tuple:
+            d = bfs_dist.get(i, hops + 2)
+            is_tier1 = i in boundary_sel
+            is_art = i in art_pts
+            is_pendant = i in pendant_members
+            n_sel_nb = sum(1 for w in nb_local[i] if w in sel_set)
+            cap = tau * float(E_g[i]) - (1.0 - tau) * float(u_g[i])
+            removal_efficiency = float(u_g[i]) / cap if cap > 0 else 1e12
+            return (is_tier1, -d, is_art or is_pendant, n_sel_nb, -removal_efficiency, -i)
+
+        def _score_unselected(i: int) -> tuple:
+            d = bfs_dist.get(i, hops + 2)
+            cap = tau * float(E_g[i]) - (1.0 - tau) * float(u_g[i])
+            add_efficiency = float(u_g[i]) / cap if cap > 0 else 1e12
+            n_sel_nb = sum(1 for w in nb_local[i] if w in sel_set)
+            return (i in frontier_unsel, -d, add_efficiency, n_sel_nb, int(u_g[i]), -i)
+
+        structural_budget = min(len(selected_bfs), remaining // 3)
+        structural = sorted(selected_bfs, key=_score_selected, reverse=True)
+        alternatives = sorted(unselected_bfs, key=_score_unselected, reverse=True)
+        bfs_chosen = set(structural[:structural_budget])
+        bfs_chosen.update(alternatives[:remaining - len(bfs_chosen)])
+        if len(bfs_chosen) < remaining:
+            bfs_chosen.update(structural[structural_budget:remaining])
+
+    return sorted(bfs_chosen | weak_interior)
+
+
+def _validate_repair_result(
+    candidate: List[int],
+    original: List[int],
+    free_nodes: "Sequence[int]",
+    nb_local: List[List[int]],
+    u_g: np.ndarray,
+    E_g: np.ndarray,
+    P_g: np.ndarray,
+    tau: float,
+    pop_thresh: int,
+    root_local: int,
+    verbose: bool = False,
+) -> Optional[List[int]]:
+    """Validate a repair candidate; return sorted selection or None on failure."""
+    N = len(nb_local)
+    free_set = set(int(i) for i in free_nodes)
+    orig_set = set(int(i) for i in original)
+    cand_list = sorted(int(i) for i in candidate)
+    cand_set = set(cand_list)
+
+    if root_local not in cand_set:
+        if verbose:
+            print("  [repair validate] FAIL: root not selected", flush=True)
+        return None
+
+    if len(cand_list) != len(cand_set) or any(i < 0 or i >= N for i in cand_set):
+        if verbose:
+            print("  [repair validate] FAIL: invalid or duplicate indices", flush=True)
+        return None
+
+    for i in range(N):
+        if i not in free_set and (i in orig_set) != (i in cand_set):
+            if verbose:
+                print(f"  [repair validate] FAIL: fixed node {i} changed", flush=True)
+            return None
+
+    if not component_ok(cand_list, u_g, E_g, P_g, tau, pop_thresh, nb_local):
+        if verbose:
+            print("  [repair validate] FAIL: connectivity/population/rate check failed", flush=True)
+        return None
+
+    old_u = int(u_g[sorted(orig_set)].sum())
+    new_u = int(u_g[cand_list].sum())
+    if new_u <= old_u:
+        if verbose:
+            print(f"  [repair validate] FAIL: no strict improvement ({new_u} <= {old_u})", flush=True)
+        return None
+
+    return cand_list
+
+
+def solve_local_repair(
+    current_selected: "Sequence[int]",
+    free_nodes: "Sequence[int]",
+    nb_local: List[List[int]],
+    u_g: np.ndarray,
+    E_g: np.ndarray,
+    P_g: np.ndarray,
+    tau: float,
+    pop_thresh: int,
+    root_local: int,
+    time_limit: float = 15.0,
+    num_workers: int = 8,
+    random_seed: int = 1,
+) -> "RepairResult":
+    """
+    Fix all tracts outside free_nodes to current selection; optimize the free neighborhood.
+    Uses signed flow on the full graph for connectivity — presolve eliminates fixed variables.
+    Returns a RepairResult; falls back to original selection on INFEASIBLE/UNKNOWN.
+    """
+    N = len(nb_local)
+    current_set = set(int(i) for i in current_selected)
+    free_set = set(int(i) for i in free_nodes)
+    current_list = sorted(current_set)
+    current_u = int(u_g[current_list].sum())
+
+    t0 = time.monotonic()
+    model = cp_model.CpModel()
+
+    x = [model.NewBoolVar(f"x_{i}") for i in range(N)]
+
+    for i in range(N):
+        if i not in free_set:
+            model.Add(x[i] == int(i in current_set))
+    model.Add(x[root_local] == 1)
+
+    model.Add(sum(int(P_g[i]) * x[i] for i in range(N)) >= int(pop_thresh))
+
+    num, den = as_fraction_tau(tau)
+    model.Add(
+        sum(int(den) * int(u_g[i]) * x[i] for i in range(N))
+        - sum(int(num) * int(E_g[i]) * x[i] for i in range(N))
+        >= 0
+    )
+
+    obj_expr = sum(int(u_g[i]) * x[i] for i in range(N))
+    model.Add(obj_expr >= current_u + 1)
+    model.Maximize(obj_expr)
+
+    for i in range(N):
+        model.AddHint(x[i], int(i in current_set))
+
+    # Signed flow connectivity over the full graph; presolve eliminates fixed-variable constraints
+    edges = sorted({
+        (min(i, j), max(i, j))
+        for i, neighbors in enumerate(nb_local)
+        for j in neighbors if i != j
+    })
+    M = max(1, N - 1)
+    f = [model.NewIntVar(-M, M, f"rf_{i}_{j}") for i, j in edges]
+    selected_count = sum(x)
+    net_out: List[list] = [[] for _ in range(N)]
+    for eidx, (i, j) in enumerate(edges):
+      model.Add(f[eidx] == 0).OnlyEnforceIf(x[i].Not())
+      model.Add(f[eidx] == 0).OnlyEnforceIf(x[j].Not())
+  
+      net_out[i].append(f[eidx])
+      net_out[j].append(-f[eidx])
+    for i in range(N):
+        expr = sum(net_out[i]) if net_out[i] else 0
+        model.Add(expr == (selected_count - 1 if i == root_local else -x[i]))
+
+    fhints = _spanning_tree_flows(current_list, nb_local, root_local)
+    for eidx, (i, j) in enumerate(edges):
+        model.AddHint(f[eidx], fhints.get((i, j), 0) - fhints.get((j, i), 0))
+
+    solver = cp_model.CpSolver()
+    solver.parameters.num_search_workers = max(1, int(num_workers))
+    solver.parameters.max_time_in_seconds = float(time_limit)
+    solver.parameters.log_search_progress = False
+    solver.parameters.cp_model_presolve = True
+    solver.parameters.linearization_level = 2
+    solver.parameters.random_seed = int(random_seed)
+
+    status = solver.Solve(model)
+    solve_secs = time.monotonic() - t0
+    status_name = solver.StatusName(status)
+
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        new_sel = [i for i in range(N) if solver.BooleanValue(x[i])]
+        new_u = int(u_g[new_sel].sum())
+        return RepairResult(
+            selected=new_sel,
+            old_unemployed=current_u,
+            new_unemployed=new_u,
+            improvement=new_u - current_u,
+            status=status_name,
+            best_bound=solver.BestObjectiveBound(),
+            free_nodes=sorted(free_set),
+            solve_seconds=solve_secs,
+        )
+
+    return RepairResult(
+        selected=current_list,
+        old_unemployed=current_u,
+        new_unemployed=current_u,
+        improvement=0,
+        status=status_name,
+        best_bound=None,
+        free_nodes=sorted(free_set),
+        solve_seconds=solve_secs,
+    )
+
+
+def improve_with_local_repair(
+    initial_selected: "Sequence[int]",
+    nb_local: List[List[int]],
+    u_g: np.ndarray,
+    E_g: np.ndarray,
+    P_g: np.ndarray,
+    tau: float,
+    pop_thresh: int,
+    root_local: int,
+    *,
+    max_rounds: int = 3,
+    max_free_nodes: int = 1000,
+    hops: int = 5,
+    time_limit: float = 15.0,
+    num_workers: int = 8,
+    random_seed: int = 1,
+    verbose: bool = False,
+) -> List[int]:
+    """Run up to max_rounds local CP-SAT repair passes; accept only strict improvements."""
+    current = sorted(int(i) for i in initial_selected)
+    num_r, den_r = as_fraction_tau(tau)
+
+    for rnd in range(1, max_rounds + 1):
+        free_nodes = build_repair_neighborhood(
+            current, nb_local, u_g, E_g, tau, root_local, max_free_nodes, hops
+        )
+        if not free_nodes:
+            break
+
+        result = solve_local_repair(
+            current, free_nodes, nb_local, u_g, E_g, P_g, tau, pop_thresh,
+            root_local, time_limit, num_workers, random_seed + rnd - 1,
+        )
+
+        if verbose:
+            bb_str = f"{result.best_bound:.1f}" if result.best_bound is not None else "N/A"
+            print(
+                f"  [local repair] round {rnd}: current_unemp={result.old_unemployed:,}, "
+                f"free_tracts={len(free_nodes)}, status={result.status}, "
+                f"best_bound={bb_str}, repaired_unemp={result.new_unemployed:,}, "
+                f"improvement=+{result.improvement}, "
+                f"solve_time={result.solve_seconds:.1f}s",
+                flush=True,
+            )
+
+        if result.improvement <= 0:
+            if verbose:
+                print(f"  [local repair] round {rnd}: no strict improvement; stopping", flush=True)
+            break
+
+        validated = _validate_repair_result(
+            result.selected, current, free_nodes,
+            nb_local, u_g, E_g, P_g, tau, pop_thresh, root_local, verbose=verbose,
+        )
+        if validated is None:
+            if verbose:
+                print(f"  [local repair] round {rnd}: validation failed; retaining previous", flush=True)
+            break
+
+        if verbose:
+            added = sorted(set(validated) - set(current))
+            removed = sorted(set(current) - set(validated))
+            new_pop = int(P_g[np.array(validated, dtype=int)].sum())
+            old_pop = int(P_g[np.array(current, dtype=int)].sum())
+            new_slack = int(
+                (den_r * u_g[np.array(validated, dtype=int)].astype(np.int64)
+                 - num_r * E_g[np.array(validated, dtype=int)].astype(np.int64)).sum()
+            )
+            old_slack = int(
+                (den_r * u_g[np.array(current, dtype=int)].astype(np.int64)
+                 - num_r * E_g[np.array(current, dtype=int)].astype(np.int64)).sum()
+            )
+            print(
+                f"    added={len(added)}, removed={len(removed)}, "
+                f"changed={len(added)+len(removed)}, "
+                f"pop: {old_pop}->{new_pop}, rate_slack: {old_slack}->{new_slack}",
+                flush=True,
+            )
+            if len(added) <= 10:
+                print(f"    added indices: {added}", flush=True)
+            if len(removed) <= 10:
+                print(f"    removed indices: {removed}", flush=True)
+
+        current = validated
+
+    return current
+
+
+def _prepare_window_hint(
+    nb_local: List[List[int]], u_g: np.ndarray, E_g: np.ndarray, P_g: np.ndarray,
+    tau: float, pop_thresh: int, root_local: int, verbose: bool = False,
+) -> Dict:
+    """
+    Build a warm-start hint using reverse_prune on the original graph, then refine
+    with improve_by_trades and augment_prune_refill.
+    Contraction is retained only to derive root_component and cluster_groups.
+    """
+    nb_r, u_r, E_r, P_r, expand_r, node_map_r = contract_high_ur_nodes(nb_local, u_g, E_g, P_g, tau)
+    root_r = int(node_map_r[root_local])
+    root_component = expand_r[root_r]
+    all_local = np.arange(len(nb_local))
+
+    def _ur(u_arr, e_arr, idx):
+        su, se = int(u_arr[idx].sum()), int(e_arr[idx].sum())
+        return 100.0 * su / max(su + se, 1), su
+
+    def _refine(hint_raw: List[int], label: str) -> Dict:
+        hint_expanded = sorted(hint_raw)  # already original-graph indices
+        if verbose:
+            ur_raw, u_raw = _ur(u_g, E_g, hint_expanded)
+            print(f"    [{label}] raw: tracts={len(hint_expanded)}, unemp={u_raw}, UR={ur_raw:.2f}%", flush=True)
+        hint_improved = improve_by_trades(hint_expanded, u_g, E_g, P_g, nb_local, tau, pop_thresh, all_local, max_iter=100)
+        hint_valid = component_ok(hint_improved, u_g, E_g, P_g, tau, pop_thresh, nb_local)
+        hint_obj_val = int(u_g[hint_improved].sum()) if hint_valid else None
+        if verbose:
+            if hint_valid:
+                ur_imp, _ = _ur(u_g, E_g, hint_improved)
+                print(f"    [{label}] after trades: tracts={len(hint_improved)}, unemp={hint_obj_val}, UR={ur_imp:.2f}%", flush=True)
+            else:
+                print(f"    [{label}] infeasible after trades", flush=True)
+        return {"hint_improved": hint_improved, "hint_valid": hint_valid, "hint_obj_val": hint_obj_val}
+
+    if verbose:
+        print(f"  [heuristic] reverse_prune ...", flush=True)
+    best = _refine(
+        reverse_prune_hint(nb_local, u_g, E_g, P_g, tau, pop_thresh, root_local),
+        "reverse_prune",
+    )
+    hint_source = "reverse_prune"
+
+    if best["hint_valid"]:
+        if verbose:
+            print(f"  [heuristic] augment_prune_refill ...", flush=True)
+        augmented = augment_prune_hint(
+            best["hint_improved"], u_g, E_g, P_g, nb_local, tau, pop_thresh,
+            root_local, protected=root_component,
+        )
+        if component_ok(augmented, u_g, E_g, P_g, tau, pop_thresh, nb_local):
+            num, den = as_fraction_tau(tau)
+            exact_slack = den * u_g.astype(np.int64) - num * E_g.astype(np.int64)
+            if _selection_key(set(augmented), u_g, exact_slack) > _selection_key(
+                set(best["hint_improved"]), u_g, exact_slack
+            ):
+                aug_u = int(u_g[augmented].sum())
+                aug_E = int(E_g[augmented].sum())
+                if verbose:
+                    print(f"  [heuristic] augment improved: tracts={len(augmented)}, unemp={aug_u}, UR={100.0*aug_u/max(aug_u+aug_E,1):.2f}%", flush=True)
+                best = {
+                    "hint_improved": augmented,
+                    "hint_valid": True,
+                    "hint_obj_val": aug_u,
+                }
+                hint_source += "+augment_prune_refill"
+            elif verbose:
+                print(f"  [heuristic] augment did not improve over {hint_source}", flush=True)
+
+        if best["hint_valid"]:
+            if verbose:
+                print(f"  [heuristic] articulation_reroute ...", flush=True)
+            rerouted = articulation_reroute(
+                best["hint_improved"], u_g, E_g, P_g, nb_local, tau, pop_thresh,
+                root_local, protected=root_component,
+            )
+            if component_ok(rerouted, u_g, E_g, P_g, tau, pop_thresh, nb_local):
+                num_rr, den_rr = as_fraction_tau(tau)
+                exact_slack_rr = den_rr * u_g.astype(np.int64) - num_rr * E_g.astype(np.int64)
+                if _selection_key(set(rerouted), u_g, exact_slack_rr) > _selection_key(
+                    set(best["hint_improved"]), u_g, exact_slack_rr
+                ):
+                    rr_u = int(u_g[rerouted].sum())
+                    rr_E = int(E_g[rerouted].sum())
+                    if verbose:
+                        print(
+                            f"  [heuristic] articulation_reroute improved: "
+                            f"tracts={len(rerouted)}, unemp={rr_u}, "
+                            f"UR={100.0 * rr_u / max(rr_u + rr_E, 1):.2f}%",
+                            flush=True,
+                        )
+                    best = {"hint_improved": rerouted, "hint_valid": True, "hint_obj_val": rr_u}
+                    hint_source += "+articulation_reroute"
+                elif verbose:
+                    print(f"  [heuristic] articulation_reroute did not improve over {hint_source}", flush=True)
+
+    return {
+        "root_component": root_component,
+        "n_contracted": len(nb_r),
+        "hint_improved": best["hint_improved"],
+        "hint_valid": best["hint_valid"],
+        "hint_obj_val": best["hint_obj_val"],
+        "hint_source": hint_source,
+        "cluster_groups": [group for group in expand_r if len(group) > 1],
+    }
+
+
+# ---------- High-level multi-ASU builder ----------
+def _export_window_comparison(
+    w: Dict,
+    sol_local: Optional[List[int]],
+    df: pd.DataFrame,
+    export_dir: str,
+    asu_num: int,
+    tau: float = 0.0645,
+) -> None:
+    """Write tract-comparison + neighbor-list Excel for one solved window."""
+    import os
+    try:
+        import openpyxl  # noqa: F401
+    except ImportError:
+        print("  [EXPORT] skipped: openpyxl not installed (pip install openpyxl)", flush=True)
+        return
+
+    sub = w["sub"]
+    nb_local: List[List[int]] = w["nb_local"]
+    N = len(sub)
+    geoids = [str(df.iloc[int(sub[i])]["geoid"]) for i in range(N)]
+    unemp = w["u_g"]
+    emp   = w["E_g"]
+    pop   = w["P_g"]
+
+    hint_set = set(w.get("hint_improved") or [])
+    sol_set  = set(sol_local or [])
+    root     = w["root_local"]
+    hsrc     = w.get("hint_source", "")
+
+    tract_rows = []
+    for i in range(N):
+        u_i, e_i, p_i = int(unemp[i]), int(emp[i]), int(pop[i])
+        # positive = UR < tau (drains threshold slack); negative = UR >= tau (contributes)
+        cap_slack_i = round(tau * e_i - (1.0 - tau) * u_i, 4)
+        tract_rows.append({
+            "global_idx":  int(sub[i]),
+            "local_idx":   i,
+            "geoid":       geoids[i],
+            "unemp":       u_i,
+            "emp":         e_i,
+            "pop":         p_i,
+            "ur_pct":      round(u_i / max(u_i + e_i, 1) * 100, 4),
+            "cap_slack":   cap_slack_i,
+            "in_hint":     i in hint_set,
+            "hint_source": hsrc if i in hint_set else "",
+            "in_solution": i in sol_set,
+            "hint_not_sol": (i in hint_set) and (i not in sol_set),
+            "sol_not_hint": (i not in hint_set) and (i in sol_set),
+            "is_root":     i == root,
+        })
+
+    seen: set = set()
+    edge_rows = []
+    for i in range(N):
+        for j in nb_local[i]:
+            edge = (min(i, j), max(i, j))
+            if edge not in seen:
+                seen.add(edge)
+                edge_rows.append({
+                    "from_idx":       i,
+                    "to_idx":         j,
+                    "from_geoid":     geoids[i],
+                    "to_geoid":       geoids[j],
+                    "from_in_hint":   i in hint_set,
+                    "to_in_hint":     j in hint_set,
+                    "from_in_sol":    i in sol_set,
+                    "to_in_sol":      j in sol_set,
+                })
+
+    os.makedirs(export_dir, exist_ok=True)
+    path = os.path.join(export_dir, f"asu_{asu_num:03d}_seed{w['seed']}.xlsx")
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        pd.DataFrame(tract_rows).to_excel(writer, sheet_name="tracts",    index=False)
+        pd.DataFrame(edge_rows).to_excel( writer, sheet_name="neighbors", index=False)
+    print(f"  [EXPORT] {path}", flush=True)
+
+
+def build_many_asus_cpsat(
+    df: pd.DataFrame,
+    nb: List[List[int]],
+    tau: float,
+    pop_thresh: int,
+    max_asus: int = 25,
+    r_start: int = 50,
+    r_step: int = 1,
+    r_max: int = 50,
+    hard_cap_nodes: int = 10000,
+    min_pop_margin: float = 1.0,
+    time_limit: int = 1200,
+    workers: int = 8,
+    rel_gap: Optional[float] = None,
+    verbose: bool = True,
+    parallel_asus: int = 1,
+    merge_adjacent: bool = True,
+    export_dir: Optional[str] = None,
+    deterministic_ties: bool = True,
+    objective_shaving: bool = False,
+    use_signed_flow: bool = True,
+    use_arborescence: bool = False,
+    configure_subsolvers: bool = True,
+) -> Dict[str, np.ndarray]:
+    """
+    Build ASUs in batches of up to `parallel_asus` disjoint candidate windows, solved
+    concurrently. Two ASUs built in the same batch that end up touching (share a
+    queen-contiguity edge) are merged into one: the mediant inequality guarantees
+    that combining two groups whose UR is each >= tau keeps the combined UR >= tau
+    (the combined ratio is a weighted average of the two, so it can't fall below
+    the smaller one), and population/connectivity only improve on union.
+    """
+    u = df["tract_ASU_unemp"].to_numpy(dtype=np.int64)
+    E = df["tract_ASU_emp"].to_numpy(dtype=np.int64)
+    P = df["tract_pop2024"].to_numpy(dtype=np.int64)
+    UR = u / np.maximum(u + E, 1e-12)
+
+    n = len(df)
+    remaining = np.ones(n, dtype=bool)
+    tried = np.zeros(n, dtype=bool)
+    asu_id = np.full(n, -1, dtype=int)
+    num, den = as_fraction_tau(tau)
+
+    batch_size = max(1, int(parallel_asus))
+    k = 0
+    while k < max_asus:
+        rem_idx = np.where(remaining)[0]
+        if rem_idx.size < 2:
+            break
+
+        # First filter for tracts with UR >= tau
+        rem_UR = UR[rem_idx]
+        high_ur_mask = rem_UR >= tau
+
+        # If no remaining tract has UR >= tau, stop building ASUs
+        if not high_ur_mask.any():
+            if verbose:
+                print(f"\nNo remaining tracts have UR >= {tau*100:.2f}%. Stopping ASU creation.", flush=True)
+            break
+
+        # Filter to only consider high UR tracts as potential seeds
+        high_ur_rem_idx = rem_idx[high_ur_mask]
+
+        # Among high UR tracts, find those with at least one remaining neighbor
+        deg_rem = np.array([np.sum(remaining[np.array(nb[i], dtype=int)]) for i in high_ur_rem_idx])
+        cand_seeds = high_ur_rem_idx[deg_rem > 0]
+
+        if cand_seeds.size == 0:
+            if verbose:
+                print(f"\nNo high-UR tracts (UR >= {tau*100:.2f}%) have remaining neighbors. Stopping.", flush=True)
+            break
+
+        # Prioritize by UR (descending) then population (descending)
+        order = np.lexsort((-df.loc[cand_seeds, "tract_pop2024"].to_numpy(), -UR[cand_seeds]))
+        seed_pool = cand_seeds[order]
+
+        # ---- Select up to batch_size disjoint feasible windows ----
+        reserved = np.zeros(n, dtype=bool)
+        windows: List[Dict] = []
+        for s in seed_pool:
+            if len(windows) >= batch_size:
+                break
+            s = int(s)
+            if tried[s] or reserved[s] or not remaining[s]:
+                continue
+            allowed_idx = np.where(remaining & ~reserved)[0]
+            if allowed_idx.size == 0:
+                break
+
+            r = int(r_start)
+            sub = bfs_ball(nb, s, r, allowed_idx)
+            while P[sub].sum() < min_pop_margin * pop_thresh and r < r_max and len(sub) < hard_cap_nodes:
+                r += r_step
+                sub = bfs_ball(nb, s, r, allowed_idx)
+            if len(sub) > hard_cap_nodes:
+                while len(sub) > hard_cap_nodes and r > 1:
+                    r -= 1
+                    sub = bfs_ball(nb, s, r, allowed_idx)
+                if len(sub) > hard_cap_nodes:
+                    sub = sub[:hard_cap_nodes]
+
+            local_index = {g: i for i, g in enumerate(sub)}
+            nb_local: List[List[int]] = [
+                sorted(local_index[h] for h in nb[g] if h in local_index) for g in sub
+            ]
+            u_g, E_g, P_g = u[sub], E[sub], P[sub]
+            deg_w = np.array([len(v) for v in nb_local])
+            cand = np.where(deg_w > 0)[0]
+            if cand.size == 0:
+                tried[s] = True
+                continue
+            if (u_g / np.maximum(u_g + E_g, 1e-12)).max(initial=0.0) < tau:
+                if verbose:
+                    print(f"  [seed={s}] skip: window max(UR) < tau", flush=True)
+                tried[s] = True
+                continue
+            if not can_hit_tau(u_g, E_g, P_g, nb_local, tau, pop_thresh):
+                if verbose:
+                    print(f"  [seed={s}] skip: quick screen fails", flush=True)
+                tried[s] = True
+                continue
+
+            top = cand[np.argmax(u_g[cand] / np.maximum(u_g[cand] + E_g[cand], 1e-12))]
+            tie = np.where(
+                (u_g / np.maximum(u_g + E_g, 1e-12)) == (u_g[top] / max(u_g[top] + E_g[top], 1e-12))
+            )[0]
+            root_local = int(tie[np.argmax(P_g[tie])]) if len(tie) > 1 else int(top)
+
+            if "geoid" in df.columns:
+                stable_values = [str(df.iloc[int(g)]["geoid"]) for g in sub]
+            else:
+                stable_values = [str(int(g)).zfill(12) for g in sub]
+            stable_order = sorted(range(len(sub)), key=lambda i: (stable_values[i], i))
+            tie_break_rank = [0] * len(sub)
+            for rank, local_i in enumerate(stable_order):
+                tie_break_rank[local_i] = rank
+
+            windows.append({
+                "seed": s, "sub": sub, "nb_local": nb_local,
+                "u_g": u_g, "E_g": E_g, "P_g": P_g, "root_local": root_local, "r": r,
+                "tie_break_rank": tie_break_rank,
+            })
+            reserved[sub] = True
+
+        if not windows:
+            if verbose:
+                print("No remaining high-UR seeds produce a feasible window; stopping.", flush=True)
+            break
+
+        if verbose:
+            print(f"\n[Batch] solving {len(windows)} window(s) concurrently (ASUs {k+1}..{k+len(windows)}) ...", flush=True)
+
+        # ---- Build warm-start hints (sequential; cheap relative to CP-SAT) ----
+        for w in windows:
+            info = _prepare_window_hint(
+                w["nb_local"], w["u_g"], w["E_g"], w["P_g"], tau, pop_thresh, w["root_local"],
+                verbose=verbose,
+            )
+            w.update(info)
+            if verbose:
+                su, sE = int(u[w["sub"]].sum()), int(E[w["sub"]].sum())
+                URw = 100.0 * (0.0 if (su + sE) == 0 else su / (su + sE))
+                seed_ur = 100.0 * UR[w["seed"]]
+                print(f"\n[ASU seed={w['seed']}] (UR={seed_ur:.2f}%) | window: r={w['r']}, "
+                      f"nodes={len(w['sub'])}, pop={int(w['P_g'].sum())}, UR={URw:.2f}%", flush=True)
+                print(f"  root_local={w['root_local']} (UR={100*(w['u_g'][w['root_local']]/max(w['u_g'][w['root_local']]+w['E_g'][w['root_local']],1e-12)):.3f}%, "
+                      f"pop={int(w['P_g'][w['root_local']])})", flush=True)
+                if info["n_contracted"] < len(w["nb_local"]):
+                    print(f"  contracted: {len(w['nb_local'])} -> {info['n_contracted']} nodes", flush=True)
+                if len(info["root_component"]) > 1:
+                    print(f"  fixed root high-UR component: {len(info['root_component'])} tracts", flush=True)
+                if info["hint_valid"]:
+                    hu = info["hint_obj_val"]
+                    hE = int(w["E_g"][np.array(info["hint_improved"], dtype=int)].sum())
+                    print(f"  [HINT] {info['hint_source']} warm start: tracts={len(info['hint_improved'])}, unemp={hu}, UR={100.0*hu/max(hu+hE,1):.2f}%", flush=True)
+
+        # ---- Solve all windows in the batch concurrently ----
+        workers_each = max(1, int(workers) // len(windows))
+
+        def _solve(w: Dict) -> Optional[CpsatResult]:
+            if verbose:
+                print(f"  [seed={w['seed']}] >>> starting CP-SAT solve (nodes={len(w['nb_local'])}, "
+                      f"workers={workers_each}, time_limit={time_limit}s)", flush=True)
+            result = solve_one_asu_cpsat(
+                nb_local=w["nb_local"], u_g=w["u_g"], E_g=w["E_g"], P_g=w["P_g"],
+                tau=tau, pop_thresh=pop_thresh, root_local=w["root_local"],
+                time_limit=time_limit, workers=workers_each, rel_gap=rel_gap, log=verbose,
+                hint=w["hint_improved"], hint_obj=w["hint_obj_val"],
+                forced_selected=w["root_component"],
+                deterministic_ties=deterministic_ties,
+                tie_break_rank=w["tie_break_rank"],
+                objective_shaving=objective_shaving,
+                use_signed_flow=use_signed_flow,
+                use_arborescence=use_arborescence,
+                configure_subsolvers=configure_subsolvers,
+                # cluster_groups intentionally NOT passed here: tying high-UR
+                # cluster members via equality is provably correct (validated
+                # against brute force) but empirically hurts this time-limited
+                # heuristic search -- see SKILL.md "Known Issues / Gotchas".
+            )
+            if verbose:
+                status = result.status if result is not None else "NO SOLUTION"
+                print(f"  [seed={w['seed']}] <<< solve finished: status={status}", flush=True)
+            return result
+
+        if len(windows) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(windows)) as pool:
+                sols = list(pool.map(_solve, windows))
+        else:
+            sols = [_solve(windows[0])]
+
+        # ---- Refine each window's result within its own reserved territory ----
+        batch_mask = np.zeros(n, dtype=bool)
+        for w in windows:
+            batch_mask[w["sub"]] = True
+
+        candidates: List[List[int]] = []
+        for w, sol in zip(windows, sols):
+            if sol is None:
+                if w["hint_valid"]:
+                    S_local = w["hint_improved"]
+                    if verbose:
+                        su = int(w["u_g"][np.array(S_local, dtype=int)].sum())
+                        print(f"  [seed={w['seed']}] [GREEDY FALLBACK] tracts={len(S_local)}, unemp={su}", flush=True)
+                else:
+                    tried[w["seed"]] = True
+                    continue
+            else:
+                S_local = sol.sel_idx_local
+
+            if export_dir is not None:
+                _export_window_comparison(w, list(S_local), df, export_dir, k + 1, tau)
+
+            S_global = np.array(w["sub"], dtype=int)[np.array(S_local, dtype=int)].tolist()
+            own_mask = np.zeros(n, dtype=bool)
+            own_mask[w["sub"]] = True
+            allowed_idx = np.where(remaining & (~batch_mask | own_mask))[0]
+            S_refined = improve_by_trades(S_global, u, E, P, nb, tau, pop_thresh, allowed_idx,
+                                           max_iter=200, max_swap_checks=0)
+            if not component_ok(S_refined, u, E, P, tau, pop_thresh, nb):
+                S_refined = S_global
+            candidates.append(S_refined)
+
+        if not candidates:
+            continue
+
+        # ---- Merge candidates that touch (share a queen-contiguity edge) ----
+        parent = list(range(len(candidates)))
+
+        def find(a: int) -> int:
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        if merge_adjacent and len(candidates) > 1:
+            owner: Dict[int, int] = {}
+            for gi, S in enumerate(candidates):
+                for t in S:
+                    owner[t] = gi
+            for gi, S in enumerate(candidates):
+                for t in S:
+                    for w2 in nb[t]:
+                        gj = owner.get(w2)
+                        if gj is not None and gj != gi:
+                            union(gi, gj)
+
+        groups: Dict[int, List[int]] = {}
+        for gi, S in enumerate(candidates):
+            groups.setdefault(find(gi), []).append(gi)
+
+        # Try the merged union first; fall back to each original candidate on the
+        # (mathematically unexpected) chance the merged set fails a sanity check.
+        final_units: List[List[int]] = []
+        for members in groups.values():
+            merged = sorted({t for gi in members for t in candidates[gi]})
+            su, sE = int(u[merged].sum()), int(E[merged].sum())
+            if len(members) > 1 and den * su - num * sE >= 0 and component_ok(merged, u, E, P, tau, pop_thresh, nb):
+                if verbose:
+                    print(f"  [MERGE] {len(members)} touching windows combined into one ASU ({len(merged)} tracts)", flush=True)
+                final_units.append(merged)
+            else:
+                final_units.extend(candidates[gi] for gi in members)
+
+        # ---- Commit each final unit, largest first, excluding not-yet-processed siblings ----
+        final_units.sort(key=lambda S: -int(u[S].sum()))
+        pending_mask = np.zeros(n, dtype=bool)
+        for S in final_units:
+            pending_mask[S] = True
+
+        for S in final_units:
+            pending_mask[S] = False
+            allowed_idx = np.where(remaining & ~pending_mask)[0]
+            S_final = improve_by_trades(S, u, E, P, nb, tau, pop_thresh, allowed_idx,
+                                         max_iter=200, max_swap_checks=0)
+            if not component_ok(S_final, u, E, P, tau, pop_thresh, nb):
+                S_final = S
+
+            k += 1
+            asu_id[S_final] = k
+            remaining[S_final] = False
+            tried[S_final] = False
+
+            if verbose:
+                su, sE, sP = int(u[S_final].sum()), int(E[S_final].sum()), int(P[S_final].sum())
+                URv = 100.0 * (0.0 if (su + sE) == 0 else su / (su + sE))
+                print(f"  [OK] ASU {k} committed: tracts={len(S_final)}, pop={sP}, UR={URv:.3f}%, unemp={su}", flush=True)
+
+            if k >= max_asus:
+                break
+
+    # Final summary if stopped due to no high-UR tracts
+    if verbose and k < max_asus:
+        rem_idx_final = np.where(remaining)[0]
+        if rem_idx_final.size > 0:
+            max_ur_remaining = UR[rem_idx_final].max() * 100
+            print(f"\nStopped after {k} ASUs. Max UR among {rem_idx_final.size} remaining tracts: {max_ur_remaining:.3f}%", flush=True)
+
+    return {"asu_id": asu_id.tolist(), "n_asu": int(k)}
+
+
+# ---------- CLI ----------
+def main():
+    ap = argparse.ArgumentParser(description="ASU builder with OR-Tools CP-SAT (queen contiguity supported)")
+    ap.add_argument("--input", required=True, help="Excel/CSV with geoid, tract_ASU_unemp, tract_ASU_emp, tract_pop2024")
+    ap.add_argument("--sheet", default=None, help="Excel sheet name (if Excel)")
+    ap.add_argument("--neighbors", default=None, help="Adjacency JSON (list of int lists; 0- or 1-based)")
+    ap.add_argument("--geometry", default=None, help="GeoPackage / Shapefile with tract polygons (for queen contiguity)")
+    ap.add_argument("--geom-col", default="geometry", help="Geometry column name")
+    ap.add_argument("--geoid-col", default="geoid", help="Join key in geometry file (to match input geoid)")
+    ap.add_argument("--tau", type=float, default=0.0645)
+    ap.add_argument("--pop-thresh", type=int, default=10000)
+    ap.add_argument("--max-asus", type=int, default=30)
+    ap.add_argument("--r-start", type=int, default=50)
+    ap.add_argument("--r-step", type=int, default=1)
+    ap.add_argument("--r-max", type=int, default=50)
+    ap.add_argument("--hard-cap-nodes", type=int, default=10000)
+    ap.add_argument("--min-pop-margin", type=float, default=1.0)
+    ap.add_argument("--time-limit", type=int, default=1200, help="CP-SAT time limit per window (seconds)")
+    ap.add_argument("--workers", type=int, default=8, help="CP-SAT parallel workers")
+    ap.add_argument("--rel-gap", type=float, default=None, help="Optional relative gap (e.g., 0.01 for 1%)")
+    ap.add_argument("--parallel-asus", type=int, default=1, help="Number of ASU windows to solve concurrently")
+    ap.add_argument("--no-merge-adjacent", action="store_true", help="Disable merging of touching ASUs built in the same batch")
+    ap.add_argument(
+        "--no-deterministic-ties",
+        action="store_true",
+        help="Skip secondary optimal-solution tie-break solves",
+    )
+    ap.add_argument("--output", default=None, help="Output CSV path (default: <stem>_with_asu.csv)")
+    ap.add_argument("--verbose", action="store_true", help="Verbose CP-SAT logs")
+    args = ap.parse_args()
+
+    # Load input table
+    inp = args.input
+    if inp.lower().endswith((".xlsx", ".xls")):
+        if args.sheet is None:
+            # pick the first visible sheet
+            tmp = pd.read_excel(inp, sheet_name=None)
+            first_key = next(iter(tmp.keys()))
+            df = tmp[first_key]
+        else:
+            df = pd.read_excel(inp, sheet_name=args.sheet)
+    else:
+        df = pd.read_csv(inp)
+
+    # Normalize geoid (strip 14000US prefix if present)
+    if "geoid" in df.columns:
+        df["geoid"] = df["geoid"].astype(str).str.replace(r"^14000US", "", regex=True)
+
+    required = ["tract_ASU_unemp", "tract_ASU_emp", "tract_pop2024"]
+    for col in required:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
+
+    # Build adjacency
+    if args.neighbors:
+        with open(args.neighbors, "r") as f:
+            nb_raw = json.load(f)
+        if not isinstance(nb_raw, list):
+            raise ValueError("neighbors JSON must be a list of lists")
+        # Convert each row to 0-based ints; handle 1-based input from R
+        n = len(nb_raw)
+        nb: List[List[int]] = []
+        for row in nb_raw:
+            row = [int(v) for v in (row or [])]
+            is_one_based = len(row) > 0 and max(row) >= n
+            if is_one_based:
+                row = [v - 1 for v in row]
+            nb.append(sorted([v for v in row if 0 <= v < n]))
+    elif args.geometry:
+        if gpd is None or Queen is None:
+            raise RuntimeError("geopandas/libpysal not installed. Use --neighbors JSON instead, or install geo deps.")
+        gdf = gpd.read_file(args.geometry)
+        if args.geoid_col not in gdf.columns:
+            raise ValueError(f"Column '{args.geoid_col}' not found in geometry file.")
+        # Join geometry to df by geoid
+        gdf2 = gdf[[args.geoid_col, args.geom_col]].rename(columns={args.geoid_col: "geoid"})
+        merged = df.merge(gdf2, on="geoid", how="left")
+        if merged[args.geom_col].isna().any():
+            missing = merged["geoid"][merged[args.geom_col].isna()].unique()[:5]
+            raise RuntimeError(f"Missing geometry for some geoids (e.g., {missing}).")
+        gdf_merged = gpd.GeoDataFrame(merged, geometry=args.geom_col, crs=gdf.crs).reset_index(drop=True)
+        nb = queen_neighbors_from_geometries(gdf_merged, geom_col=args.geom_col)
+        # Drop geometry for output size
+        df = pd.DataFrame(gdf_merged.drop(columns=[args.geom_col]))
+    else:
+        raise RuntimeError("Provide either --neighbors JSON or --geometry to compute contiguity.")
+
+    # Build ASUs
+    out = build_many_asus_cpsat(
+        df=df, nb=nb, tau=args.tau, pop_thresh=args.pop_thresh,
+        max_asus=args.max_asus, r_start=args.r_start, r_step=args.r_step, r_max=args.r_max,
+        hard_cap_nodes=args.hard_cap_nodes, min_pop_margin=args.min_pop_margin,
+        time_limit=args.time_limit, workers=args.workers, rel_gap=args.rel_gap,
+        verbose=args.verbose, parallel_asus=args.parallel_asus,
+        merge_adjacent=not args.no_merge_adjacent,
+        deterministic_ties=not args.no_deterministic_ties,
+    )
+
+    df_out = df.copy()
+    df_out["asu_id"] = out["asu_id"]
+
+    out_path = args.output or f"{os.path.splitext(os.path.basename(inp))[0]}_with_asu.csv"
+    df_out.to_csv(out_path, index=False)
+    print(f"\nDone. Built {out['n_asu']} ASU(s) → {out_path}")
+
+
+if __name__ == "__main__":
+    main()

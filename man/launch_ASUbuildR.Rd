@@ -8,7 +8,8 @@ launch_ASUbuildR(
   rmd_file = NULL,
   host = "127.0.0.1",
   port = NULL,
-  launch.browser = TRUE
+  launch.browser = TRUE,
+  auto_reload = NULL
 )
 }
 \arguments{
@@ -20,6 +21,10 @@ If NULL (default), uses the package's built-in dashboard.}
 \item{port}{Numeric port number. If NULL, R will choose an available port.}
 
 \item{launch.browser}{Logical. Should the dashboard open in browser? Default TRUE.}
+
+\item{auto_reload}{Logical. Should the app reload when the source R Markdown
+file changes? By default this is disabled for the package's built-in
+dashboard and enabled for a custom \code{rmd_file}.}
 }
 \value{
 This function is called for its side effects (launching the dashboard).
