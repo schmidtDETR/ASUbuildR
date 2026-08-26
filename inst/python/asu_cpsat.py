@@ -730,7 +730,7 @@ def solve_one_asu_cpsat(
     # boundary constraints these cuts add evidently still prune the flow
     # phase's search space usefully even when they never converge to a single
     # connected component. See SKILL.md.
-    cut_time_budget = min(20.0, max(2.0, float(time_limit) * 0.15))
+    cut_time_budget = 0.0  # cut pre-pass disabled
     stall_rounds = 0
     prev_num_components: Optional[int] = None
     first_components: Optional[int] = None
@@ -901,7 +901,29 @@ def solve_one_asu_cpsat(
         # one low-value node forces routing 3 units through what a BFS tree treats as
         # a capacity-2 edge. The uniform bound below is the correct, universally valid
         # one (flow on any edge can never exceed total selected nodes - 1).
-        M = max(1, N - 1)
+        # Tighten M via a fast connectivity-free solve: max tracts s.t. UR/pop only.
+        _mM = cp_model.CpModel()
+        _mx = [_mM.NewBoolVar(f"mx_{i}") for i in range(N)]
+        for _fi in forced_set:
+            _mM.Add(_mx[_fi] == 1)
+        _mM.Add(sum(int(P_g[i]) * _mx[i] for i in range(N)) >= int(pop_thresh))
+        _mM.Add(
+            sum(int(den) * int(u_g[i]) * _mx[i] for i in range(N))
+            - sum(int(num) * int(E_g[i]) * _mx[i] for i in range(N))
+            >= 0
+        )
+        _mM.Maximize(sum(_mx))
+        _ms = cp_model.CpSolver()
+        _ms.parameters.num_search_workers = max(1, int(workers))
+        _ms.parameters.max_time_in_seconds = 10.0
+        _ms.parameters.cp_model_presolve = True
+        _ms.parameters.linearization_level = 2
+        _ms.parameters.log_search_progress = False
+        _ms_status = _ms.Solve(_mM)
+        if _ms_status == cp_model.OPTIMAL:
+            M = max(1, int(round(_ms.ObjectiveValue())) - 1)
+        else:
+            M = max(1, N - 1)
         # NOTE: _bridge_edge_bounds() gives a provably sound tighter per-edge cap
         # (validated against 400 brute-force instances + explicit counterexamples)
         # but was A/B tested on real Colorado data and was a clear regression
@@ -918,16 +940,16 @@ def solve_one_asu_cpsat(
             ]
             net_out_for = [[] for _ in range(N)]
             for edge_index, (i, j) in enumerate(edges):
-                model.Add(f[edge_index] <= edge_bounds[edge_index] * x[i])
-                model.Add(f[edge_index] >= -edge_bounds[edge_index] * x[i])
-                model.Add(f[edge_index] <= edge_bounds[edge_index] * x[j])
-                model.Add(f[edge_index] >= -edge_bounds[edge_index] * x[j])
-                net_out_for[i].append(f[edge_index])
-                net_out_for[j].append(-f[edge_index])
-                model.AddHint(
-                    f[edge_index],
-                    flow_hints.get((i, j), 0) - flow_hints.get((j, i), 0),
-                )
+              model.Add(f[edge_index] == 0).OnlyEnforceIf(x[i].Not())
+              model.Add(f[edge_index] == 0).OnlyEnforceIf(x[j].Not())
+          
+              net_out_for[i].append(f[edge_index])
+              net_out_for[j].append(-f[edge_index])
+          
+              model.AddHint(
+                  f[edge_index],
+                  flow_hints.get((i, j), 0) - flow_hints.get((j, i), 0),
+              )
             for i in range(N):
                 net_outflow = sum(net_out_for[i]) if net_out_for[i] else 0
                 model.Add(net_outflow == (selected_count - 1 if i == root_local else -x[i]))
@@ -1100,7 +1122,7 @@ def solve_one_asu_cpsat(
         solver.parameters.linearization_level = 1
         solver.parameters.cp_model_probing_level = 2
         solver.parameters.cut_level = 1
-        solver.parameters.lns_initial_difficulty = 0.4
+        solver.parameters.lns_initial_difficulty = 0.3
 
         if hasattr(solver.parameters, "merge_text_format"):
             lns_params_text = (
@@ -1113,14 +1135,13 @@ def solve_one_asu_cpsat(
             lns_params.linearization_level = 1
         if configure_subsolvers:
             solver.parameters.filter_subsolvers.extend([
+                "probing",
                 "rins*",
-                #"probing",
-                #"max_lp",
                 "probing_max_lp",
                 "lb_tree_search",
-                #"quick_restart_no_lp",
                 "graph_arc_lns",
-                "ls*",
+                "graph_var*",
+                "ls*"
             ])
         # solver.parameters.ignore_subsolvers.extend([
         #     "pseudo_costs",
@@ -1189,6 +1210,10 @@ def solve_one_asu_cpsat(
                 tie_remaining = float(time_limit) - (time.monotonic() - start_time)
                 if tie_remaining <= 0.01:
                     break
+                # Cap each tie-break stage so a quickly-solved window doesn't
+                # burn the full remaining budget on secondary objectives.
+                _TIE_CAP = 30.0
+                tie_stage_secs = min(tie_remaining, _TIE_CAP)
                 if direction == "max":
                     model.Maximize(expression)
                 else:
@@ -1196,7 +1221,7 @@ def solve_one_asu_cpsat(
 
                 tie_solver = cp_model.CpSolver()
                 tie_solver.parameters.num_search_workers = max(1, int(workers))
-                tie_solver.parameters.max_time_in_seconds = tie_remaining
+                tie_solver.parameters.max_time_in_seconds = tie_stage_secs
                 tie_solver.parameters.log_search_progress = False
                 tie_solver.parameters.cp_model_presolve = True
                 tie_solver.parameters.linearization_level = 2
@@ -1242,7 +1267,8 @@ def frontier_candidates(S: List[int], nb: List[List[int]], allowed: np.ndarray) 
 
 
 def improve_by_trades(S0: List[int], u: np.ndarray, E: np.ndarray, P: np.ndarray, nb: List[List[int]],
-                      tau: float, pop_thresh: int, allowed: np.ndarray, max_iter: int = 200) -> List[int]:
+                      tau: float, pop_thresh: int, allowed: np.ndarray, max_iter: int = 200,
+                      max_swap_checks: Optional[int] = None) -> List[int]:
     S = sorted(set(S0))
     selected = set(S)
     sum_u = int(u[S].sum())
@@ -1263,9 +1289,15 @@ def improve_by_trades(S0: List[int], u: np.ndarray, E: np.ndarray, P: np.ndarray
                 break
         if improved:
             continue
-        # Swap: drop worst u, add best neighbor
-        if len(S) > 1:
+        # Swap: drop worst u, add best neighbor.
+        # max_swap_checks=0 skips this entirely (used after CP-SAT solve where
+        # the solution is already optimal within the window).
+        if len(S) > 1 and max_swap_checks != 0:
+            n_checked = 0
             for r in sorted(S, key=lambda i: u[i]):
+                if max_swap_checks is not None and n_checked >= max_swap_checks:
+                    break
+                n_checked += 1
                 reduced_u = sum_u - int(u[r])
                 reduced_E = sum_E - int(E[r])
                 reduced_P = sum_P - int(P[r])
@@ -2267,12 +2299,11 @@ def solve_local_repair(
     selected_count = sum(x)
     net_out: List[list] = [[] for _ in range(N)]
     for eidx, (i, j) in enumerate(edges):
-        model.Add(f[eidx] <= M * x[i])
-        model.Add(f[eidx] >= -M * x[i])
-        model.Add(f[eidx] <= M * x[j])
-        model.Add(f[eidx] >= -M * x[j])
-        net_out[i].append(f[eidx])
-        net_out[j].append(-f[eidx])
+      model.Add(f[eidx] == 0).OnlyEnforceIf(x[i].Not())
+      model.Add(f[eidx] == 0).OnlyEnforceIf(x[j].Not())
+  
+      net_out[i].append(f[eidx])
+      net_out[j].append(-f[eidx])
     for i in range(N):
         expr = sum(net_out[i]) if net_out[i] else 0
         model.Add(expr == (selected_count - 1 if i == root_local else -x[i]))
@@ -2828,7 +2859,8 @@ def build_many_asus_cpsat(
             own_mask = np.zeros(n, dtype=bool)
             own_mask[w["sub"]] = True
             allowed_idx = np.where(remaining & (~batch_mask | own_mask))[0]
-            S_refined = improve_by_trades(S_global, u, E, P, nb, tau, pop_thresh, allowed_idx, max_iter=200)
+            S_refined = improve_by_trades(S_global, u, E, P, nb, tau, pop_thresh, allowed_idx,
+                                           max_iter=200, max_swap_checks=0)
             if not component_ok(S_refined, u, E, P, tau, pop_thresh, nb):
                 S_refined = S_global
             candidates.append(S_refined)
@@ -2888,7 +2920,8 @@ def build_many_asus_cpsat(
         for S in final_units:
             pending_mask[S] = False
             allowed_idx = np.where(remaining & ~pending_mask)[0]
-            S_final = improve_by_trades(S, u, E, P, nb, tau, pop_thresh, allowed_idx, max_iter=200)
+            S_final = improve_by_trades(S, u, E, P, nb, tau, pop_thresh, allowed_idx,
+                                         max_iter=200, max_swap_checks=0)
             if not component_ok(S_final, u, E, P, tau, pop_thresh, nb):
                 S_final = S
 

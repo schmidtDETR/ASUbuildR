@@ -149,17 +149,12 @@ cache_dir <- rappdirs::user_cache_dir("ASUbuildR", "tigris")
 if (!dir.exists(cache_dir))
   dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
 
-# 3. tell tigris to use it *this session*
-options(tigris_cache_dir = cache_dir)
-
-# tell tigris to look there first before re‑downloading
-options(tigris_use_cache = TRUE)
-
-
-# cache every tigris download automatically
 options(
-  tigris_use_cache = TRUE,                 # turn caching on
-  tigris_class     = "sf"                  # always return sf objects
+  tigris_cache_dir = cache_dir,
+  tigris_use_cache = TRUE,
+  tigris_class     = "sf",
+  download.file.method = "libcurl"
+
 )
 
 options(shiny.maxRequestSize = 50 * 1024^2)  # Set to 50MB or your desired limit
@@ -176,13 +171,7 @@ asu_summary <- shiny::reactiveVal(NULL)
 full_data <- shiny::reactiveVal(NULL)
 full_data_reset <- shiny::reactiveVal()
 selected_tracts <- shiny::reactiveVal(NULL)
-current_selection <- shiny::reactiveVal(NULL)
-
-
-# Prevent reactivity issues with empty initial values
-map_update_debounced <- shiny::debounce(shiny::reactive({
-  list(full_data(), selected_tracts(), highlighted_tracts())
-}), 250) # 250ms delay
+nb_adjacency    <- shiny::reactiveVal(NULL) # island-fixed full-state neighbor graph
 
 
 # New England Optional year selection logic
@@ -247,7 +236,7 @@ prep_map_data <- function(map_data) {
   
   map_data |>
     sf::st_make_valid() |>
-    sf::st_simplify(dTolerance = .001, preserveTopology = TRUE) |>  # Simplify geometry
+    sf::st_simplify(dTolerance = .005, preserveTopology = TRUE) |>  # Simplify geometry
     sf::st_zm(what = "ZM", drop = TRUE) |>
     dplyr::filter(!sf::st_is_empty(geometry)) |>
     dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
@@ -269,19 +258,19 @@ base_geom <- shiny::reactive({
 }) |>
   shiny::bindCache(sort(full_data()$GEOID))
 
-# Cheap non-spatial join of current attributes onto the cached geometry
+# Cheap non-spatial join of current attributes onto the cached geometry.
+# Only include columns needed for rendering and tooltips to minimise GeoJSON size.
 map_geom <- shiny::reactive({
   shiny::req(full_data())
-  dplyr::inner_join(
-    base_geom(),
-    full_data() |> sf::st_drop_geometry(),
-    by = "GEOID"
-  )
+  attrs <- full_data() |>
+    sf::st_drop_geometry() |>
+    dplyr::select(GEOID, asunum, tract_pop_cur, tract_ASU_clf, tract_ASU_urate, tract_ASU_unemp)
+  dplyr::inner_join(base_geom(), attrs, by = "GEOID")
 })
 
 # Reactively tracks the GEOID set but only fires when GEOIDs actually change.
 # Because full_data() changes on every ASU edit (asunum values), map_geom()
-# is invalidated on every edit too. If output$initial_map / output$edit_map
+# is invalidated on every edit too. If output$edit_map
 # depend directly on map_geom(), they are invalidated and Shiny re-sends the
 # cached HTML to the browser, which re-initialises MapLibre and wipes any
 # proxy color updates. Keying on geoid_set() instead means the map outputs
@@ -373,54 +362,60 @@ calculate_tract_colors <- function(data) {
   )
 }
 
-update_map_efficiently <- function(map_id = "edit_map") {
+# Helper: set filter + visibility on the 'selected' or 'highlighted' overlay layer.
+# In mapgl 0.5.0, set_filter() composes user+base via ["all", ...], so we MUST
+# NOT set an initial filter on these layers. Use visibility="none" as the off-state
+# and pair every set_filter call with a matching set_layout_property visibility toggle.
+apply_overlay_filter <- function(proxy, layer_id, ids) {
+  ids <- ids[!is.na(ids)]
+  if (length(ids) == 0) {
+    proxy |>
+      mapgl::set_filter(layer_id, NULL) |>
+      mapgl::set_layout_property(layer_id, "visibility", "none")
+  } else {
+    filter_expr <- if (length(ids) == 1) {
+      list("==", list("get", "GEOID"), as.character(ids))
+    } else {
+      list("in", list("get", "GEOID"), list("literal", as.character(ids)))
+    }
+    proxy |>
+      mapgl::set_filter(layer_id, filter_expr) |>
+      mapgl::set_layout_property(layer_id, "visibility", "visible")
+  }
+}
+
+update_map_efficiently <- function(map_id = "edit_map", paint_only = FALSE) {
   data <- map_geom()
   if (is.null(data) || nrow(data) == 0) return()
 
   cm <- calculate_tract_colors(data)
 
-  if (map_id == "edit_map") {
-    # Use set_source to update each layer's data in-place (no clear → no blink),
-    # then refresh paint and filters. MapLibre calls getSource(id).setData()
-    # atomically, so feature-property tooltips also read fresh values.
-    sel <- selected_tracts()   %||% character(0)
-    hl  <- highlighted_tracts() %||% character(0)
+  sel <- selected_tracts()   %||% character(0)
+  hl  <- highlighted_tracts() %||% character(0)
 
-    build_filter <- function(ids) {
-      ids <- ids[!is.na(ids)]
-      if (length(ids) == 0) return(list("==", c("get", "GEOID"), "__NONE__"))
-      if (length(ids) == 1) list("==", c("get", "GEOID"), as.character(ids))
-      else list("in", c("get", "GEOID"), list("literal", as.character(ids)))
-    }
+  proxy <- mapgl::maplibre_proxy(map_id)
 
-    mapgl::maplibre_proxy(map_id) |>
-      mapgl::set_source(layer_id = "basemap", source = data) |>
-      mapgl::set_paint_property(
-        "basemap", "fill-color",
-        mapgl::match_expr(
-          column  = "GEOID",
-          values  = cm$values,
-          stops   = cm$stops,
-          default = "#E0E0E0"
-        )
-      ) |>
-      mapgl::set_filter("selected", build_filter(sel)) |>
-      mapgl::set_filter("highlighted", build_filter(hl))
-  } else {
-    # For read-only maps (initial_map), update source data AND paint property.
-    # set_source keeps tooltip feature properties (asunum, rates, etc.) current.
-    mapgl::maplibre_proxy(map_id) |>
-      mapgl::set_source(layer_id = "basemap", source = data) |>
-      mapgl::set_paint_property(
-        "basemap", "fill-color",
-        mapgl::match_expr(
-          column  = "GEOID",
-          values  = cm$values,
-          stops   = cm$stops,
-          default = "#E0E0E0"
-        )
-      )
+  if (!paint_only) {
+    # set_source refreshes tooltip feature properties; skip for paint-only edits.
+    proxy <- proxy |> mapgl::set_source(layer_id = "basemap", source = data)
   }
+
+  proxy <- proxy |>
+    mapgl::set_paint_property(
+      "basemap", "fill-color",
+      mapgl::match_expr(
+        column  = "GEOID",
+        values  = cm$values,
+        stops   = cm$stops,
+        default = "#E0E0E0"
+      )
+    )
+
+  if (map_id == "edit_map") {
+    proxy <- apply_overlay_filter(proxy, "selected",    sel)
+    proxy <- apply_overlay_filter(proxy, "highlighted", hl)
+  }
+  proxy
 }
 
 # Enhanced version that can also update the data source if needed
@@ -463,14 +458,14 @@ update_map_with_data <- function(map_id = "edit_map", new_data = NULL) {
         line_color = "red",
         line_width = 4,
         line_opacity = 1,
-        filter = list("==", c("get", "GEOID"), "__NONE__")
+        visibility = "none"
       ) |>
       mapgl::add_fill_layer(
         id = "highlighted",
         source = data,
         fill_color = "black",
         fill_opacity = 0.8,
-        filter = list("==", c("get", "GEOID"), "__NONE__")
+        visibility = "none"
       )
   } else {
     # Just update the paint property
@@ -486,6 +481,40 @@ update_map_with_data <- function(map_id = "edit_map", new_data = NULL) {
       )
   }
 }
+# Connect every sub-graph to the largest component via nearest centroid.
+fix_nb_islands <- function(nb, intpt_lat, intpt_lon) {
+  g     <- igraph::graph_from_adj_list(nb)
+  comps <- igraph::components(g)
+  if (comps$no <= 1L) return(nb)
+  main_id  <- which.max(comps$csize)
+  main_idx <- which(comps$membership == main_id)
+  for (comp_id in setdiff(unique(comps$membership), main_id)) {
+    island_idx <- which(comps$membership == comp_id)
+    combis     <- expand.grid(island = island_idx, main = main_idx)
+    combis$dist <- sqrt(
+      (intpt_lat[combis$island] - intpt_lat[combis$main])^2 +
+      (intpt_lon[combis$island] - intpt_lon[combis$main])^2
+    )
+    closest <- combis[which.min(combis$dist), ]
+    nb[[closest$island]] <- c(nb[[closest$island]], closest$main)
+    nb[[closest$main]]   <- c(nb[[closest$main]],   closest$island)
+  }
+  nb
+}
+
+# Check whether asu_geoids form a single connected component in stored_nb.
+asu_is_contiguous <- function(asu_geoids, stored_nb) {
+  idx <- which(stored_nb$geoids %in% asu_geoids)
+  if (length(idx) <= 1L) return(TRUE)
+  local_nb <- lapply(seq_along(idx), function(i) {
+    nbrs  <- stored_nb$nb[[idx[i]]]
+    local <- which(idx %in% nbrs)
+    if (length(local) == 0L) integer(0L) else as.integer(local)
+  })
+  g <- igraph::graph_from_adj_list(local_nb, mode = "all")
+  igraph::components(g)$no == 1L
+}
+
 ```
 
 # Data Initialization
@@ -770,18 +799,18 @@ shiny::tableOutput("asu")
 palette_logic <- function(n_asu) {
   if (n_asu == 0) {
     list(
-      fill = "#808080",
+      fill = "#E0E0E0",
       legend_vals = "(none)",
-      legend_cols = "#808080"
+      legend_cols = "#E0E0E0"
     )
   } else if (n_asu == 1) {
     list(
       fill = mapgl::step_expr(
         column = "asunum",
-        base = "#808080",
+        base = "#E0E0E0",
         stops = "#7FC97F",
         values = 1,
-        na_color = "#444444"
+        na_color = "#E0E0E0"
       ),
       legend_vals = 1,
       legend_cols = "#7FC97F"
@@ -926,6 +955,15 @@ if (identical(algo_choice, "cpsat")) {
     
     # Update merged_sf with the fixed neighborhood structure
     merged_sf$continuous <- nb
+    nb_adjacency(list(geoids = merged_sf$GEOID, nb = nb))
+
+    # Pre-simplify geometry inside withProgress so map renders immediately after
+    # the solver finishes (visible to the user as part of the setup phase).
+    append_cpsat_log("[NB] Simplifying tract geometry...")
+    sf::st_geometry(merged_sf) <- sf::st_geometry(merged_sf) |>
+      sf::st_make_valid() |>
+      sf::st_simplify(dTolerance = .005, preserveTopology = TRUE) |>
+      sf::st_zm(what = "ZM", drop = TRUE)
     
     merged_df <- merged_sf |> sf::st_drop_geometry()
     append_cpsat_log(sprintf("[NB] Tracts kept: %d (after join)", nrow(merged_df)))
@@ -995,7 +1033,7 @@ import pandas as pd
 df = pd.read_csv(r'%s')
 with open(r'%s','r') as f:
     nb = json.load(f)
-print(f'[runner] inputs: rows={{len(df)}} nb_lists={{len(nb)}}')
+print('[runner] inputs: rows=' + str(len(df)) + ' nb_lists=' + str(len(nb)))
 
 kwargs = dict(
     df=df, nb=nb,
@@ -1105,6 +1143,7 @@ print('[runner] OK', flush=True)
               dplyr::mutate(asunum = ifelse(asu_id < 0L, 0L, as.integer(asu_id))) |>
               dplyr::select(-dplyr::any_of("continuous")) |>
               clean_sf_columns()
+            # geometry already simplified in merged_sf (done during withProgress)
 
             # update reactives used by the rest of the app
             full_data(final_sf)
@@ -1124,6 +1163,8 @@ print('[runner] OK', flush=True)
                 )
             )
             output$asu <- shiny::renderTable(asu_summary(), digits = 3)
+            update_map_efficiently("initial_map")
+            update_map_efficiently("edit_map")
             append_cpsat_log("[run] Solver finished OK; map/table updated.")
           } else {
             append_cpsat_log("[run][warn] Output JSON invalid or length mismatch.")
@@ -1156,6 +1197,17 @@ print('[runner] OK', flush=True)
         row_num    = dplyr::row_number(),
         continuous = sfdep::st_contiguity(geometry)
       )
+
+    # Build and cache island-fixed neighbor graph for contiguity checks.
+    nb_adjacency(list(
+      geoids = tract_list$GEOID,
+      nb     = fix_nb_islands(
+        lapply(tract_list$continuous, function(x)
+          if (length(x) == 1L && x == 0L) integer(0L) else as.integer(x)),
+        as.numeric(tract_list$INTPTLAT),
+        as.numeric(tract_list$INTPTLON)
+      )
+    ))
 
     ## 1b · Merge the BLS data (kept for potential checks/debug)
     shiny::incProgress(0.3, detail = "Merging BLS unemployment data\u2026")
@@ -1191,7 +1243,7 @@ print('[runner] OK', flush=True)
     asu_summary(res$asu_summary)
 
     output$asu <- shiny::renderTable(asu_summary(), digits = 3)
-    # The global renderMaplibre for output$initial_map will react to full_data()
+    # The global renderMaplibre for output$edit_map will react to full_data()
   }
 })
 
@@ -1212,6 +1264,7 @@ shiny::observeEvent(input$th_pass, {
   
   # Efficient update instead of clearing layers
   update_map_efficiently("initial_map")
+  update_map_efficiently("edit_map")
 })
 
 shiny::observeEvent(input$th_combine, {
@@ -1230,12 +1283,14 @@ shiny::observeEvent(input$th_combine, {
   
   # Efficient update instead of clearing layers
   update_map_efficiently("initial_map")
+  update_map_efficiently("edit_map")
 })
 
 #-------Total Unemployment Box --------------------------------
 total_unemp <- shiny::reactive({
   shiny::req(full_data())                                  # wait until available
   full_data() |>
+    sf::st_drop_geometry() |>
     dplyr::filter(asunum > 0) |>
     dplyr::summarise(unemp = sum(tract_ASU_unemp, na.rm = TRUE)) |>
     dplyr::pull(unemp)
@@ -1280,29 +1335,6 @@ shiny::observeEvent(input$close_log, {
   cpsat_running(FALSE)
 })
 
-output$cpsat_log_saved_banner <- shiny::renderUI({
-  lf <- cpsat_log_saved()
-  if (is.null(lf)) return(NULL)
-  shiny::div(
-    style = "position:fixed; bottom:20px; right:20px; z-index:1100; background:#f0f8ff; border:1px solid #4a90d9; border-radius:4px; padding:10px 14px; font-size:13px; box-shadow:0 2px 8px rgba(0,0,0,.2); max-width:520px;",
-    shiny::div(
-      style = "display:flex; justify-content:space-between; align-items:flex-start;",
-      shiny::strong("Solver log saved:"),
-      shiny::actionButton("dismiss_cpsat_banner", "\u00d7",
-        class = "btn-xs btn-link",
-        style = "padding:0 4px; font-size:16px; line-height:1; color:#555; margin-left:8px;")
-    ),
-    shiny::span(style = "font-family:monospace; font-size:11px; word-break:break-all;", lf),
-    shiny::br(), shiny::br(),
-    shiny::actionButton("open_log_folder", "Open folder", class = "btn-xs btn-info", style = "margin-right:6px;"),
-    shiny::actionButton("open_log_file",   "Open log",    class = "btn-xs btn-default")
-  )
-})
-
-shiny::observeEvent(input$dismiss_cpsat_banner, {
-  cpsat_log_saved(NULL)
-})
-
 output$cpsat_log_link <- shiny::renderUI({
   lf <- cpsat_log_saved()
   if (is.null(lf)) return(NULL)
@@ -1317,14 +1349,6 @@ output$cpsat_log_link <- shiny::renderUI({
   )
 })
 
-shiny::observeEvent(input$open_log_folder, {
-  lf <- cpsat_log_saved()
-  if (!is.null(lf)) try(shell.exec(dirname(normalizePath(lf, mustWork = FALSE))), silent = TRUE)
-})
-shiny::observeEvent(input$open_log_file, {
-  lf <- cpsat_log_saved()
-  if (!is.null(lf) && file.exists(lf)) try(shell.exec(normalizePath(lf)), silent = TRUE)
-})
 shiny::observeEvent(input$open_log_folder2, {
   lf <- cpsat_log_saved()
   if (!is.null(lf)) try(shell.exec(dirname(normalizePath(lf, mustWork = FALSE))), silent = TRUE)
@@ -1335,20 +1359,30 @@ shiny::observeEvent(input$open_log_file2, {
 })
 
 # Make sure the log text stays updated
-shiny::observe({
-  cpsat_log_buf()  # Depend on this reactive value
-  # Instead of session$flushReact(), use invalidateLater
-  shiny::invalidateLater(100)  # Check for updates every 100ms
-})
 
 ```
 
 ```{r}
-# -- GLOBAL map render that reacts to geoid_set() only --
+# Add debounced reactive for map updates
+map_update_trigger <- shiny::debounce(shiny::reactive({
+  list(full_data(), input$update)
+}), 200)
+
+# Observer for debounced updates — fires when full_data() or input$update changes.
+# paint_only=TRUE skips set_source so no GeoJSON is shipped on manual edits;
+# algorithm completions use explicit update_map_efficiently() calls with the default.
+shiny::observeEvent(map_update_trigger(), {
+  if (!is.null(full_data()) && nrow(full_data()) > 0) {
+    update_map_efficiently("edit_map", paint_only = TRUE)
+  }
+}, ignoreInit = TRUE)
+```
+
+```{r}
+# Read-only overview map for Load Initial ASU tab; keyed on geoid_set() so it
+# only re-renders when the tract set changes, not on every asunum edit.
 output$initial_map <- mapgl::renderMaplibre({
   shiny::req(length(geoid_set()) > 0)
-  # isolate() so the render body doesn't create additional reactive dependencies
-  # that would cause re-sends on asunum-only changes.
   map_data <- shiny::isolate(map_geom())
   if (is.null(map_data) || nrow(map_data) == 0) {
     return(
@@ -1357,12 +1391,10 @@ output$initial_map <- mapgl::renderMaplibre({
     )
   }
 
-  # Replace 0 with NA so base color applies
   map_data <- map_data |> dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
 
   n_asu <- suppressWarnings(max(map_data$asunum, na.rm = TRUE))
   n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
-
   pal <- palette_logic(n_asu)
 
   mapgl::maplibre(style = mapgl::carto_style("positron")) |>
@@ -1386,25 +1418,9 @@ output$initial_map <- mapgl::renderMaplibre({
   shiny::bindCache(geoid_set())
 ```
 
-```{r}
-# Add debounced reactive for map updates
-map_update_trigger <- shiny::debounce(shiny::reactive({
-  list(full_data(), input$update)
-}), 200)
-
-# Observer for debounced updates
-shiny::observeEvent(map_update_trigger(), {
-  if (!is.null(full_data()) && nrow(full_data()) > 0) {
-    update_map_efficiently("initial_map")
-    update_map_efficiently("edit_map")
-  }
-}, ignoreInit = TRUE)
-```
-
 
 ## Map {data-width="800"}
 ```{r}
-# Map
 mapgl::maplibreOutput("initial_map", height = "100vh")
 
 # Log overlay (shows only while running)
@@ -1424,13 +1440,9 @@ These tools allow you to select, inspect, and change ASU designations for indivi
 shiny::htmlOutput("total_unemp2")
 shiny::renderUI(shiny::HTML("<hr>"))
 
-# Select an ASU
-asu_selection_ui <- shiny::reactive({
-  shiny::selectInput("select_asunum", "Select ASU Number:",
-              choices = c("None", asu_choices()),
-              selected = "None")
-})
-shiny::renderUI(asu_selection_ui())
+# Select an ASU — render once, update choices in-place to avoid full widget rebuild
+shiny::selectInput("select_asunum", "Select ASU Number:",
+              choices = "None", selected = "None")
 shiny::renderUI(shiny::HTML("<hr>"))
 
 # Change ASU
@@ -1443,9 +1455,15 @@ shiny::actionButton("clear", "Clear Selected Tracts")
 shiny::renderUI(shiny::HTML("<hr>"))
 
 asu_choices <- shiny::reactive({
-  shiny::req(full_data())                     # only run after full_data exists
+  shiny::req(full_data())
   full_data() |> dplyr::pull(asunum) |> unique() |> sort()
-})
+}) |> shiny::debounce(400)
+
+# Push choice updates in-place; 400 ms debounce absorbs rapid sequential edits.
+shiny::observe({
+  shiny::updateSelectInput(session, "select_asunum",
+                           choices = c("None", asu_choices()))
+}) |> shiny::bindEvent(asu_choices(), ignoreNULL = FALSE, ignoreInit = FALSE)
 
 shiny::renderUI(shiny::HTML("<hr>"))
 
@@ -1474,7 +1492,6 @@ shiny::actionButton("reset", "Reset to Initial Data")
 ```{r}
 # The map
   mapgl::maplibreOutput("edit_map", height = "100vh")
-  shiny::uiOutput("cpsat_log_saved_banner")
   
 output$edit_map <- mapgl::renderMaplibre({
 
@@ -1521,21 +1538,23 @@ output$edit_map <- mapgl::renderMaplibre({
         "<strong>Tract Unemployment Rate: </strong>",mapgl::number_format(mapgl::get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2),"%<br>",
         "<strong>Tract Unemployment: </strong>",mapgl::number_format(mapgl::get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0),"<br>")
     ) |>
-    # Pre-add empty layers for selection and highlighting - avoids repeated add/clear cycles
+    # Pre-add hidden overlay layers; visibility="none" is the off-state so that
+    # mapgl 0.5.0's filter-stack (base+user composed via ["all",...]) is not
+    # poisoned by a permanent "__NONE__" base filter.
     mapgl::add_line_layer(
       id = "selected",
       source = data,
       line_color = "red",
       line_width = 4,
       line_opacity = 1,
-      filter = list("==", c("get", "GEOID"), "__NONE__")
+      visibility = "none"
     ) |>
     mapgl::add_fill_layer(
       id = "highlighted",
       source = data,
       fill_color = "black",
       fill_opacity = 0.8,
-      filter = list("==", c("get", "GEOID"), "__NONE__")
+      visibility = "none"
     )
 }) |>
   shiny::bindCache(geoid_set())
@@ -1556,17 +1575,12 @@ shiny::observeEvent(input$edit_map_feature_click, {
   }
   selected_tracts(current_selection)
 
-  # Build filter expression and apply
-  if (length(current_selection) > 0 && !any(is.na(current_selection))) {
-    filter_expr <- if (length(current_selection) == 1) {
-      list("==", c("get", "GEOID"), as.character(current_selection[1]))
-    } else {
-      list("in", c("get", "GEOID"), list("literal", as.character(current_selection)))
-    }
-    mapgl::maplibre_proxy("edit_map") |> mapgl::set_filter("selected", filter_expr)
-  } else {
-    mapgl::maplibre_proxy("edit_map") |> mapgl::set_filter("selected", list("==", c("get", "GEOID"), "__NONE__"))
-  }
+  # Build filter expression and apply (with visibility toggle)
+  apply_overlay_filter(
+    mapgl::maplibre_proxy("edit_map"),
+    "selected",
+    current_selection
+  )
 
   output$selection_table <- shiny::renderTable({ selected_tracts() }, digits = 3)
 })
@@ -1580,9 +1594,8 @@ clear_selection_debounced <- shiny::debounce(shiny::reactive({
 shiny::observeEvent(clear_selection_debounced(), {
   selected_tracts(NULL)
   
-  # Use set_filter to hide selection
-  mapgl::maplibre_proxy("edit_map") |>
-    mapgl::set_filter("selected", list("==", c("get", "GEOID"), "__NONE__"))
+  # Use apply_overlay_filter to hide selection layer
+  apply_overlay_filter(mapgl::maplibre_proxy("edit_map"), "selected", character(0))
   
   # Reset ASU dropdown to "None"
     shiny::updateSelectInput(session, "select_asunum", selected = "None")
@@ -1594,8 +1607,7 @@ shiny::observeEvent(input$select_asunum, {
 
   if (input$select_asunum == "None") {
     selected_tracts(NULL)
-    mapgl::maplibre_proxy("edit_map") |>
-      mapgl::set_filter("selected", list("==", c("get", "GEOID"), "__NONE__"))
+    apply_overlay_filter(mapgl::maplibre_proxy("edit_map"), "selected", character(0))
     return()
   }
 
@@ -1605,21 +1617,17 @@ shiny::observeEvent(input$select_asunum, {
 
   if (length(selected_tract_ids) == 0) {
     selected_tracts(NULL)
-    mapgl::maplibre_proxy("edit_map") |>
-      mapgl::set_filter("selected", list("==", c("get", "GEOID"), "__NONE__"))
+    apply_overlay_filter(mapgl::maplibre_proxy("edit_map"), "selected", character(0))
     return()
   }
 
   selected_tracts(selected_tract_ids)
 
-  filter_expr <- if (length(selected_tract_ids) == 1) {
-    list("==", c("get", "GEOID"), as.character(selected_tract_ids[1]))
-  } else {
-    list("in", c("get", "GEOID"), list("literal", as.character(selected_tract_ids)))
-  }
-
-  mapgl::maplibre_proxy("edit_map") |>
-    mapgl::set_filter("selected", filter_expr) |>
+  apply_overlay_filter(
+    mapgl::maplibre_proxy("edit_map"),
+    "selected",
+    selected_tract_ids
+  ) |>
     mapgl::fit_bounds(subset(full_data(), GEOID %in% selected_tract_ids), animate = TRUE)
 })
 
@@ -1634,8 +1642,11 @@ shiny::observeEvent(input$select_geoid, {
   if (nrow(selected_tract) > 0) {
     shiny::updateSelectInput(session, "select_asunum", selected = "None")
 
-    mapgl::maplibre_proxy("edit_map") |>
-      mapgl::set_filter("selected", list("==", c("get", "GEOID"), as.character(input$manual_geoid))) |>
+    apply_overlay_filter(
+      mapgl::maplibre_proxy("edit_map"),
+      "selected",
+      selected_tract$GEOID
+    ) |>
       mapgl::fit_bounds(selected_tract, animate = TRUE)
 
     selected_tracts(selected_tract$GEOID)
@@ -1666,7 +1677,7 @@ filtered_tracts_memo <- shiny::reactive({
       dplyr::pull(GEOID)
   }
 }) |>
-  shiny::bindCache(input$percentile, input$unemployment_filter, selected_tracts(), full_data())
+  shiny::bindCache(input$percentile, input$unemployment_filter, selected_tracts(), full_data()$asunum)
 
 # Apply highlights only when the button is explicitly clicked
 shiny::observe({
@@ -1679,24 +1690,21 @@ shiny::observe({
   highlighted_tracts(filtered_selected)
 
   if (length(filtered_selected) > 0 && !any(is.na(filtered_selected))) {
-    filter_expr <- if (length(filtered_selected) == 1) {
-      list("==", c("get", "GEOID"), as.character(filtered_selected[1]))
-    } else {
-      list("in", c("get", "GEOID"), list("literal", as.character(filtered_selected)))
-    }
-    mapgl::maplibre_proxy("edit_map") |> mapgl::set_filter("highlighted", filter_expr)
+    apply_overlay_filter(
+      mapgl::maplibre_proxy("edit_map"),
+      "highlighted",
+      filtered_selected
+    )
   } else {
     shiny::showNotification("No tracts matched the filter criteria.", type = "message", duration = 3)
-    mapgl::maplibre_proxy("edit_map") |>
-      mapgl::set_filter("highlighted", list("==", c("get", "GEOID"), "__NONE__"))
+    apply_overlay_filter(mapgl::maplibre_proxy("edit_map"), "highlighted", character(0))
   }
 }) |> shiny::bindEvent(input$filter_percentile, ignoreInit = TRUE)
 
 # Clear highlights on demand; do NOT clear on select_asunum change
 shiny::observeEvent(input$clear_percentile, {
   highlighted_tracts(character(0))
-  mapgl::maplibre_proxy("edit_map") |>
-    mapgl::set_filter("highlighted", list("==", c("get", "GEOID"), "__NONE__"))
+  apply_overlay_filter(mapgl::maplibre_proxy("edit_map"), "highlighted", character(0))
 }, ignoreInit = TRUE)
 
 
@@ -1717,14 +1725,23 @@ shiny::observeEvent(input$update, {
       )
     )
   full_data(updated_data)
-  
-  # Use the efficient update function
-  update_map_efficiently("edit_map")
-  
   selected_tracts(NULL)
-  # Clear selection with set_filter
-  mapgl::maplibre_proxy("edit_map") |>
-    mapgl::set_filter("selected", list("==", c("get", "GEOID"), "__NONE__"))
+
+  # Paint-only update fires immediately so colors change without waiting for the
+  # 200 ms debounce + set_source in map_update_trigger. map_update_trigger still
+  # runs afterward and calls set_source to refresh tooltip asunum values.
+  cm <- calculate_tract_colors(map_geom())
+  proxy <- mapgl::maplibre_proxy("edit_map") |>
+    mapgl::set_paint_property(
+      "basemap", "fill-color",
+      mapgl::match_expr(
+        column  = "GEOID",
+        values  = cm$values,
+        stops   = cm$stops,
+        default = "#E0E0E0"
+      )
+    )
+  apply_overlay_filter(proxy, "selected", character(0))
 })
 
 
@@ -1798,13 +1815,6 @@ shiny::observeEvent(input$load_data, {
   highlighted_tracts(NULL)
 })
 
-# OPTIMIZATION 7: Enhanced cleanup with requestAnimationFrame equivalent
-shiny::observe({
-  shiny::invalidateLater(60000)
-  if (exists("gc")) gc()
-}) |> 
-shiny::bindEvent(input$update, ignoreInit = TRUE)
-
 # Trigger map resize when panels are resized
 shiny::observeEvent(input$map_resize, {
   # Force map to resize/redraw
@@ -1833,8 +1843,7 @@ preview_data <- shiny::reactive({
   
 
   list(data = replacement_data, summary = summary_data)
-}) |>
-  shiny::bindCache(selected_tracts(), full_data())
+})
 
 # Conditional display based on selection
 shiny::conditionalPanel(
@@ -1860,7 +1869,7 @@ shiny::conditionalPanel(
   # Detailed table
   shiny::h4("Tract Details", style = "flex-shrink: 0;"),
   shiny::div(
-    style = "flex: 1; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 5px; min-height: 200px;",
+    style = "flex: 1; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 5px; min-height: 400px;",
     DT::dataTableOutput("summary_table")
   )
 )
@@ -1931,7 +1940,7 @@ output$summary_table <- DT::renderDataTable({
       selection  = "multiple",
       rownames   = FALSE,
       options    = list(
-        pageLength = 15,
+        pageLength = 25,
         scrollX    = TRUE,
         dom        = "ftp",
         columnDefs = list(list(className = "dt-right", targets = c(1, 2, 3, 4, 5)))
@@ -1950,13 +1959,13 @@ shiny::observeEvent(input$summary_table_rows_selected, ignoreNULL = FALSE, {
   geoids <- if (length(sel_rows) > 0) tbl_geoids[sel_rows] else character(0)
   highlighted_tracts(geoids)
   filter_expr <- if (length(geoids) == 0) {
-    list("==", c("get", "GEOID"), "__NONE__")
+    NULL
   } else if (length(geoids) == 1) {
-    list("==", c("get", "GEOID"), as.character(geoids))
+    list("==", list("get", "GEOID"), as.character(geoids))
   } else {
-    list("in", c("get", "GEOID"), list("literal", as.character(geoids)))
+    list("in", list("get", "GEOID"), list("literal", as.character(geoids)))
   }
-  mapgl::maplibre_proxy("edit_map") |> mapgl::set_filter("highlighted", filter_expr)
+  apply_overlay_filter(mapgl::maplibre_proxy("edit_map"), "highlighted", geoids)
 })
 
 # highlighted_tracts() changed externally (percentile filter / map) → reflect in DT
@@ -2114,20 +2123,29 @@ shiny::observeEvent(input$run_asu_summary, {
 
   asu_sf <- full_data() |> dplyr::filter(asunum > 0.5)
 
-  # Contiguity check: for each ASU, build a Queen-contiguity graph over its
-  # tracts only and verify the graph is fully connected (one component).
-  # Uses the same st_contiguity() approach as the tract-loading step.
+  # Contiguity check: use the island-fixed full-state neighbor graph built at
+  # load time so that island tracts connected via centroid distance are handled
+  # consistently with how the solver built the ASUs.
   asu_ids <- sort(unique(asu_sf$asunum))
+
+  nb_check <- nb_adjacency()
+  if (is.null(nb_check)) {
+    # Fallback for sessions loaded from RDS: rebuild from current geometry.
+    all_sf  <- full_data()
+    raw_nb  <- lapply(
+      suppressWarnings(sfdep::st_contiguity(all_sf$geometry)),
+      function(x) if (length(x) == 1L && x == 0L) integer(0L) else as.integer(x)
+    )
+    fixed_nb <- if (all(c("INTPTLAT", "INTPTLON") %in% names(all_sf)))
+      fix_nb_islands(raw_nb, as.numeric(all_sf$INTPTLAT), as.numeric(all_sf$INTPTLON))
+    else raw_nb
+    nb_check <- list(geoids = all_sf$GEOID, nb = fixed_nb)
+    nb_adjacency(nb_check)
+  }
+
   contiguous_flag <- vapply(asu_ids, function(id) {
-    grp <- asu_sf |> dplyr::filter(asunum == id)
-    if (nrow(grp) <= 1L) return(TRUE)
-    nb <- sfdep::st_contiguity(grp$geometry)
-    # sfdep may return 0 for isolated tracts; normalise to integer(0)
-    nb <- lapply(nb, function(x) {
-      if (length(x) == 1L && x == 0L) integer(0L) else as.integer(x)
-    })
-    g <- igraph::graph_from_adj_list(nb, mode = "all")
-    igraph::components(g)$no == 1L
+    grp_geoids <- asu_sf |> dplyr::filter(asunum == id) |> dplyr::pull(GEOID)
+    asu_is_contiguous(grp_geoids, nb_check)
   }, logical(1L))
 
   contiguity_df <- data.frame(asunum = asu_ids, contiguous = contiguous_flag)

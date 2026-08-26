@@ -19,3 +19,4 @@ test folder/asu_exports/
 .venv/
 *.csv
 ASUbuildR.Rproj
+.codex_exact_lns_patch_probe
