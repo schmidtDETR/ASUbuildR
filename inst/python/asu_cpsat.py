@@ -2724,6 +2724,7 @@ def build_many_asus_cpsat(
     use_signed_flow: bool = True,
     use_arborescence: bool = False,
     configure_subsolvers: bool = True,
+    full_graph_window: bool = False,
 ) -> Dict[str, np.ndarray]:
     """
     Build ASUs in batches of up to `parallel_asus` disjoint candidate windows, solved
@@ -2790,17 +2791,21 @@ def build_many_asus_cpsat(
             if allowed_idx.size == 0:
                 break
 
-            r = int(r_start)
-            sub = bfs_ball(nb, s, r, allowed_idx)
-            while P[sub].sum() < min_pop_margin * pop_thresh and r < r_max and len(sub) < hard_cap_nodes:
-                r += r_step
+            if full_graph_window:
+                r = "all"
+                sub = allowed_idx.astype(int).tolist()
+            else:
+                r = int(r_start)
                 sub = bfs_ball(nb, s, r, allowed_idx)
-            if len(sub) > hard_cap_nodes:
-                while len(sub) > hard_cap_nodes and r > 1:
-                    r -= 1
+                while P[sub].sum() < min_pop_margin * pop_thresh and r < r_max and len(sub) < hard_cap_nodes:
+                    r += r_step
                     sub = bfs_ball(nb, s, r, allowed_idx)
                 if len(sub) > hard_cap_nodes:
-                    sub = sub[:hard_cap_nodes]
+                    while len(sub) > hard_cap_nodes and r > 1:
+                        r -= 1
+                        sub = bfs_ball(nb, s, r, allowed_idx)
+                    if len(sub) > hard_cap_nodes:
+                        sub = sub[:hard_cap_nodes]
 
             local_index = {g: i for i, g in enumerate(sub)}
             nb_local: List[List[int]] = [

@@ -1038,11 +1038,13 @@ print('[runner] inputs: rows=' + str(len(df)) + ' nb_lists=' + str(len(nb)))
 kwargs = dict(
     df=df, nb=nb,
     tau=%s, pop_thresh=%d, max_asus=%d,
-    time_limit=%d, workers=%d, verbose=True
+    time_limit=%d, workers=%d, verbose=True,
+    full_graph_window=True
 )
 REL = %s
 if REL is not None and not (isinstance(REL, float) and math.isnan(REL)):
     kwargs['rel_gap'] = REL
+print('[runner] window scope: all remaining tracts', flush=True)
 print('[runner] launching CP-SAT…', flush=True)
 res = build_many_asus_cpsat(**kwargs)
 print('[runner] solver finished; writing json', flush=True)
