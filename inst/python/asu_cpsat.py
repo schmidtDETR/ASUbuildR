@@ -1188,10 +1188,11 @@ def solve_one_asu_cpsat(
             allocation_pattern = [
                 "probing_max_lp",
                 "lb_tree_search",
-                "variables_shaving",
-
-                "probing_max_lp",
                 "pseudo_costs",
+
+                "variables_shaving",
+                "probing_max_lp",
+
 
                 "lb_tree_search",
                 "objective_lb_search_max_lp",
@@ -2523,7 +2524,7 @@ def _prepare_window_hint(
 ) -> Dict:
     """
     Build a warm-start hint using reverse_prune on the original graph, then refine
-    with improve_by_trades and augment_prune_refill.
+    with improve_by_trades and articulation rerouting.
     Contraction is retained only to derive root_component and cluster_groups.
     """
     nb_r, u_r, E_r, P_r, expand_r, node_map_r = contract_high_ur_nodes(nb_local, u_g, E_g, P_g, tau)
@@ -2561,56 +2562,30 @@ def _prepare_window_hint(
 
     if best["hint_valid"]:
         if verbose:
-            print(f"  [heuristic] augment_prune_refill ...", flush=True)
-        augmented = augment_prune_hint(
+            print(f"  [heuristic] articulation_reroute ...", flush=True)
+        rerouted = articulation_reroute(
             best["hint_improved"], u_g, E_g, P_g, nb_local, tau, pop_thresh,
             root_local, protected=root_component,
         )
-        if component_ok(augmented, u_g, E_g, P_g, tau, pop_thresh, nb_local):
-            num, den = as_fraction_tau(tau)
-            exact_slack = den * u_g.astype(np.int64) - num * E_g.astype(np.int64)
-            if _selection_key(set(augmented), u_g, exact_slack) > _selection_key(
-                set(best["hint_improved"]), u_g, exact_slack
+        if component_ok(rerouted, u_g, E_g, P_g, tau, pop_thresh, nb_local):
+            num_rr, den_rr = as_fraction_tau(tau)
+            exact_slack_rr = den_rr * u_g.astype(np.int64) - num_rr * E_g.astype(np.int64)
+            if _selection_key(set(rerouted), u_g, exact_slack_rr) > _selection_key(
+                set(best["hint_improved"]), u_g, exact_slack_rr
             ):
-                aug_u = int(u_g[augmented].sum())
-                aug_E = int(E_g[augmented].sum())
+                rr_u = int(u_g[rerouted].sum())
+                rr_E = int(E_g[rerouted].sum())
                 if verbose:
-                    print(f"  [heuristic] augment improved: tracts={len(augmented)}, unemp={aug_u}, UR={100.0*aug_u/max(aug_u+aug_E,1):.2f}%", flush=True)
-                best = {
-                    "hint_improved": augmented,
-                    "hint_valid": True,
-                    "hint_obj_val": aug_u,
-                }
-                hint_source += "+augment_prune_refill"
+                    print(
+                        f"  [heuristic] articulation_reroute improved: "
+                        f"tracts={len(rerouted)}, unemp={rr_u}, "
+                        f"UR={100.0 * rr_u / max(rr_u + rr_E, 1):.2f}%",
+                        flush=True,
+                    )
+                best = {"hint_improved": rerouted, "hint_valid": True, "hint_obj_val": rr_u}
+                hint_source += "+articulation_reroute"
             elif verbose:
-                print(f"  [heuristic] augment did not improve over {hint_source}", flush=True)
-
-        if best["hint_valid"]:
-            if verbose:
-                print(f"  [heuristic] articulation_reroute ...", flush=True)
-            rerouted = articulation_reroute(
-                best["hint_improved"], u_g, E_g, P_g, nb_local, tau, pop_thresh,
-                root_local, protected=root_component,
-            )
-            if component_ok(rerouted, u_g, E_g, P_g, tau, pop_thresh, nb_local):
-                num_rr, den_rr = as_fraction_tau(tau)
-                exact_slack_rr = den_rr * u_g.astype(np.int64) - num_rr * E_g.astype(np.int64)
-                if _selection_key(set(rerouted), u_g, exact_slack_rr) > _selection_key(
-                    set(best["hint_improved"]), u_g, exact_slack_rr
-                ):
-                    rr_u = int(u_g[rerouted].sum())
-                    rr_E = int(E_g[rerouted].sum())
-                    if verbose:
-                        print(
-                            f"  [heuristic] articulation_reroute improved: "
-                            f"tracts={len(rerouted)}, unemp={rr_u}, "
-                            f"UR={100.0 * rr_u / max(rr_u + rr_E, 1):.2f}%",
-                            flush=True,
-                        )
-                    best = {"hint_improved": rerouted, "hint_valid": True, "hint_obj_val": rr_u}
-                    hint_source += "+articulation_reroute"
-                elif verbose:
-                    print(f"  [heuristic] articulation_reroute did not improve over {hint_source}", flush=True)
+                print(f"  [heuristic] articulation_reroute did not improve over {hint_source}", flush=True)
 
     return {
         "root_component": root_component,
