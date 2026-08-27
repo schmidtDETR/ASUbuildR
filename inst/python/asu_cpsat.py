@@ -1122,7 +1122,15 @@ def solve_one_asu_cpsat(
         solver.parameters.linearization_level = 2
         solver.parameters.cp_model_probing_level = 2
         solver.parameters.cut_level = 2
-        solver.parameters.lns_initial_difficulty = 0.5
+
+        # LNS settings
+        solver.parameters.lns_initial_difficulty = 0.65
+        solver.parameters.solution_pool_size = 10
+        solver.parameters.diversify_lns_params = True
+
+
+        solver.parameters.add_objective_cut = True
+        solver.parameters.variables_shaving_level = 3
 
         if hasattr(solver.parameters, "merge_text_format"):
             lns_params_text = (
@@ -1133,33 +1141,103 @@ def solve_one_asu_cpsat(
             lns_params = solver.parameters.subsolver_params.add()
             lns_params.name = "lns_base"
             lns_params.linearization_level = 1
-        if configure_subsolvers:
-            solver.parameters.filter_subsolvers.extend([
-                "probing",
-                "pseudo_costs",
-                "quick_restart_no_lp",
-                "rins*",
+
+        def configure_asu_subsolvers(params, workers):
+            workers = max(1, int(workers))
+
+            if workers < 8:
+                return
+
+            # Prevent old/default custom subsolvers from being inserted
+            # ahead of our explicitly ordered ASU portfolio.
+            params.ClearField("extra_subsolvers")
+            params.ClearField("subsolvers")
+            params.ClearField("filter_subsolvers")
+
+            # ASU benefits strongly from interleaved RINS/LNS/LS.
+            # Do not devote too many workers to full-problem solvers.
+            full_budget = max(
+                3,
+                min(16, round(workers / 3))
+            )
+
+            # Ordered so that every prefix is useful.
+            #
+            # ASU roles observed in logs:
+            #
+            #   probing_max_lp
+            #       Primary objective-bound / proof worker.
+            #
+            #   lb_tree_search
+            #       Useful for larger early bound jumps.
+            #
+            #   variables_shaving
+            #       Strong early domain/bound reduction on large states.
+            #
+            #   pseudo_costs
+            #       Useful supporting search, but less productive than
+            #       probing_max_lp for ASU proof work.
+            #
+            #   quick_restart_no_lp
+            #       SAT diversification / clause and bound sharing.
+            #       Keep one copy, but don't spend multiple workers on it.
+            #
+            #   probing
+            #       Lower priority; retain one copy only at large budgets.
+            #
+            allocation_pattern = [
                 "probing_max_lp",
                 "lb_tree_search",
-                "graph_arc_lns",
-                "graph_var*",
-                "ls*"
-            ])
-        # solver.parameters.ignore_subsolvers.extend([
-        #     "pseudo_costs",
-        #     "reduced_costs",
-        #     "default_lp",
-        #     "quick_restart",
-        #     # Keep quick_restart_no_lp enabled.
-        #     "objective_shaving_max_lp",f
-        #     "objective_shaving_no_lp",
-        #     "objective_lb_search_max_lp",
-        #     "feasibility_pump",
-        #     "graph_cst_lns",
-        #     "graph_var_lns",
-        #     "rnd_cst_lns",
-        # ])
-        solver.parameters.extra_subsolvers.extend(["probing", "probing_max_lp", "pseudo_costs", "quick_restart_no_lp"]) 
+                "pseudo_costs",
+
+                "variables_shaving",
+                "probing_max_lp",
+
+
+                "lb_tree_search",
+                "objective_lb_search_max_lp",
+
+                "reduced_costs",
+                "pseudo_costs",
+
+                "probing_max_lp",
+                "quick_restart_max_lp",
+
+                "probing_max_lp",
+                "lb_tree_search",
+
+                "max_lp",
+            ]
+
+            full_subsolvers = allocation_pattern[:full_budget]
+
+            params.subsolvers.extend(full_subsolvers)
+            params.num_full_subsolvers = len(full_subsolvers)
+
+            allowed = list(dict.fromkeys(
+                full_subsolvers + [
+                    "rins*",
+                    "lb_relax_lns",
+
+                    "graph_arc_lns",
+
+                    # Diversification / basin escape
+                    "rnd_var_lns",
+
+                    "variables_shaving_max_lp",
+
+                    "ls*",
+                ]
+            ))
+
+            params.filter_subsolvers.extend(allowed)
+
+
+        if configure_subsolvers:
+            configure_asu_subsolvers(
+                solver.parameters,
+                workers
+            )
         if rel_gap is not None:
             solver.parameters.relative_gap_limit = float(rel_gap)
         status = solver.Solve(model)
@@ -2446,7 +2524,7 @@ def _prepare_window_hint(
 ) -> Dict:
     """
     Build a warm-start hint using reverse_prune on the original graph, then refine
-    with improve_by_trades and augment_prune_refill.
+    with improve_by_trades and articulation rerouting.
     Contraction is retained only to derive root_component and cluster_groups.
     """
     nb_r, u_r, E_r, P_r, expand_r, node_map_r = contract_high_ur_nodes(nb_local, u_g, E_g, P_g, tau)
@@ -2484,56 +2562,30 @@ def _prepare_window_hint(
 
     if best["hint_valid"]:
         if verbose:
-            print(f"  [heuristic] augment_prune_refill ...", flush=True)
-        augmented = augment_prune_hint(
+            print(f"  [heuristic] articulation_reroute ...", flush=True)
+        rerouted = articulation_reroute(
             best["hint_improved"], u_g, E_g, P_g, nb_local, tau, pop_thresh,
             root_local, protected=root_component,
         )
-        if component_ok(augmented, u_g, E_g, P_g, tau, pop_thresh, nb_local):
-            num, den = as_fraction_tau(tau)
-            exact_slack = den * u_g.astype(np.int64) - num * E_g.astype(np.int64)
-            if _selection_key(set(augmented), u_g, exact_slack) > _selection_key(
-                set(best["hint_improved"]), u_g, exact_slack
+        if component_ok(rerouted, u_g, E_g, P_g, tau, pop_thresh, nb_local):
+            num_rr, den_rr = as_fraction_tau(tau)
+            exact_slack_rr = den_rr * u_g.astype(np.int64) - num_rr * E_g.astype(np.int64)
+            if _selection_key(set(rerouted), u_g, exact_slack_rr) > _selection_key(
+                set(best["hint_improved"]), u_g, exact_slack_rr
             ):
-                aug_u = int(u_g[augmented].sum())
-                aug_E = int(E_g[augmented].sum())
+                rr_u = int(u_g[rerouted].sum())
+                rr_E = int(E_g[rerouted].sum())
                 if verbose:
-                    print(f"  [heuristic] augment improved: tracts={len(augmented)}, unemp={aug_u}, UR={100.0*aug_u/max(aug_u+aug_E,1):.2f}%", flush=True)
-                best = {
-                    "hint_improved": augmented,
-                    "hint_valid": True,
-                    "hint_obj_val": aug_u,
-                }
-                hint_source += "+augment_prune_refill"
+                    print(
+                        f"  [heuristic] articulation_reroute improved: "
+                        f"tracts={len(rerouted)}, unemp={rr_u}, "
+                        f"UR={100.0 * rr_u / max(rr_u + rr_E, 1):.2f}%",
+                        flush=True,
+                    )
+                best = {"hint_improved": rerouted, "hint_valid": True, "hint_obj_val": rr_u}
+                hint_source += "+articulation_reroute"
             elif verbose:
-                print(f"  [heuristic] augment did not improve over {hint_source}", flush=True)
-
-        if best["hint_valid"]:
-            if verbose:
-                print(f"  [heuristic] articulation_reroute ...", flush=True)
-            rerouted = articulation_reroute(
-                best["hint_improved"], u_g, E_g, P_g, nb_local, tau, pop_thresh,
-                root_local, protected=root_component,
-            )
-            if component_ok(rerouted, u_g, E_g, P_g, tau, pop_thresh, nb_local):
-                num_rr, den_rr = as_fraction_tau(tau)
-                exact_slack_rr = den_rr * u_g.astype(np.int64) - num_rr * E_g.astype(np.int64)
-                if _selection_key(set(rerouted), u_g, exact_slack_rr) > _selection_key(
-                    set(best["hint_improved"]), u_g, exact_slack_rr
-                ):
-                    rr_u = int(u_g[rerouted].sum())
-                    rr_E = int(E_g[rerouted].sum())
-                    if verbose:
-                        print(
-                            f"  [heuristic] articulation_reroute improved: "
-                            f"tracts={len(rerouted)}, unemp={rr_u}, "
-                            f"UR={100.0 * rr_u / max(rr_u + rr_E, 1):.2f}%",
-                            flush=True,
-                        )
-                    best = {"hint_improved": rerouted, "hint_valid": True, "hint_obj_val": rr_u}
-                    hint_source += "+articulation_reroute"
-                elif verbose:
-                    print(f"  [heuristic] articulation_reroute did not improve over {hint_source}", flush=True)
+                print(f"  [heuristic] articulation_reroute did not improve over {hint_source}", flush=True)
 
     return {
         "root_component": root_component,
@@ -2647,6 +2699,7 @@ def build_many_asus_cpsat(
     use_signed_flow: bool = True,
     use_arborescence: bool = False,
     configure_subsolvers: bool = True,
+    full_graph_window: bool = False,
 ) -> Dict[str, np.ndarray]:
     """
     Build ASUs in batches of up to `parallel_asus` disjoint candidate windows, solved
@@ -2713,17 +2766,21 @@ def build_many_asus_cpsat(
             if allowed_idx.size == 0:
                 break
 
-            r = int(r_start)
-            sub = bfs_ball(nb, s, r, allowed_idx)
-            while P[sub].sum() < min_pop_margin * pop_thresh and r < r_max and len(sub) < hard_cap_nodes:
-                r += r_step
+            if full_graph_window:
+                r = "all"
+                sub = allowed_idx.astype(int).tolist()
+            else:
+                r = int(r_start)
                 sub = bfs_ball(nb, s, r, allowed_idx)
-            if len(sub) > hard_cap_nodes:
-                while len(sub) > hard_cap_nodes and r > 1:
-                    r -= 1
+                while P[sub].sum() < min_pop_margin * pop_thresh and r < r_max and len(sub) < hard_cap_nodes:
+                    r += r_step
                     sub = bfs_ball(nb, s, r, allowed_idx)
                 if len(sub) > hard_cap_nodes:
-                    sub = sub[:hard_cap_nodes]
+                    while len(sub) > hard_cap_nodes and r > 1:
+                        r -= 1
+                        sub = bfs_ball(nb, s, r, allowed_idx)
+                    if len(sub) > hard_cap_nodes:
+                        sub = sub[:hard_cap_nodes]
 
             local_index = {g: i for i, g in enumerate(sub)}
             nb_local: List[List[int]] = [

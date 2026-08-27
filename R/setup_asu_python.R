@@ -51,7 +51,52 @@ setup_asu_python <- function(force = FALSE) {
   if (!have_conda) {
     message("Conda not found. Installing Miniconda...")
     message("This is a one-time installation and may take a few minutes...")
-    reticulate::install_miniconda(update = FALSE)
+
+    # Some networks block one installer host (e.g. GitHub release assets)
+    # but allow another (e.g. repo.anaconda.com), or vice versa. Retry with
+    # alternate hosts before giving up, since reticulate's default choice of
+    # host varies by platform and package version.
+    arch <- if (.Platform$OS.type == "windows") "x86_64" else NA_character_
+    fallback_urls <- if (.Platform$OS.type == "windows") {
+      c(
+        sprintf("https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-%s.exe", arch),
+        sprintf("https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Windows-%s.exe", arch)
+      )
+    } else {
+      character(0)
+    }
+
+    install_attempt <- function(url_override = NULL) {
+      opt_name <- "reticulate.miniconda.url"
+      old <- getOption(opt_name)
+      on.exit(options(stats::setNames(list(old), opt_name)), add = TRUE)
+      if (!is.null(url_override)) options(stats::setNames(list(url_override), opt_name))
+      reticulate::install_miniconda(update = FALSE)
+    }
+
+    candidates <- c(list(NULL), as.list(fallback_urls))
+    last_error <- NULL
+    installed <- FALSE
+    for (url in candidates) {
+      result <- tryCatch({ install_attempt(url); TRUE },
+                          error = function(e) { last_error <<- e; FALSE })
+      if (isTRUE(result)) { installed <- TRUE; break }
+    }
+
+    if (!installed) {
+      stop(
+        "Could not download or install a conda distribution from any known host.\n",
+        "Original error: ", conditionMessage(last_error), "\n\n",
+        "Installer hosts tried include github.com/release-assets.githubusercontent.com ",
+        "and repo.anaconda.com. If your organization requires a proxy, configure ",
+        "HTTPS_PROXY (and HTTP_PROXY when required) before running ",
+        "setup_asu_python() again.\n\n",
+        "Alternatively, ask IT to install Miniforge for your user account ",
+        "from https://github.com/conda-forge/miniforge, restart R, and run ",
+        "setup_asu_python() again.",
+        call. = FALSE
+      )
+    }
     have_conda <- TRUE
     just_installed <- TRUE
     message("Miniconda installed successfully!")
